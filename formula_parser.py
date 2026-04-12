@@ -1,14 +1,10 @@
 """
-Chemical Formula and Reaction Parser.
+Разбор химических формул и уравнений реакций.
 
-Parses chemical formulas like "H2O", "CH4", "C2H5OH"
-and reaction expressions like "2H2 + O2", "CH4 + 2O2", "1.5 H2 + 0.5 N2".
-
-Supports:
-- Standard formulas: H2O, CO2, CH4, NH3
-- Complex formulas: C2H5OH, Ca(OH)2
-- Reaction expressions: coefficient * formula separated by '+'
-- Parentheses in formulas
+Умеет читать:
+  - Простые формулы: H2O, CO2, CH4, NH3
+  - Сложные формулы со скобками: Ca(OH)2, Al2(SO4)3
+  - Уравнения левой части: "2H2 + O2", "CH4 + 2O2", "1.5 H2 + 0.5 N2"
 """
 
 import re
@@ -17,147 +13,166 @@ from typing import Dict, List, Tuple
 
 def parse_formula(formula: str) -> Dict[str, float]:
     """
-    Parse a single chemical formula string into element counts.
-    
-    Examples:
-        'H2O' -> {'H': 2.0, 'O': 1.0}
-        'C2H5OH' -> {'C': 2.0, 'H': 6.0, 'O': 1.0}
-        'Ca(OH)2' -> {'Ca': 1.0, 'O': 2.0, 'H': 2.0}
+    Разбирает химическую формулу и возвращает количество атомов каждого элемента.
+
+    Примеры:
+        'H2O'      -> {'H': 2.0, 'O': 1.0}
+        'C2H5OH'   -> {'C': 2.0, 'H': 6.0, 'O': 1.0}
+        'Ca(OH)2'  -> {'Ca': 1.0, 'O': 2.0, 'H': 2.0}
     """
-    elements: Dict[str, float] = {}
-    
-    def _parse_group(s: str, multiplier: float = 1.0):
+    atom_counts: Dict[str, float] = {}
+
+    def _parse_group(fragment: str, multiplier: float = 1.0):
+        """Рекурсивно разбирает фрагмент формулы, учитывая скобки."""
         i = 0
-        while i < len(s):
-            if s[i] == '(':
-                # Find matching closing parenthesis
+        while i < len(fragment):
+            char = fragment[i]
+
+            if char == '(':
+                # Ищем закрывающую скобку, учитывая вложенность
                 depth = 1
                 j = i + 1
-                while j < len(s) and depth > 0:
-                    if s[j] == '(':
+                while j < len(fragment) and depth > 0:
+                    if fragment[j] == '(':
                         depth += 1
-                    elif s[j] == ')':
+                    elif fragment[j] == ')':
                         depth -= 1
                     j += 1
-                # j now points after ')'
-                inner = s[i+1:j-1]
-                # Read number after ')'
+                # fragment[i+1 : j-1] — содержимое скобок
+                inner = fragment[i + 1 : j - 1]
+
+                # Читаем число после закрывающей скобки, например '2' в '(OH)2'
                 num_str = ''
-                while j < len(s) and (s[j].isdigit() or s[j] == '.'):
-                    num_str += s[j]
+                while j < len(fragment) and (fragment[j].isdigit() or fragment[j] == '.'):
+                    num_str += fragment[j]
                     j += 1
-                group_mult = float(num_str) if num_str else 1.0
-                _parse_group(inner, multiplier * group_mult)
+                group_multiplier = float(num_str) if num_str else 1.0
+
+                _parse_group(inner, multiplier * group_multiplier)
                 i = j
-            elif s[i].isupper():
-                # Element symbol
-                elem = s[i]
+
+            elif char.isupper():
+                # Начало символа элемента (заглавная буква)
+                symbol = char
                 i += 1
-                while i < len(s) and s[i].islower():
-                    elem += s[i]
+                # Строчные буквы — продолжение символа (например 'Ca', 'Fe')
+                while i < len(fragment) and fragment[i].islower():
+                    symbol += fragment[i]
                     i += 1
-                # Read number
+
+                # Число после символа элемента
                 num_str = ''
-                while i < len(s) and (s[i].isdigit() or s[i] == '.'):
-                    num_str += s[i]
+                while i < len(fragment) and (fragment[i].isdigit() or fragment[i] == '.'):
+                    num_str += fragment[i]
                     i += 1
                 count = float(num_str) if num_str else 1.0
-                elem_upper = elem[0].upper() + elem[1:].upper() if len(elem) > 1 else elem.upper()
-                elements[elem_upper] = elements.get(elem_upper, 0.0) + count * multiplier
+
+                # Приводим символ к каноническому виду: первая заглавная, остальные строчные
+                canonical = symbol[0].upper() + symbol[1:].lower()
+                atom_counts[canonical] = atom_counts.get(canonical, 0.0) + count * multiplier
+
             else:
+                # Пропускаем посторонние символы (пробелы, запятые и т.п.)
                 i += 1
-    
+
     _parse_group(formula.strip())
-    return elements
+    return atom_counts
 
 
-def parse_reaction_string(reaction_str: str) -> List[Tuple[float, str, Dict[str, float]]]:
+def parse_reaction_string(
+    reaction_str: str,
+) -> List[Tuple[float, str, Dict[str, float]]]:
     """
-    Parse a reaction string (left side of equation).
-    
-    Supports formats:
+    Разбирает левую часть уравнения реакции (список реагентов).
+
+    Поддерживаемые форматы:
         "2H2 + O2"
-        "CH4 + 2 O2" 
+        "CH4 + 2 O2"
         "1.5H2 + 0.5N2"
-        "3.76N2 + O2"
-        "C2H5OH + 3O2"
-    
-    Returns:
-        List of (coefficient, formula_string, element_dict) tuples
+        "C2H5OH + 3O2 + 11.28N2"
+
+    Возвращает список кортежей: (коэффициент, формула, {элемент: количество_атомов})
     """
     components = []
-    
-    # Split by '+'
+
+    # Разбиваем на отдельные слагаемые по символу '+'
     parts = reaction_str.split('+')
-    
+
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        
-        # Try to extract leading coefficient
-        # Patterns: "2H2O", "2 H2O", "2.5H2O", "2.5 H2O", "H2O"
+
+        # Пытаемся отделить числовой коэффициент от формулы
+        # Принимаем форматы: "2H2O", "2 H2O", "2.5H2O", "H2O"
         match = re.match(r'^(\d+\.?\d*)\s*([A-Z].*)$', part)
         if match:
-            coeff = float(match.group(1))
+            coefficient = float(match.group(1))
             formula = match.group(2).strip()
         else:
-            coeff = 1.0
+            coefficient = 1.0
             formula = part
-        
-        elem_dict = parse_formula(formula)
-        components.append((coeff, formula, elem_dict))
-    
+
+        element_dict = parse_formula(formula)
+        components.append((coefficient, formula, element_dict))
+
     return components
 
 
-def get_total_elements(components: List[Tuple[float, str, Dict[str, float]]]) -> Dict[str, float]:
+def get_total_elements(
+    components: List[Tuple[float, str, Dict[str, float]]],
+) -> Dict[str, float]:
     """
-    Calculate total element composition from a list of reaction components.
-    
-    Args:
-        components: List from parse_reaction_string()
-    
-    Returns:
-        Dict of total element moles: {element: total_moles}
+    Считает суммарный элементный состав смеси реагентов.
+
+    Аргументы:
+        components: Результат parse_reaction_string()
+
+    Возвращает словарь {символ_элемента: суммарное_количество_молей}
     """
-    total = {}
-    for coeff, formula, elem_dict in components:
-        for elem, count in elem_dict.items():
-            total[elem] = total.get(elem, 0.0) + coeff * count
+    total: Dict[str, float] = {}
+    for coefficient, formula, element_dict in components:
+        for element, atom_count in element_dict.items():
+            total[element] = total.get(element, 0.0) + coefficient * atom_count
     return total
 
 
 def format_elements(elements: Dict[str, float]) -> str:
-    """Format element dict as a readable string."""
+    """Форматирует словарь элементов в читаемую строку, например 'C2 H6 O'."""
     parts = []
-    for elem, count in sorted(elements.items()):
-        if abs(count - round(count)) < 1e-6:
-            parts.append(f"{elem}{int(round(count))}" if round(count) != 1 else elem)
+    for element, count in sorted(elements.items()):
+        rounded = round(count)
+        if abs(count - rounded) < 1e-6:
+            # Целое значение: 'H2', 'O' (единица не пишется)
+            parts.append(f"{element}{rounded}" if rounded != 1 else element)
         else:
-            parts.append(f"{elem}{count:.4f}")
+            # Дробное значение: 'H1.5000'
+            parts.append(f"{element}{count:.4f}")
     return ' '.join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Самотестирование при запуске напрямую
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # Test cases
-    test_formulas = ["H2O", "CO2", "CH4", "C2H5OH", "N2O4", "NH3", "H2SO4"]
-    print("Formula parsing tests:")
-    for f in test_formulas:
-        print(f"  {f} -> {parse_formula(f)}")
-    
-    print("\nReaction parsing tests:")
+    print("=== Тест разбора формул ===")
+    test_formulas = ["H2O", "CO2", "CH4", "C2H5OH", "N2O4", "NH3", "H2SO4", "Ca(OH)2"]
+    for formula in test_formulas:
+        print(f"  {formula:15s} -> {parse_formula(formula)}")
+
+    print("\n=== Тест разбора уравнений ===")
     test_reactions = [
         "2H2 + O2",
         "CH4 + 2O2",
         "1.5H2 + 0.5N2",
         "C2H5OH + 3O2",
-        "3.76N2 + O2",
+        "1CH4 + 2O2 + 7.52N2",
     ]
-    for r in test_reactions:
-        components = parse_reaction_string(r)
+    for reaction in test_reactions:
+        components = parse_reaction_string(reaction)
         total = get_total_elements(components)
-        print(f"  '{r}':")
+        print(f"\n  '{reaction}':")
         for coeff, formula, elems in components:
-            print(f"    {coeff} × {formula} = {elems}")
-        print(f"    Total elements: {total}")
+            print(f"    {coeff} × {formula:12s} = {elems}")
+        print(f"    Итого: {total}")

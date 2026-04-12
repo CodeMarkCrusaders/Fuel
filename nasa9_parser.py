@@ -1,8 +1,9 @@
 """
-NASA 9-Coefficient Thermodynamic Database Parser.
+Парсер термодинамической базы данных NASA (9-коэффициентный формат).
 
-Parses the CEA-format thermo.inp file containing NASA 9-polynomial
-thermodynamic data for chemical species.
+Читает файл thermo.inp в формате CEA, содержащий полиномиальные данные
+NASA-9 для химических веществ. Возвращает словарь объектов Species,
+по которым потом считаются Cp, H, S, G.
 """
 
 import re
@@ -13,29 +14,39 @@ from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
-class TempInterval:
-    """Single temperature interval with NASA9 coefficients."""
-    T_low: float
-    T_high: float
-    n_coeff: int
-    exponents: List[float]
-    coeffs: List[float]       # a1..a7 (or fewer)
-    integration: List[float]  # b1, b2 (enthalpy and entropy integration constants)
+class TemperatureInterval:
+    """
+    Один температурный интервал с набором коэффициентов NASA-9.
+
+    Каждое вещество может иметь несколько интервалов, например:
+      200–1000 K и 1000–6000 K. Для каждого — свои коэффициенты.
+    """
+    T_low: float           # нижняя граница интервала, К
+    T_high: float          # верхняя граница интервала, К
+    n_coeff: int           # количество коэффициентов (обычно 7)
+    exponents: List[float] # показатели степеней T (обычно [-2,-1,0,1,2,3,4])
+    coeffs: List[float]    # a1..a7 — коэффициенты полинома
+    integration: List[float]  # b1, b2 — константы интегрирования (для H и S)
 
 
-@dataclass 
+@dataclass
 class Species:
-    """Chemical species with thermodynamic data."""
+    """
+    Химическое вещество с термодинамическими данными NASA-9.
+
+    Хранит состав, фазовое состояние, молярную массу,
+    теплоту образования и список температурных интервалов.
+    """
     name: str
     description: str
     n_intervals: int
     reference: str
-    elements: Dict[str, float]   # element_symbol -> atom_count
-    phase: int                   # 0=gas, 1=solid/crystal, 2=liquid
-    mol_weight: float            # g/mol
-    hf298: float                 # J/mol (heat of formation at 298.15 K)
-    intervals: List[TempInterval] = field(default_factory=list)
-    is_reactant_only: bool = False
+    elements: Dict[str, float]  # символ элемента -> количество атомов
+    phase: int                  # 0 = газ, 1 = твёрдое, 2 = жидкость
+    mol_weight: float           # г/моль
+    hf298: float                # Дж/моль, стандартная теплота образования при 298.15 К
+    intervals: List[TemperatureInterval] = field(default_factory=list)
+    is_reactant_only: bool = False  # True, если вещество только реагент (не продукт)
 
     @property
     def is_gas(self) -> bool:
@@ -47,11 +58,20 @@ class Species:
 
     @property
     def phase_str(self) -> str:
-        return {0: "gas", 1: "solid", 2: "liquid"}.get(self.phase, "unknown")
+        """Текстовое обозначение фазы."""
+        return {0: "газ", 1: "твёрдое", 2: "жидкость"}.get(self.phase, "неизвестно")
 
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для разбора формата файла
+# ---------------------------------------------------------------------------
 
 def _parse_fortran_float(s: str) -> float:
-    """Parse a Fortran-style float (D exponent -> E exponent)."""
+    """
+    Конвертирует строку числа в фортрановском стиле (экспонента 'D') в float.
+
+    Например: '1.23456D+04' -> 12345.6
+    """
     s = s.strip()
     if not s:
         return 0.0
@@ -62,115 +82,133 @@ def _parse_fortran_float(s: str) -> float:
         return 0.0
 
 
-def _parse_coeff_line(line: str) -> List[float]:
-    """Parse a line of 5 NASA9 coefficients (each 16 chars wide)."""
-    coeffs = []
-    padded = line.ljust(80)
-    for i in range(5):
-        segment = padded[i*16:(i+1)*16]
-        coeffs.append(_parse_fortran_float(segment))
-    return coeffs
+def _parse_coefficient_line(line: str) -> List[float]:
+    """
+    Разбирает строку с 5 коэффициентами NASA-9.
 
+    В формате CEA каждый коэффициент занимает ровно 16 символов.
+    """
+    coefficients = []
+    # Дополняем строку до 80 символов на случай усечения
+    padded = line.ljust(80)
+    for col in range(5):
+        segment = padded[col * 16 : (col + 1) * 16]
+        coefficients.append(_parse_fortran_float(segment))
+    return coefficients
+
+
+# ---------------------------------------------------------------------------
+# Основная функция разбора файла
+# ---------------------------------------------------------------------------
 
 def parse_thermo_file(filepath: str) -> Dict[str, Species]:
     """
-    Parse NASA9 thermo.inp file.
-    
-    Returns a dict mapping species name -> Species object.
-    Only species with valid thermodynamic data (n_intervals > 0) are included.
-    Species from the "reactants only" section are marked accordingly.
+    Разбирает файл thermo.inp с данными NASA-9.
+
+    Возвращает словарь: имя вещества -> объект Species.
+    Включает только вещества с реальными термодинамическими данными
+    (т.е. n_intervals > 0). Вещества из секции «только реагенты»
+    помечаются флагом is_reactant_only=True.
     """
-    species_dict: Dict[str, Species] = {}
-    
+    species_db: Dict[str, Species] = {}
+
     with open(filepath, 'r') as f:
         lines = f.readlines()
-    
-    # Find the start of thermodynamic data (after "thermo" line)
-    start_idx = 0
+
+    # Ищем строку 'thermo' — после неё начинаются данные
+    data_start = 0
     for i, line in enumerate(lines):
         if line.strip().lower() == 'thermo':
-            start_idx = i + 2  # skip "thermo" and the global T range line
+            data_start = i + 2  # пропускаем 'thermo' и строку с глобальным диапазоном T
             break
-    
+
     in_reactants_section = False
-    idx = start_idx
-    
+    idx = data_start
+
     while idx < len(lines):
         line = lines[idx]
         stripped = line.strip()
-        
-        # Skip empty lines and comments
+
+        # Пропускаем пустые строки и комментарии
         if not stripped or stripped.startswith('!'):
             idx += 1
             continue
-        
-        # Check for section markers
+
+        # Маркер начала секции «только реагенты»
         if stripped.startswith('END PRODUCTS'):
             in_reactants_section = True
             idx += 1
             continue
+
+        # Маркер конца файла данных
         if stripped.startswith('END REACTANTS'):
             break
-        
-        # --- Parse species header (line 1) ---
+
+        # ---------------------------------------------------------------
+        # Строка 1: имя и описание вещества
+        # ---------------------------------------------------------------
         species_name = line[:18].strip()
         description = line[18:].strip()
-        
+
         if not species_name:
             idx += 1
             continue
-        
+
         idx += 1
         if idx >= len(lines):
             break
-        
-        # --- Parse composition line (line 2) ---
+
+        # ---------------------------------------------------------------
+        # Строка 2: состав, фаза, молярная масса, теплота образования
+        # ---------------------------------------------------------------
         comp_line = lines[idx]
         if len(comp_line) < 50:
             idx += 1
             continue
-        
+
         padded = comp_line.ljust(80)
-        
+
+        # Количество температурных интервалов
         try:
             n_intervals = int(padded[0:2].strip())
         except (ValueError, IndexError):
             idx += 1
             continue
-        
+
         reference = padded[3:9].strip()
-        
-        # Parse 5 element pairs (each 8 chars starting at position 10)
+
+        # Пять пар «символ элемента + количество атомов» (по 8 символов каждая)
         elements = {}
         for i in range(5):
-            start = 10 + i * 8
-            sym = padded[start:start+2].strip()
+            pos = 10 + i * 8
+            symbol = padded[pos : pos + 2].strip()
             try:
-                count = float(padded[start+2:start+8].strip())
+                count = float(padded[pos + 2 : pos + 8].strip())
             except (ValueError, IndexError):
                 count = 0.0
-            if sym and abs(count) > 1e-10 and sym != 'E':
-                # Skip electron entries (E) as they are for ions
-                elements[sym.upper()] = count
-        
-        # Phase
+
+            # 'E' — запись для электрона (ионы), пропускаем
+            if symbol and abs(count) > 1e-10 and symbol != 'E':
+                elements[symbol.upper()] = count
+
+        # Фаза вещества
         try:
             phase = int(padded[50:52].strip())
         except (ValueError, IndexError):
             phase = 0
-        
-        # Molecular weight
+
+        # Молярная масса, г/моль
         try:
             mol_weight = float(padded[52:65].strip())
         except (ValueError, IndexError):
             mol_weight = 0.0
-        
-        # Heat of formation at 298.15 K (J/mol)
+
+        # Стандартная теплота образования при 298.15 К, Дж/моль
         try:
             hf298 = float(padded[65:80].strip())
         except (ValueError, IndexError):
             hf298 = 0.0
-        
+
         sp = Species(
             name=species_name,
             description=description,
@@ -180,19 +218,21 @@ def parse_thermo_file(filepath: str) -> Dict[str, Species]:
             phase=phase,
             mol_weight=mol_weight,
             hf298=hf298,
-            is_reactant_only=in_reactants_section
+            is_reactant_only=in_reactants_section,
         )
-        
+
         idx += 1
-        
-        # --- Parse temperature intervals ---
-        for interval_idx in range(n_intervals):
+
+        # ---------------------------------------------------------------
+        # Блоки температурных интервалов (по 3 строки каждый)
+        # ---------------------------------------------------------------
+        for _ in range(n_intervals):
             if idx >= len(lines):
                 break
-            
-            # Temperature range line
+
+            # Строка диапазона T и показателей степеней
             t_line = lines[idx].ljust(80)
-            
+
             try:
                 T_low = float(t_line[0:11].strip())
                 T_high = float(t_line[11:22].strip())
@@ -200,122 +240,123 @@ def parse_thermo_file(filepath: str) -> Dict[str, Species]:
             except (ValueError, IndexError):
                 idx += 1
                 continue
-            
-            # Parse exponents (8 values, each 5 chars)
+
+            # Показатели степеней (8 значений по 5 символов)
             exponents = []
             for i in range(8):
-                start = 24 + i * 5
+                pos = 24 + i * 5
                 try:
-                    exponents.append(float(t_line[start:start+5].strip()))
+                    exponents.append(float(t_line[pos : pos + 5].strip()))
                 except (ValueError, IndexError):
                     exponents.append(0.0)
-            
+
             idx += 1
             if idx >= len(lines):
                 break
-            
-            # Coefficient line 1: a1..a5
-            coeff_line1 = _parse_coeff_line(lines[idx])
+
+            # Строка коэффициентов a1..a5
+            first_coeffs = _parse_coefficient_line(lines[idx])
             idx += 1
-            
+
             if idx >= len(lines):
                 break
-            
-            # Coefficient line 2: a6, a7, [empty], b1, b2
-            coeff_line2 = _parse_coeff_line(lines[idx])
+
+            # Строка коэффициентов a6, a7, [пусто], b1, b2
+            second_coeffs = _parse_coefficient_line(lines[idx])
             idx += 1
-            
-            # Build coefficient arrays
-            # Standard NASA9: 7 coefficients + 2 integration constants
-            coeffs = coeff_line1[:5] + coeff_line2[:2]  # a1..a7
-            integration = [coeff_line2[3], coeff_line2[4]]  # b1, b2
-            
-            interval = TempInterval(
+
+            # Итоговые массивы коэффициентов
+            all_coeffs = first_coeffs[:5] + second_coeffs[:2]   # a1..a7
+            integration_consts = [second_coeffs[3], second_coeffs[4]]  # b1, b2
+
+            interval = TemperatureInterval(
                 T_low=T_low,
                 T_high=T_high,
                 n_coeff=n_coeff,
                 exponents=exponents,
-                coeffs=coeffs,
-                integration=integration
+                coeffs=all_coeffs,
+                integration=integration_consts,
             )
             sp.intervals.append(interval)
-        
-        # Store species (skip duplicates, keep first occurrence)
-        if species_name not in species_dict and n_intervals > 0:
-            species_dict[species_name] = sp
-    
-    return species_dict
+
+        # Сохраняем вещество (дубликаты не добавляем, берём первое вхождение)
+        if species_name not in species_db and n_intervals > 0:
+            species_db[species_name] = sp
+
+    return species_db
 
 
 def get_products_for_elements(
-    species_dict: Dict[str, Species],
+    species_db: Dict[str, Species],
     element_set: set,
     include_condensed: bool = True,
-    T: float = None
+    T: float = None,
 ) -> List[Species]:
     """
-    Select all product species whose elements are a subset of the given element set.
-    
-    Args:
-        species_dict: Parsed species database
-        element_set: Set of element symbols present in reactants
-        include_condensed: Whether to include condensed (solid/liquid) species
-        T: Temperature (K) for filtering valid temperature ranges
-    
-    Returns:
-        List of candidate product species
+    Выбирает из базы данных вещества, которые могут быть продуктами реакции.
+
+    Включает только те вещества, все элементы которых присутствуют
+    в заданном наборе. Ионы и вещества-только-реагенты исключаются.
+
+    Параметры:
+        species_db:        База данных веществ из parse_thermo_file()
+        element_set:       Набор символов элементов реагентов (например {'H', 'O'})
+        include_condensed: Включать ли конденсированные фазы (тв. и жидк.)
+        T:                 Температура (К) для проверки диапазона данных
     """
-    products = []
-    for name, sp in species_dict.items():
-        # Skip reactant-only species
+    candidates = []
+
+    for name, sp in species_db.items():
+        # Исключаем вещества, которые нельзя использовать как продукты
         if sp.is_reactant_only:
             continue
-        
-        # Skip ions (species with 'E' in elements from original data or +/- in name)
-        if '+' in name or '-' in name:
+
+        # Исключаем ионы (+ или - в имени) и электрон
+        if '+' in name or '-' in name or name == 'e-':
             continue
-            
-        # Skip electron
-        if name == 'e-':
+
+        # Проверяем, что все элементы вещества есть среди наших реагентов
+        if not set(sp.elements.keys()).issubset(element_set):
             continue
-        
-        # Check if all elements of this species are in our set
-        sp_elements = set(sp.elements.keys())
-        if not sp_elements.issubset(element_set):
-            continue
-        
-        # Skip condensed species if not requested
+
+        # При необходимости исключаем конденсированные фазы
         if sp.is_condensed and not include_condensed:
             continue
-        
-        # Check temperature range validity if T provided
+
+        # Проверяем, что температура попадает в диапазон данных (с допуском ±100 К)
         if T is not None and sp.intervals:
             T_min = min(iv.T_low for iv in sp.intervals)
             T_max = max(iv.T_high for iv in sp.intervals)
             if T < T_min - 100 or T > T_max + 100:
                 continue
-        
-        products.append(sp)
-    
-    return products
 
+        candidates.append(sp)
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Быстрый тест при запуске напрямую
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
-    
+
     if len(sys.argv) < 2:
-        print("Usage: python nasa9_parser.py <thermo.inp>")
+        print("Использование: python nasa9_parser.py <thermo.inp>")
         sys.exit(1)
-    
+
     db = parse_thermo_file(sys.argv[1])
-    print(f"Parsed {len(db)} species with valid thermodynamic data.")
-    
-    # Show a few examples
+    print(f"Загружено {len(db)} веществ с термодинамическими данными.")
+
+    # Показываем несколько известных веществ
     for name in ['H2O', 'O2', 'N2', 'CO2', 'CH4', 'H2', 'CO', 'OH']:
         if name in db:
             sp = db[name]
-            print(f"\n{sp.name}: MW={sp.mol_weight:.4f}, Hf298={sp.hf298:.1f} J/mol, "
-                  f"phase={sp.phase_str}, elements={sp.elements}")
+            print(
+                f"\n{sp.name}: М = {sp.mol_weight:.4f} г/моль, "
+                f"Hf298 = {sp.hf298:.1f} Дж/моль, "
+                f"фаза = {sp.phase_str}, элементы = {sp.elements}"
+            )
             for iv in sp.intervals:
-                print(f"  T: {iv.T_low:.1f} - {iv.T_high:.1f} K, "
-                      f"{iv.n_coeff} coefficients")
+                print(f"  T: {iv.T_low:.1f} – {iv.T_high:.1f} К, коэффициентов: {iv.n_coeff}")

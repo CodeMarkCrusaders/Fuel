@@ -1,9 +1,14 @@
 """
-Fuel_Equilibrium - Chemical Equilibrium Calculator
+fuel_equilibrium — расчёт химического равновесия газовых смесей.
 
-Determines equilibrium composition of gas mixtures at specified 
-temperature and pressure using Gibbs free energy minimization 
-with NASA 9-coefficient thermodynamic database.
+Определяет равновесный состав продуктов при заданных температуре и давлении
+методом минимизации энергии Гиббса с использованием базы данных NASA-9.
+
+Быстрый старт:
+    from equilibrium import run_batch
+    result = run_batch("2H2 + O2", T=3000, P=101325)
+    for name, moles, xi in result.get_gas_species():
+        print(f"{name}: {xi:.4%}")
 """
 
 __version__ = "1.0.0"
