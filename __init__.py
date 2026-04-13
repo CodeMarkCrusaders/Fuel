@@ -1,10 +1,9 @@
 """
 fuel_equilibrium — расчёт химического равновесия газовых смесей.
 
-Определяет равновесный состав продуктов при заданных температуре и давлении
-методом минимизации энергии Гиббса с использованием базы данных NASA-9.
+Метод: минимизация энергии Гиббса, база данных NASA-9.
 
-Быстрый старт:
+Пример:
     from equilibrium import run_batch
     result = run_batch("2H2 + O2", T=3000, P=101325)
     for name, moles, xi in result.get_gas_species():
@@ -12,7 +11,6 @@ fuel_equilibrium — расчёт химического равновесия г
 """
 
 __version__ = "1.0.0"
-__author__ = "Fuel_Equilibrium Project"
 
 from .nasa9_parser import parse_thermo_file, Species, get_products_for_elements
 from .thermo_calc import cp_over_R, h_over_RT, s_over_R, g_over_RT, R_UNIVERSAL

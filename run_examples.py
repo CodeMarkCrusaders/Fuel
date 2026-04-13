@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-Набор тестовых расчётов для проверки решателя химического равновесия.
-
-Запускает несколько эталонных задач и выводит результаты.
-Полезно как для проверки корректности, так и в качестве примеров использования.
-"""
+# несколько тестовых расчётов для проверки решателя
 
 import os
 import sys
@@ -16,125 +11,43 @@ from nasa9_parser import parse_thermo_file
 from equilibrium import run_batch, print_result, find_thermo_db
 
 
-def run_example(
-    name: str,
-    reactants: str,
-    T: float,
-    P_atm: float,
-    species_db: dict,
-) -> None:
-    """
-    Выполняет один расчёт и печатает результаты.
+def run_example(name, reactants, T, P_atm, db):
+    P = P_atm * 101325.0
+    print(f"\n{'#'*70}")
+    print(f"# {name}")
+    print(f"# {reactants},  T={T:.0f} К,  P={P_atm} атм")
+    print(f"{'#'*70}")
 
-    Параметры:
-        name:        Название примера для заголовка
-        reactants:   Строка реагентов, например "2H2 + O2"
-        T:           Температура, К
-        P_atm:       Давление, атм
-        species_db:  Загруженная база данных веществ
-    """
-    P_pa = P_atm * 101325.0
+    t0 = time.time()
+    result = run_batch(reactants, T=T, P=P, verbose=False)
+    print_result(result, db)
+    print(f"  время: {time.time()-t0:.2f} с")
 
-    print(f"\n{'#' * 80}")
-    print(f"#  {name}")
-    print(f"#  Реагенты: {reactants}")
-    print(f"#  T = {T:.0f} К,  P = {P_atm} атм")
-    print(f"{'#' * 80}")
-
-    t_start = time.time()
-    result = run_batch(reactants, T=T, P=P_pa, verbose=False)
-    elapsed = time.time() - t_start
-
-    print_result(result, species_db)
-    print(f"\n  Время расчёта: {elapsed:.3f} с")
-
-    # Выводим компоненты, чья мольная доля превышает 0.01%
-    major_components = [(name, moles, xi) for name, moles, xi in result.get_gas_species()
-                        if xi > 1e-4]
-    if major_components:
-        print(f"\n  Основные компоненты газовой фазы (мол. доля > 0.01%):")
-        for sp_name, moles, xi in major_components:
-            print(f"    {sp_name:<20s}  {xi * 100:8.4f} %")
+    # выводим компоненты с долей > 0.01%
+    major = [(n, xi) for n, _, xi in result.get_gas_species() if xi > 1e-4]
+    if major:
+        print("  Основные компоненты:")
+        for n, xi in major:
+            print(f"    {n:<20} {xi*100:.4f} %")
 
 
 def main():
-    print("=" * 80)
-    print("    ПРИМЕРЫ РАСЧЁТОВ ХИМИЧЕСКОГО РАВНОВЕСИЯ")
-    print("    База данных NASA-9 / Минимизация энергии Гиббса")
-    print("=" * 80)
+    print("=" * 70)
+    print("  Тестовые расчёты химического равновесия")
+    print("=" * 70)
 
-    # Загружаем базу один раз — все примеры используют её
-    species_db = parse_thermo_file(find_thermo_db())
+    db = parse_thermo_file(find_thermo_db())
 
-    # ------------------------------------------------------------------
-    # Пример 1: сгорание водорода при высокой температуре
-    # ------------------------------------------------------------------
-    run_example(
-        name="Водород + Кислород (стехиометрия), T = 3000 К",
-        reactants="2H2 + O2",
-        T=3000.0,
-        P_atm=1.0,
-        species_db=species_db,
-    )
+    run_example("H2 + O2 при 3000 К",       "2H2 + O2",          3000, 1.0, db)
+    run_example("H2 + O2 при 1500 К",       "2H2 + O2",          1500, 1.0, db)
+    run_example("CH4 + воздух при 2000 К",  "1CH4 + 2O2 + 7.52N2", 2000, 1.0, db)
+    run_example("CO + O2 при 2500 К",       "2CO + O2",          2500, 1.0, db)
+    run_example("H2 + O2 при 3000 К, 100 атм", "2H2 + O2",       3000, 100.0, db)
+    run_example("N2 диссоциация при 5000 К", "1N2",              5000, 1.0, db)
 
-    # ------------------------------------------------------------------
-    # Пример 2: тот же состав, но температура ниже — меньше диссоциации
-    # ------------------------------------------------------------------
-    run_example(
-        name="Водород + Кислород, T = 1500 К",
-        reactants="2H2 + O2",
-        T=1500.0,
-        P_atm=1.0,
-        species_db=species_db,
-    )
-
-    # ------------------------------------------------------------------
-    # Пример 3: сгорание метана в воздухе
-    # ------------------------------------------------------------------
-    run_example(
-        name="Метан + Воздух (стехиометрия), T = 2000 К",
-        reactants="1CH4 + 2O2 + 7.52N2",
-        T=2000.0,
-        P_atm=1.0,
-        species_db=species_db,
-    )
-
-    # ------------------------------------------------------------------
-    # Пример 4: равновесие CO/O2
-    # ------------------------------------------------------------------
-    run_example(
-        name="Оксид углерода + Кислород, T = 2500 К",
-        reactants="2CO + O2",
-        T=2500.0,
-        P_atm=1.0,
-        species_db=species_db,
-    )
-
-    # ------------------------------------------------------------------
-    # Пример 5: влияние высокого давления (100 атм)
-    # ------------------------------------------------------------------
-    run_example(
-        name="Водород + Кислород, T = 3000 К, P = 100 атм",
-        reactants="2H2 + O2",
-        T=3000.0,
-        P_atm=100.0,
-        species_db=species_db,
-    )
-
-    # ------------------------------------------------------------------
-    # Пример 6: диссоциация азота при очень высокой температуре
-    # ------------------------------------------------------------------
-    run_example(
-        name="Диссоциация азота, T = 5000 К",
-        reactants="1N2",
-        T=5000.0,
-        P_atm=1.0,
-        species_db=species_db,
-    )
-
-    print("\n" + "=" * 80)
-    print("    Все примеры успешно выполнены.")
-    print("=" * 80)
+    print("\n" + "=" * 70)
+    print("  Готово.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
