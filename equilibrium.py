@@ -2,8 +2,17 @@
 # расчёт химического равновесия (метод минимизации энергии Гиббса)
 # база данных: NASA CEA, 9-коэффициентные полиномы
 #
+# Поддерживаемые типы задач:
+#   TP — заданы температура и давление (классическая)
+#   HP — заданы энтальпия и давление (адиабатическое горение)
+#   SP — заданы энтропия  и давление (изэнтропическое расширение)
+#
 # запуск интерактивно:  python equilibrium.py
-# пакетный режим:       python equilibrium.py -r "2H2 + O2" -T 3000 -P "1 atm"
+# пакетный режим (TP):  python equilibrium.py -r "2H2 + O2" -T 3000 -P "1 atm"
+# пакетный режим (HP):  python equilibrium.py -r "2H2 + O2" --HP -H -200000 -P "1 atm"
+# пакетный режим (SP):  python equilibrium.py -r "2H2 + O2" --SP -S 700 -P "1 atm"
+#
+# во всех режимах можно добавить --log run.log — вывод итераций в файл
 
 import os
 import sys
@@ -14,7 +23,13 @@ from typing import Dict, List, Optional
 from nasa9_parser import parse_thermo_file, get_products_for_elements, Species
 from thermo_calc import g_over_RT, R_UNIVERSAL
 from formula_parser import parse_reaction_string, get_total_elements
-from gibbs_solver import solve_equilibrium, EquilibriumResult
+from gibbs_solver import (
+    solve_equilibrium,
+    solve_equilibrium_HP,
+    solve_equilibrium_SP,
+    EquilibriumResult,
+)
+from iteration_logger import IterationLogger, NullLogger
 
 
 # папка с базами данных лежит рядом со скриптом
@@ -108,11 +123,13 @@ def parse_pressure(s: str) -> float:
 
 def print_result(result: EquilibriumResult, species_db: Dict[str, Species]) -> None:
     print("\n" + "=" * 70)
-    print("  РЕЗУЛЬТАТЫ РАСЧЁТА ХИМИЧЕСКОГО РАВНОВЕСИЯ")
+    print(f"  РЕЗУЛЬТАТЫ РАСЧЁТА ХИМИЧЕСКОГО РАВНОВЕСИЯ  (тип: {result.problem_type})")
     print("=" * 70)
 
     print(f"\n  T = {result.T:.2f} К  ({result.T-273.15:.2f} °C)")
     print(f"  P = {result.P:.0f} Па  ({result.P/101325:.5f} атм)")
+    print(f"  H = {result.enthalpy:.4e} Дж")
+    print(f"  S = {result.entropy:.4e} Дж/К")
     conv = "сошлось ✓" if result.converged else "не сошлось ✗"
     print(f"  {conv}  (итераций: {result.iterations}, невязка: {result.residual:.2e})")
 
@@ -154,9 +171,148 @@ def print_result(result: EquilibriumResult, species_db: Dict[str, Species]) -> N
     print("\n" + "=" * 70)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Универсальная функция-диспетчер для пакетных вызовов
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_batch(
+    reactants: str,
+    P: float,
+    T: Optional[float] = None,
+    H: Optional[float] = None,
+    S: Optional[float] = None,
+    problem_type: str = 'TP',
+    thermo_db_path: str = None,
+    include_condensed: bool = True,
+    verbose: bool = False,
+    log_path: Optional[str] = None,
+    T_init: float = 2000.0,
+) -> EquilibriumResult:
+    """Единая точка входа для всех типов задач.
+
+    problem_type: 'TP' | 'HP' | 'SP'
+    Для 'TP' нужны T и P; для 'HP' — H и P; для 'SP' — S и P.
+    """
+    if thermo_db_path is None:
+        thermo_db_path = find_thermo_db()
+
+    species_db = parse_thermo_file(thermo_db_path)
+    components = parse_reaction_string(reactants)
+    total_elements = get_total_elements(components)
+
+    # для отбора кандидатов — нам нужна какая-то T;
+    # для HP/SP берём T_init.
+    T_for_selection = T if T is not None else T_init
+    candidates = select_candidate_species(
+        species_db, set(total_elements.keys()), T_for_selection,
+        include_condensed=include_condensed, verbose=verbose,
+    )
+
+    # ── логгер ──
+    use_logger = log_path is not None
+    logger = IterationLogger(log_path) if use_logger else NullLogger()
+    try:
+        if logger.enabled:
+            logger.header_problem(
+                problem_type=problem_type,
+                reactants=reactants,
+                elements=total_elements,
+                T=T, P=P, H=H, S=S,
+            )
+            logger.log_species_list(
+                [sp.name for sp in candidates],
+                n_gas=sum(1 for sp in candidates if sp.is_gas),
+                n_cond=sum(1 for sp in candidates if sp.is_condensed),
+            )
+
+        problem_type = problem_type.upper()
+        if problem_type == 'TP':
+            if T is None:
+                raise ValueError("Для TP-задачи нужно задать T")
+            result = solve_equilibrium(
+                species_list=candidates,
+                element_abundances=total_elements,
+                T=T, P=P,
+                include_condensed=include_condensed,
+                verbose=verbose,
+                logger=logger,
+            )
+        elif problem_type == 'HP':
+            if H is None:
+                raise ValueError("Для HP-задачи нужно задать H")
+            result = solve_equilibrium_HP(
+                species_list=candidates,
+                element_abundances=total_elements,
+                H_target=H, P=P,
+                T_init=T_init,
+                include_condensed=include_condensed,
+                verbose=verbose,
+                logger=logger,
+            )
+        elif problem_type == 'SP':
+            if S is None:
+                raise ValueError("Для SP-задачи нужно задать S")
+            result = solve_equilibrium_SP(
+                species_list=candidates,
+                element_abundances=total_elements,
+                S_target=S, P=P,
+                T_init=T_init,
+                include_condensed=include_condensed,
+                verbose=verbose,
+                logger=logger,
+            )
+        else:
+            raise ValueError(f"Неизвестный тип задачи: {problem_type}. "
+                             f"Допустимо: TP, HP, SP.")
+
+        # финальный состав в лог
+        if logger.enabled:
+            logger.log_composition(
+                result.species_names,
+                result.moles,
+                result.total_moles,
+            )
+            logger.result_summary(
+                converged=result.converged,
+                iterations=result.iterations,
+                T=result.T,
+                P=result.P,
+                H=result.enthalpy,
+                S=result.entropy,
+                residual=result.residual,
+            )
+
+        if verbose:
+            print_result(result, species_db)
+        return result
+
+    finally:
+        logger.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Интерактивный режим
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ask_problem_type() -> str:
+    while True:
+        s = input("\n  Тип задачи: [1] TP — T+P (по умолч.)\n"
+                  "             [2] HP — энтальпия и P\n"
+                  "             [3] SP — энтропия  и P\n"
+                  "  Выбор (1/2/3): ").strip()
+        if s in ('', '1', 'tp', 'TP'):
+            return 'TP'
+        if s in ('2', 'hp', 'HP'):
+            return 'HP'
+        if s in ('3', 'sp', 'SP'):
+            return 'SP'
+        print("  Неверный выбор, попробуйте ещё раз.")
+
+
 def run_interactive():
     print("=" * 70)
     print("  Расчёт химического равновесия (минимизация Гиббса, NASA CEA)")
+    print("  Типы задач: TP / HP / SP")
     print("=" * 70)
 
     print("\n  Загружаем базу данных...")
@@ -195,16 +351,33 @@ def run_interactive():
             print(f"    {coeff:.4g} × {formula}")
         print(f"  Элементы: {total_elements}")
 
+        # тип задачи
+        problem_type = _ask_problem_type()
+
+        T_val = H_val = S_val = None
+        T_init = 2000.0
+
         try:
-            T = float(input("\n  Температура (К): ").strip())
-            if T <= 0:
-                raise ValueError("температура должна быть > 0")
+            if problem_type == 'TP':
+                T_val = float(input("\n  Температура (К): ").strip())
+                if T_val <= 0:
+                    raise ValueError("температура должна быть > 0")
+            elif problem_type == 'HP':
+                H_val = float(input("\n  Энтальпия H_target (Дж): ").strip())
+                t_str = input("  Начальная T для итераций (К, по умолч. 2000): ").strip()
+                if t_str:
+                    T_init = float(t_str)
+            elif problem_type == 'SP':
+                S_val = float(input("\n  Энтропия S_target (Дж/К): ").strip())
+                t_str = input("  Начальная T для итераций (К, по умолч. 2000): ").strip()
+                if t_str:
+                    T_init = float(t_str)
         except ValueError as e:
             print(f"  Ошибка: {e}")
             continue
 
         try:
-            P = parse_pressure(input("  Давление (напр. '1 atm', '1 bar', '101325 Pa'): ").strip())
+            P_val = parse_pressure(input("  Давление (напр. '1 atm', '1 bar', '101325 Pa'): ").strip())
         except ValueError as e:
             print(f"  Ошибка: {e}")
             continue
@@ -212,86 +385,104 @@ def run_interactive():
         inc_cond = input("\n  Учитывать конденсат? (y/n, по умолч. y): ").strip().lower()
         include_condensed = inc_cond not in ('n', 'no', 'нет')
 
-        verbose = input("  Подробный лог? (y/n, по умолч. n): ").strip().lower() in ('y', 'yes', 'да')
+        verbose = input("  Подробный лог в консоль? (y/n, по умолч. n): ").strip().lower() \
+                  in ('y', 'yes', 'да')
 
-        print(f"\n  Ищем вещества-продукты...")
-        candidates = select_candidate_species(
-            species_db, set(total_elements.keys()), T,
-            include_condensed=include_condensed, verbose=True
-        )
-        if not candidates:
-            print("  Нет подходящих веществ в базе!")
+        log_path = input("  Файл для журнала итераций (Enter — без файла): ").strip()
+        if not log_path:
+            log_path = None
+
+        print(f"\n  Решаем {problem_type}-задачу при P={P_val:.0f} Па...")
+        try:
+            result = run_batch(
+                reactants=s,
+                P=P_val,
+                T=T_val, H=H_val, S=S_val,
+                problem_type=problem_type,
+                include_condensed=include_condensed,
+                verbose=verbose,
+                log_path=log_path,
+                T_init=T_init,
+            )
+            print_result(result, species_db)
+            if log_path:
+                print(f"\n  Журнал итераций сохранён в: {log_path}")
+        except Exception as e:
+            print(f"  Ошибка решателя: {e}")
             continue
-
-        print(f"  Решаем задачу равновесия при T={T:.0f} К, P={P:.0f} Па...")
-        result = solve_equilibrium(
-            species_list=candidates,
-            element_abundances=total_elements,
-            T=T, P=P,
-            include_condensed=include_condensed,
-            verbose=verbose,
-        )
-        print_result(result, species_db)
 
         print("\n  Enter — новый расчёт, q — выход.")
 
 
-def run_batch(
-    reactants: str,
-    T: float,
-    P: float,
-    thermo_db_path: str = None,
-    include_condensed: bool = True,
-    verbose: bool = False,
-) -> EquilibriumResult:
-    """Пакетный режим — вызов из кода или скрипта."""
-    if thermo_db_path is None:
-        thermo_db_path = find_thermo_db()
-
-    species_db = parse_thermo_file(thermo_db_path)
-    components = parse_reaction_string(reactants)
-    total_elements = get_total_elements(components)
-
-    candidates = select_candidate_species(
-        species_db, set(total_elements.keys()), T,
-        include_condensed=include_condensed, verbose=verbose,
-    )
-    result = solve_equilibrium(
-        species_list=candidates,
-        element_abundances=total_elements,
-        T=T, P=P,
-        include_condensed=include_condensed,
-        verbose=verbose,
-    )
-    if verbose:
-        print_result(result, species_db)
-    return result
-
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
 
-    cli = argparse.ArgumentParser(description="Расчёт химического равновесия")
+    cli = argparse.ArgumentParser(
+        description="Расчёт химического равновесия (TP / HP / SP)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  TP:  python equilibrium.py -r '2H2 + O2' -T 3000 -P '1 atm'\n"
+            "  HP:  python equilibrium.py -r '2H2 + O2' --HP -H -200000 -P '1 atm'\n"
+            "  SP:  python equilibrium.py -r '2H2 + O2' --SP -S 700    -P '1 atm'\n"
+            "  с логом итераций:\n"
+            "       python equilibrium.py -r '2H2 + O2' -T 3000 -P '1 atm' --log run.log\n"
+        ),
+    )
     cli.add_argument('--reactants', '-r', type=str)
-    cli.add_argument('--temperature', '-T', type=float)
+    cli.add_argument('--temperature', '-T', type=float, help='температура (К) для TP')
+    cli.add_argument('--enthalpy', '-H', type=float, help='энтальпия (Дж) для HP')
+    cli.add_argument('--entropy',  '-S', type=float, help='энтропия (Дж/К) для SP')
     cli.add_argument('--pressure', '-P', type=str)
+    cli.add_argument('--HP', action='store_true', help='HP-задача (нужны H и P)')
+    cli.add_argument('--SP', action='store_true', help='SP-задача (нужны S и P)')
+    cli.add_argument('--T-init', type=float, default=2000.0,
+                     help='начальная T для внешних итераций HP/SP (по умолч. 2000 К)')
     cli.add_argument('--thermo-db', type=str)
     cli.add_argument('--no-condensed', action='store_true')
     cli.add_argument('--verbose', '-v', action='store_true')
+    cli.add_argument('--log', dest='log_path', type=str, default=None,
+                     help='путь к файлу с подробным журналом итераций')
     args = cli.parse_args()
 
-    if args.reactants and args.temperature and args.pressure:
+    # определяем тип задачи
+    if args.HP:
+        problem_type = 'HP'
+    elif args.SP:
+        problem_type = 'SP'
+    else:
+        problem_type = 'TP'
+
+    # пакетный режим возможен, если переданы реагенты и P, и нужный целевой параметр
+    have_target = (
+        (problem_type == 'TP' and args.temperature is not None) or
+        (problem_type == 'HP' and args.enthalpy   is not None) or
+        (problem_type == 'SP' and args.entropy    is not None)
+    )
+
+    if args.reactants and args.pressure and have_target:
         P = parse_pressure(args.pressure)
         db_path = args.thermo_db or find_thermo_db()
         species_db = parse_thermo_file(db_path)
         result = run_batch(
             reactants=args.reactants,
-            T=args.temperature,
             P=P,
+            T=args.temperature,
+            H=args.enthalpy,
+            S=args.entropy,
+            problem_type=problem_type,
             thermo_db_path=args.thermo_db,
             include_condensed=not args.no_condensed,
             verbose=args.verbose,
+            log_path=args.log_path,
+            T_init=args.T_init,
         )
         print_result(result, species_db)
+        if args.log_path:
+            print(f"\n  Журнал итераций сохранён в: {args.log_path}")
     else:
         run_interactive()
