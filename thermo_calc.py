@@ -25,7 +25,11 @@ def cp_over_R(species: Species, T: float) -> float:
     # Cp/R = a1*T^-2 + a2*T^-1 + a3 + a4*T + a5*T^2 + a6*T^3 + a7*T^4
     iv = _get_interval(species, T)
     if iv is None:
-        return 2.5  # одноатомный газ по умолчанию
+        # реагент с табличной энтальпией — нет полиномов, Cp неизвестно.
+        # для практических целей вернём приближённое значение конденсированной фазы.
+        if getattr(species, 'is_tabular_only', False):
+            return 4.0  # ≈ Cp_v/R для жидкости (порядок величины)
+        return 2.5
     a = iv.coeffs
     return (a[0]*T**-2 + a[1]*T**-1 + a[2]
             + a[3]*T + a[4]*T**2 + a[5]*T**3 + a[6]*T**4)
@@ -35,6 +39,10 @@ def h_over_RT(species: Species, T: float) -> float:
     # H/RT = -a1*T^-2 + a2*ln(T)/T + a3 + a4*T/2 + ... + b1/T
     iv = _get_interval(species, T)
     if iv is None:
+        # «табличный» реагент (например O2(L), H2(L)): полиномов нет,
+        # задана только энтальпия hf298 при T_assigned — её и возвращаем.
+        if getattr(species, 'is_tabular_only', False):
+            return species.hf298 / (R_UNIVERSAL * T)
         return 2.5
     a = iv.coeffs
     b1 = iv.integration[0]
@@ -46,6 +54,8 @@ def s_over_R(species: Species, T: float) -> float:
     # S/R = -a1*T^-2/2 - a2*T^-1 + a3*ln(T) + a4*T + ... + b2
     iv = _get_interval(species, T)
     if iv is None:
+        # для табличного реагента энтропия не определена полиномами —
+        # вернём 0; реагент в задаче равновесия использоваться не должен.
         return 0.0
     a = iv.coeffs
     b2 = iv.integration[1]

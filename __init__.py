@@ -19,7 +19,7 @@ fuel_equilibrium — расчёт химического равновесия г
                        problem_type='SP', log_path='run.log')
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .nasa9_parser import parse_thermo_file, Species, get_products_for_elements
 from .thermo_calc import cp_over_R, h_over_RT, s_over_R, g_over_RT, R_UNIVERSAL
@@ -34,3 +34,11 @@ from .gibbs_solver import (
 )
 from .iteration_logger import IterationLogger, NullLogger
 from .equilibrium import run_batch, run_interactive
+from .nozzle_flow import (
+    Propellant,
+    StationResult,
+    RocketPerformance,
+    solve_rocket_nozzle,
+    print_nozzle_table,
+    stoichiometric_OF,
+)
