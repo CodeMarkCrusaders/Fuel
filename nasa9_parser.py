@@ -4,7 +4,7 @@
 import os
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional  # noqa: F401  (Optional нужен для Species)
 
 
 @dataclass
@@ -29,8 +29,12 @@ class Species:
     phase: int       # 0=газ, 1=тв., 2=жидк.
     mol_weight: float
     hf298: float     # теплота образования при 298.15 К, Дж/моль
+                     # для реагентов с n_intervals=0 — это assigned-h при T_assigned
     intervals: List[TemperatureInterval] = field(default_factory=list)
     is_reactant_only: bool = False
+    # для реагентов с n_intervals=0 (например O2(L), H2(L)) — фиксированная T,
+    # при которой задана энтальпия; полиномы по T отсутствуют, h(T)=hf298=const.
+    T_assigned: Optional[float] = None
 
     @property
     def is_gas(self):
@@ -39,6 +43,11 @@ class Species:
     @property
     def is_condensed(self):
         return self.phase != 0
+
+    @property
+    def is_tabular_only(self) -> bool:
+        """Реагент задан только табличной энтальпией без полиномов."""
+        return self.n_intervals == 0 and self.T_assigned is not None
 
     @property
     def phase_str(self):
@@ -164,6 +173,25 @@ def parse_thermo_file(filepath: str) -> Dict[str, Species]:
         )
 
         idx += 1
+
+        # n_intervals = 0 — реагент с табличной энтальпией (например O2(L)).
+        # После comp-строки идёт одна строка вида "  90.170    0.0000   0.0 ..."
+        # — T_assigned и нули (нет полиномов).  В таких случаях hf298 в comp-строке
+        # — это и есть энтальпия при T_assigned (так делает CEA).
+        if n_intervals == 0:
+            if idx < len(lines):
+                t_line = lines[idx].ljust(80)
+                try:
+                    T_assigned = float(t_line[0:11].strip())
+                    if T_assigned > 0:
+                        sp.T_assigned = T_assigned
+                except (ValueError, IndexError):
+                    pass
+                idx += 1
+            # такие записи сохраняем под именем и идём дальше
+            if species_name not in species_db and sp.T_assigned is not None:
+                species_db[species_name] = sp
+            continue
 
         # читаем блоки температурных интервалов (по 3 строки каждый)
         for _ in range(n_intervals):
