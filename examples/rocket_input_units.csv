@@ -1,0 +1,5 @@
+oxidizer;fuel;Pc;Pe;ratio_mode;alpha;n_intermediate_stations;top_species
+LOX;LH2;10 MPa;1 atm;alpha;1.0;0;10
+LOX;LH2;100 bar;100 kPa;alpha;1.0;0;10
+LOX;LH2;100 kgf/cm2;14.7 psi;alpha;1.0;0;10
+LOX;LH2;1450 psi;1 atm;alpha;1.0;0;10
