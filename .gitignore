@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-package-lock.json
-logs/
-*.log

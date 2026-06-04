@@ -1,2 +1,0 @@
-oxidizer;fuel;Pc;Pe;ratio_mode;optimize_target;alpha_min;alpha_max;n_grid;n_intermediate_stations;top_species
-LOX;LH2;10 MPa;1 atm;optimal;Isp;0.4;1.2;9;0;10
