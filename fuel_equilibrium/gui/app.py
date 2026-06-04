@@ -525,25 +525,25 @@ class NozzleSolverWorker(QThread):
         try:
             p = self.params
             
-            # Создать смешанный окислитель/горючее из относительных масс компонентов.
+            # Внутри окислителя/горючего «масса» задаёт долю компонента (0.001..1).
+            # Суммарное O/F задаётся отдельно и не зависит от этих долей.
             ox_components = p['ox_components']  # List[Dict{'name', 'mass', 'T'}]
             fu_components = p['fuel_components']
-            ox_mass_total_rel = sum(c['mass'] for c in ox_components)
-            fu_mass_total_rel = sum(c['mass'] for c in fu_components)
-            total_rel = ox_mass_total_rel + fu_mass_total_rel
-            if total_rel <= 0:
-                raise ValueError("Сумма относительных масс компонентов равна нулю.")
-            # Нормализуем так, чтобы общая масса смеси = 1 кг (удобно для удельных величин)
-            scale = 1.0 / total_rel
+            of_ratio = max(float(p.get('of_ratio', 1.0)), 1e-9)
 
-            # Для простоты оставляем поведение: берём первый компонент для имени и T
+            # Нормировка на 1 кг суммарной смеси по заданному O/F.
+            fuel_mass_kg = 1.0 / (1.0 + of_ratio)
+            oxidizer_mass_kg = of_ratio / (1.0 + of_ratio)
+
+            # На текущем этапе решатель принимает по одному «эквивалентному» компоненту
+            # окислителя и горючего; берем первый в каждом списке.
             ox_comp = ox_components[0]
             ox_T = ox_comp['T'] if ox_comp['T'] > 0 else None
-            ox = Propellant(name=ox_comp['name'], mass_kg=ox_mass_total_rel * scale, T_K=ox_T)
+            ox = Propellant(name=ox_comp['name'], mass_kg=oxidizer_mass_kg, T_K=ox_T)
 
             fu_comp = fu_components[0]
             fu_T = fu_comp['T'] if fu_comp['T'] > 0 else None
-            fu = Propellant(name=fu_comp['name'], mass_kg=fu_mass_total_rel * scale, T_K=fu_T)
+            fu = Propellant(name=fu_comp['name'], mass_kg=fuel_mass_kg, T_K=fu_T)
 
             if self.solver == 'cea':
                 self.progress.emit("Запуск CEA-решателя (Cantera)...")
@@ -655,11 +655,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixture_widget.mixture_changed.connect(self._update_of_from_mixture)
         gb_fuel_layout.addWidget(self.mixture_widget)
         
-        # Отношение O/F (информационное)
-        self.lbl_of = QtWidgets.QLabel("O/F = —")
+        # Отношение O/F задаётся отдельно от внутритопливных долей компонентов.
+        self.sp_of_ratio = QtWidgets.QDoubleSpinBox()
+        self.sp_of_ratio.setRange(0.01, 1000.0)
+        self.sp_of_ratio.setDecimals(4)
+        self.sp_of_ratio.setValue(7.9370)
+        self.sp_of_ratio.setSingleStep(0.1)
+        self.sp_of_ratio.setToolTip(
+            "Массовое отношение окислителя к горючему (O/F).\n"
+            "Это значение задаётся отдельно от долей компонентов внутри\n"
+            "окислителя и горючего."
+        )
+        self.sp_of_ratio.valueChanged.connect(self._update_of_from_mixture)
+
+        self.lbl_of = QtWidgets.QLabel("O/F = 7.9370")
         self.lbl_of.setStyleSheet("color: #cc785c; font-weight: bold;")
         of_layout = QtWidgets.QHBoxLayout()
-        of_layout.addWidget(QtWidgets.QLabel("Отношение:"))
+        of_layout.addWidget(QtWidgets.QLabel("Заданное O/F:"))
+        of_layout.addWidget(self.sp_of_ratio)
         of_layout.addWidget(self.lbl_of)
         of_layout.addStretch()
         gb_fuel_layout.addLayout(of_layout)
@@ -704,8 +717,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_n_inter.setRange(0, 50)
         self.sp_n_inter.setValue(8)
         self.sp_n_inter.setToolTip(
-            "Число промежуточных сечений между горловиной и срезом.\n"
-            "Чем больше — тем гладче графики, но дольше расчёт."
+            "Число промежуточных сечений только для газодинамических параметров\n"
+            "между горловиной и срезом.\n"
+            "Состав продуктов всегда показывается на 4 сечениях:\n"
+            "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
 
         self.chk_condensed = QtWidgets.QCheckBox("Учитывать конденсат")
@@ -713,7 +728,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         form2.addRow("Давление в камере:", w_Pc)
         form2.addRow("Давление на срезе:", w_Pe)
-        form2.addRow("Промежут. сечений:", self.sp_n_inter)
+        form2.addRow("Промежут. сечений (газодин.):", self.sp_n_inter)
         form2.addRow("", self.chk_condensed)
         layout.addWidget(gb_cond)
 
@@ -1010,11 +1025,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mixture_widget.oxidizer_list.species_db = self.species_db
             self.mixture_widget.fuel_list.species_db = self.species_db
             
-            # Инициализировать с стандартными компонентами
+            # Инициализировать стандартной смесью (внутренние доли 1.0/1.0,
+            # массовое O/F задаётся отдельно через self.sp_of_ratio).
             self.mixture_widget.set_mixture({
-                'ox_components': [{'name': 'O2(L)', 'mass': 7.937, 'T': 0}],
+                'ox_components': [{'name': 'O2(L)', 'mass': 1.000, 'T': 0}],
                 'fuel_components': [{'name': 'H2(L)', 'mass': 1.000, 'T': 0}],
             })
+            self.sp_of_ratio.setValue(7.9370)
             self._update_of_from_mixture()
             
             self.statusBar().showMessage(
@@ -1028,19 +1045,58 @@ class MainWindow(QtWidgets.QMainWindow):
         pass
 
     def _update_of_from_mixture(self):
-        """Обновить O/F из текущей смеси компонентов."""
+        """Обновить подпись O/F (задаётся отдельным полем)."""
+        of = self.sp_of_ratio.value()
         mixture = self.mixture_widget.get_mixture()
-        ox_mass = sum(c['mass'] for c in mixture['ox_components'])
-        fu_mass = sum(c['mass'] for c in mixture['fuel_components'])
-        if fu_mass > 1e-9:
-            of = ox_mass / fu_mass
-            self.lbl_of.setText(f"O/F = {of:.4f}")
-        else:
-            self.lbl_of.setText("O/F = ∞")
+        ox_parts = sum(c['mass'] for c in mixture['ox_components'])
+        fu_parts = sum(c['mass'] for c in mixture['fuel_components'])
+        self.lbl_of.setText(f"O/F = {of:.4f}  (доли: OX={ox_parts:.3f}, FUEL={fu_parts:.3f})")
 
     def _open_component_selector(self):
         """(Устарено) Открыть диалог выбора компонентов."""
         pass
+
+    def _get_mixture_summary(self) -> Tuple[str, str]:
+        """Строки состава окислителя и горючего в формате Name(frac)."""
+        mixture = self.mixture_widget.get_mixture()
+
+        def _fmt(parts: List[Dict]) -> str:
+            if not parts:
+                return "—"
+            total = sum(max(0.0, float(p.get('mass', 0.0))) for p in parts)
+            if total <= 1e-12:
+                return " + ".join(f"{p.get('name', '?')}(0.000)" for p in parts)
+            chunks = []
+            for p in parts:
+                frac = max(0.0, float(p.get('mass', 0.0))) / total
+                chunks.append(f"{p.get('name', '?')}({frac:.3f})")
+            return " + ".join(chunks)
+
+        return _fmt(mixture.get('ox_components', [])), _fmt(mixture.get('fuel_components', []))
+
+    @staticmethod
+    def _get_composition_station_indices(stations: List[StationResult]) -> List[int]:
+        """Индексы 4 сечений для состава: камера, вход в сопло, горловина, срез."""
+        target_labels = ["injector", "nozzle inlet", "nozzle throat", "nozzle exit"]
+        idx_by_label = {
+            str(st.label).strip().lower(): i
+            for i, st in enumerate(stations)
+        }
+
+        indices: List[int] = []
+        for lbl in target_labels:
+            idx = idx_by_label.get(lbl)
+            if idx is not None and idx not in indices:
+                indices.append(idx)
+
+        if not indices and stations:
+            indices = [0, len(stations) - 1]
+
+        return sorted(indices)
+
+    def _get_composition_stations(self, stations: List[StationResult]) -> List[StationResult]:
+        indices = self._get_composition_station_indices(stations)
+        return [stations[i] for i in indices]
 
     def on_calculate(self):
         # Получить смесь из виджета
@@ -1070,6 +1126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         params = {
             'ox_components': mixture['ox_components'],
             'fuel_components': mixture['fuel_components'],
+            'of_ratio': self.sp_of_ratio.value(),
             'P_chamber': pv_to_pa(self.sp_Pc.value(), self.cb_Pc_unit.currentText()),
             'P_exit': pv_to_pa(self.sp_Pe.value(), self.cb_Pe_unit.currentText()),
             'n_inter': self.sp_n_inter.value(),
@@ -1172,8 +1229,9 @@ class MainWindow(QtWidgets.QMainWindow):
         s.append("  ТЯГОВЫЕ ХАРАКТЕРИСТИКИ")
         s.append("═" * 70)
         s.append("")
-        s.append(f"  Окислитель:           {self.cb_oxidizer.currentText()}")
-        s.append(f"  Горючее:              {self.cb_fuel.currentText()}")
+        ox_desc, fu_desc = self._get_mixture_summary()
+        s.append(f"  Окислитель:           {ox_desc}")
+        s.append(f"  Горючее:              {fu_desc}")
         s.append(f"  Массовое O/F:         {perf.O_F:.4f}")
         if not math.isnan(perf.O_F_stoich):
             s.append(f"  Стехиометр. O/F:      {perf.O_F_stoich:.4f}")
@@ -1213,7 +1271,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_species_view(self):
         if self.perf is None:
             return
-        stations = self.perf.stations
+        stations = self._get_composition_stations(self.perf.stations)
+        if not stations:
+            return
         sp_names = stations[0].species_names
         N = len(sp_names)
 
@@ -1496,7 +1556,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.perf is None:
             return
         style = self._collect_style()
-        stations = self.perf.stations
+        all_stations = self.perf.stations
+
         def length_to_m(v, unit):
             if unit == 'м':
                 return v
@@ -1506,12 +1567,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 return v * 0.001
             return v
 
-        x = build_nozzle_geometry(
-            stations,
+        x_all = build_nozzle_geometry(
+            all_stations,
             L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
             L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
             L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
         )
+        comp_idx = self._get_composition_station_indices(all_stations)
+        stations = [all_stations[i] for i in comp_idx]
+        x = np.array([x_all[i] for i in comp_idx])
+        if not stations:
+            return
+
         sp_names = stations[0].species_names
         N = len(sp_names)
         use_mole = self.rb_mole.isChecked()
@@ -1616,11 +1683,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 w = csv.writer(f, delimiter=';')
                 # Заголовок
                 w.writerow(['# RPA-Style Rocket Nozzle Calculator — Export'])
-                w.writerow([f'# Окислитель: {self.cb_oxidizer.currentText()}, '
-                            f'масса = {self.sp_ox_mass.value()} кг'])
-                w.writerow([f'# Горючее: {self.cb_fuel.currentText()}, '
-                            f'масса = {self.sp_fu_mass.value()} кг'])
-                w.writerow([f'# Pc = {self.sp_Pc.value()} МПа, Pe = {self.sp_Pe.value()} МПа'])
+                ox_desc, fu_desc = self._get_mixture_summary()
+                w.writerow([f'# Окислитель: {ox_desc}'])
+                w.writerow([f'# Горючее: {fu_desc}'])
+                w.writerow([f'# Pc = {self.sp_Pc.value()} МПа, Pe = {self.sp_Pe.value()} МПа, O/F(set) = {self.sp_of_ratio.value():.4f}'])
                 w.writerow([f'# O/F = {self.perf.O_F:.4f}, '
                             f'alpha = {self.perf.alpha:.4f}, '
                             f'Isp = {self.perf.Isp_s:.4f} c, '
@@ -1654,21 +1720,22 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"{s.mass_flux_kg_per_m2_s:.4f}",
                     ])
 
-                # Состав
+                # Состав: только 4 ключевых сечения
                 w.writerow([])
-                w.writerow(['# Мольные доли продуктов сгорания'])
-                sp_names = stations[0].species_names
-                w.writerow(['Компонент'] + [s.label for s in stations])
+                w.writerow(['# Мольные доли продуктов сгорания (Injector / Nozzle inlet / Nozzle throat / Nozzle exit)'])
+                comp_stations = self._get_composition_stations(stations)
+                sp_names = comp_stations[0].species_names
+                w.writerow(['Компонент'] + [s.label for s in comp_stations])
                 # Сортируем по максимуму
                 max_frac = np.zeros(len(sp_names))
-                for st in stations:
+                for st in comp_stations:
                     if st.mole_fractions is not None:
                         max_frac = np.maximum(max_frac, st.mole_fractions)
                 for idx in np.argsort(-max_frac):
                     if max_frac[idx] < 1e-8:
                         continue
                     row = [sp_names[idx]]
-                    for st in stations:
+                    for st in comp_stations:
                         v = st.mole_fractions[idx] if st.mole_fractions is not None else 0.0
                         row.append(f"{v:.6e}")
                     w.writerow(row)
@@ -1727,7 +1794,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(f"# Amesim XY export from {APP_NAME}\n")
-                f.write(f"# {self.cb_oxidizer.currentText()} / {self.cb_fuel.currentText()},  "
+                ox_desc, fu_desc = self._get_mixture_summary()
+                f.write(f"# {ox_desc} / {fu_desc},  "
                         f"Pc={self.sp_Pc.value()} MPa, Pe={self.sp_Pe.value()} MPa\n")
                 f.write(f"# O/F = {self.perf.O_F:.4f},  Isp = {self.perf.Isp_s:.4f} s,  "
                         f"C* = {self.perf.Cstar_m_per_s:.4f} m/s\n")
@@ -1762,12 +1830,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         cfg = {
-            'oxidizer': self.cb_oxidizer.currentText(),
-            'ox_mass': self.sp_ox_mass.value(),
-            'ox_T': self.sp_ox_T.value(),
-            'fuel': self.cb_fuel.currentText(),
-            'fu_mass': self.sp_fu_mass.value(),
-            'fu_T': self.sp_fu_T.value(),
+            'mixture': self.mixture_widget.get_mixture(),
+            'of_ratio': self.sp_of_ratio.value(),
             'Pc_MPa': self.sp_Pc.value(),
             'Pe_MPa': self.sp_Pe.value(),
             'n_inter': self.sp_n_inter.value(),
@@ -1804,12 +1868,24 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
-            self.cb_oxidizer.setCurrentText(cfg.get('oxidizer', 'O2(L)'))
-            self.sp_ox_mass.setValue(cfg.get('ox_mass', 7.937))
-            self.sp_ox_T.setValue(cfg.get('ox_T', 0.0))
-            self.cb_fuel.setCurrentText(cfg.get('fuel', 'H2(L)'))
-            self.sp_fu_mass.setValue(cfg.get('fu_mass', 1.0))
-            self.sp_fu_T.setValue(cfg.get('fu_T', 0.0))
+            mixture = cfg.get('mixture')
+            if mixture is not None:
+                self.mixture_widget.set_mixture(mixture)
+            else:
+                # Совместимость со старым форматом конфигурации.
+                self.mixture_widget.set_mixture({
+                    'ox_components': [{
+                        'name': cfg.get('oxidizer', 'O2(L)'),
+                        'mass': 1.0,
+                        'T': cfg.get('ox_T', 0.0),
+                    }],
+                    'fuel_components': [{
+                        'name': cfg.get('fuel', 'H2(L)'),
+                        'mass': 1.0,
+                        'T': cfg.get('fu_T', 0.0),
+                    }],
+                })
+            self.sp_of_ratio.setValue(cfg.get('of_ratio', 7.9370))
             self.sp_Pc.setValue(cfg.get('Pc_MPa', 10.0))
             self.sp_Pe.setValue(cfg.get('Pe_MPa', 0.1013))
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
@@ -1831,6 +1907,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_grid_major.setChecked(st.get('grid_major', True))
             self.chk_grid_minor.setChecked(st.get('grid_minor', True))
             self.chk_dark_plot.setChecked(st.get('dark', True))
+            self._update_of_from_mixture()
             self.statusBar().showMessage(f"Конфигурация загружена: {path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))

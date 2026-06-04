@@ -290,8 +290,8 @@ class ComponentListWidget(QtWidgets.QWidget):
             mass_spin.setRange(0.001, 1.0)
             mass_spin.setDecimals(3)
             mass_spin.setValue(comp['mass'])
-            mass_spin.setSingleStep(0.1)
-            mass_spin.setToolTip("Массовое соотношение между частями компонента (0.001–1). Пример: 0.5 + 0.5 для смеси H2 + CH4. Нажмите ⚖ чтобы нормализовать суммы в списке до 1.")
+            mass_spin.setSingleStep(0.001)
+            mass_spin.setToolTip("Массовая доля компонента внутри текущей группы (окислитель или горючее), диапазон 0.001–1. O/F задаётся отдельно в основной панели.")
             mass_spin.valueChanged.connect(
                 lambda val, r=row: self._update_mass(r, val)
             )
