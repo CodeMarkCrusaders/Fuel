@@ -244,6 +244,37 @@ def parse_thermo_file(filepath: str) -> Dict[str, Species]:
     return species_db
 
 
+def _is_ionic_or_charged_species_name(name: str) -> bool:
+    """Проверка, что имя соответствует иону/заряженной частице."""
+    return ('+' in name) or ('-' in name) or (name.strip().lower() == 'e-')
+
+
+def is_valid_propellant_component(sp: Species) -> bool:
+    """Фильтр «реалистичных» компонентов топлива/окислителя для выбора.
+
+    Условия:
+    - только из секции REACTANTS (штатные компоненты топлива);
+    - не ионы и не электроны;
+    - есть валидный элементный состав и молярная масса.
+    """
+    if not sp.is_reactant_only:
+        return False
+    if _is_ionic_or_charged_species_name(sp.name):
+        return False
+    if sp.mol_weight <= 0:
+        return False
+    if not sp.elements:
+        return False
+    return True
+
+
+def get_propellant_component_names(species_db: Dict[str, Species]) -> List[str]:
+    """Возвращает отсортированный список допустимых компонентов топлива."""
+    return sorted(
+        [sp.name for sp in species_db.values() if is_valid_propellant_component(sp)]
+    )
+
+
 def get_products_for_elements(
     species_db: Dict[str, Species],
     element_set: set,
@@ -257,7 +288,7 @@ def get_products_for_elements(
         if sp.is_reactant_only:
             continue
         # ионы пропускаем
-        if '+' in name or '-' in name or name == 'e-':
+        if _is_ionic_or_charged_species_name(name):
             continue
         # все элементы вещества должны быть в нашем наборе
         if not set(sp.elements.keys()).issubset(element_set):

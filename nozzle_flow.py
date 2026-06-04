@@ -561,7 +561,7 @@ def solve_rocket_nozzle(
         )
         st = _make_station('throat?', species_list, elements, r, P_try,
                            mass_total_g, H_chamber_per_kg,
-                           compute_equilibrium_derivatives=compute_equilibrium_derivatives)
+                           compute_equilibrium_derivatives=False)
         return st.M - 1.0, r, st
 
     # начальное приближение: P_throat ≈ P_chamber * (2/(gamma+1))^(gamma/(gamma-1))
@@ -595,7 +595,11 @@ def solve_rocket_nozzle(
                        f'P_throat = {P_throat:.0f} Па')
 
     _, throat_eq, station_throat = throat_residual(P_throat)
-    station_throat.label = 'Nozzle throat'
+    station_throat = _make_station(
+        'Nozzle throat', species_list, elements, throat_eq, P_throat,
+        mass_total_g, H_chamber_per_kg,
+        compute_equilibrium_derivatives=compute_equilibrium_derivatives,
+    )
     if logger.enabled:
         logger.log(f'P_throat = {P_throat:.0f} Па  ({P_throat/1e6:.5f} МПа)')
         logger.log(f'T_throat = {station_throat.T_K:.4f} К')
