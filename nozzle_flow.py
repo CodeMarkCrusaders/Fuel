@@ -714,10 +714,15 @@ def solve_rocket_nozzle(
 def get_valid_propellant_components(species_db: Dict[str, Species]) -> Tuple[List[str], List[str]]:
     """Возвращает списки допустимых окислителей и горючих для GUI.
 
-    Из выбора исключаются ионы/электроны и прочие нерелевантные записи.
+    Фильтрация выполняется в два шага:
+    1) берём только «чистые» молекулы-реагенты из NASA-базы (без ионов/электронов);
+    2) если доступен propellants_catalog.py, дополнительно ограничиваем выбор
+       справочными компонентами из каталога (убираем экзотические/нерелевантные
+       вещества, которые не должны появляться в обычном выборе топлива).
     """
     def _is_neutral_name(name: str) -> bool:
-        return '+' not in name and '-' not in name and name.lower() != 'e-'
+        lowered = name.lower()
+        return ('+' not in name) and ('-' not in name) and lowered not in {'e-', 'electron'}
 
     def _oxidation_capacity(sp: Species) -> float:
         return sp.elements.get('O', 0.0)
@@ -745,6 +750,20 @@ def get_valid_propellant_components(species_db: Dict[str, Species]) -> Tuple[Lis
         if red_dem > 0:
             fuels.append(name)
 
+    # Дополнительная «санитарная» фильтрация по каталогу RPA-style,
+    # чтобы в списках выбора не было неподходящих компонентов.
+    try:
+        from propellants_catalog import OXIDIZERS, FUELS
+
+        catalog_ox = {entry.name for entry in OXIDIZERS}
+        catalog_fu = {entry.name for entry in FUELS}
+
+        oxidizers = [name for name in oxidizers if name in catalog_ox]
+        fuels = [name for name in fuels if name in catalog_fu]
+    except Exception:
+        # fallback: если каталог недоступен, оставляем базовую фильтрацию.
+        pass
+
     return sorted(set(oxidizers)), sorted(set(fuels))
 
 
@@ -752,9 +771,9 @@ def optimize_lox_lh2_mixture_ratio(
     species_db: Dict[str, Species],
     P_chamber: float = 10e6,
     P_exit: float = 101325.0,
-    alpha_min: float = 0.5,
-    alpha_max: float = 1.4,
-    coarse_points: int = 11,
+    alpha_min: float = 0.40,
+    alpha_max: float = 0.90,
+    coarse_points: int = 7,
 ) -> Dict[str, object]:
     """Быстрый поиск оптимального O/F для LOX/LH2 по максимуму Isp.
 
@@ -819,7 +838,7 @@ def optimize_lox_lh2_mixture_ratio(
         _objective,
         bounds=(lo, hi),
         method='bounded',
-        options={'xatol': 5e-4, 'maxiter': 40},
+        options={'xatol': 5e-4, 'maxiter': 24},
     )
 
     alpha_best = float(opt.x)
