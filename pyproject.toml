@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fuel_equilibrium"
+version = "1.2.0"
+description = "Chemical equilibrium of combustion gases (NASA-9 + Gibbs minimization) with rocket nozzle gas dynamics and RPA-style PyQt5 GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Fuel Equilibrium contributors" },
+]
+keywords = [
+    "chemical-equilibrium",
+    "nasa-9",
+    "rocket-nozzle",
+    "thermodynamics",
+    "gibbs-minimization",
+    "cea",
+    "rpa",
+    "combustion",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+# Базовое ядро: чистая термодинамика и расчёт сопла.
+# Без GUI и без CEA-решателя — их ставят опционально.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "tabulate>=0.9.0",
+]
+
+[project.optional-dependencies]
+# GUI на PyQt5 + графики
+gui = [
+    "PyQt5>=5.15",
+    "matplotlib>=3.7",
+]
+# CEA-эквивалентный решатель через Cantera
+cea = [
+    "cantera>=3.0",
+]
+# Всё сразу
+all = [
+    "PyQt5>=5.15",
+    "matplotlib>=3.7",
+    "cantera>=3.0",
+]
+
+[project.scripts]
+fuel-equilibrium      = "fuel_equilibrium.core.equilibrium:run_interactive"
+fuel-equilibrium-csv  = "fuel_equilibrium.io.csv_runner:main"
+
+[project.gui-scripts]
+fuel-equilibrium-gui  = "fuel_equilibrium.gui:main"
+
+[project.urls]
+Homepage = "https://example.com/fuel_equilibrium"
+
+# ─── setuptools ────────────────────────────────────────────────────────────
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fuel_equilibrium", "fuel_equilibrium.*"]
+
+[tool.setuptools.package-data]
+# термодинамические базы NASA-9 поставляются вместе с пакетом
+"fuel_equilibrium" = ["data/*.inp"]
