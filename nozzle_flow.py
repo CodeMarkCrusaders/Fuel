@@ -21,7 +21,7 @@ import math
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize_scalar
 
 from nasa9_parser import Species, parse_thermo_file, get_products_for_elements
 from thermo_calc import h_over_RT, s_over_R, cp_over_R, g_over_RT, R_UNIVERSAL
@@ -317,6 +317,7 @@ def _make_station(
     total_mass_g: float,
     H_chamber_per_kg: float,
     Cstar: Optional[float] = None,
+    compute_equilibrium_derivatives: bool = True,
 ) -> StationResult:
     """Из решения TP/SP-задачи собирает полный набор параметров сечения."""
     T = result_eq.T
@@ -350,15 +351,24 @@ def _make_station(
     cv_f_per_kg = cv_f / mass_kg
 
     # «равновесное» Cp, Cv и gamma_s (численные производные)
-    try:
-        cp_eq, cv_eq, gamma_s, a_eq, _ = equilibrium_cp_and_sound_speed(
-            sp_list, element_abundances, T, P, moles
-        )
-        cp_eq_per_kg = cp_eq / mass_kg
-        cv_eq_per_kg = cv_eq / mass_kg
-        # NASA RP-1311: Gamma = Cp_eq / Cv_eq (отличается от gamma_s = isentropic exp.)
-        gamma_eq = cp_eq / cv_eq if cv_eq > 1e-30 else gamma_f
-    except Exception:
+    # Для быстрого режима можно отключить численные производные —
+    # это значительно ускоряет многократные прогоны (поиск оптимального O/F).
+    if compute_equilibrium_derivatives:
+        try:
+            cp_eq, cv_eq, gamma_s, a_eq, _ = equilibrium_cp_and_sound_speed(
+                sp_list, element_abundances, T, P, moles
+            )
+            cp_eq_per_kg = cp_eq / mass_kg
+            cv_eq_per_kg = cv_eq / mass_kg
+            # NASA RP-1311: Gamma = Cp_eq / Cv_eq (отличается от gamma_s = isentropic exp.)
+            gamma_eq = cp_eq / cv_eq if cv_eq > 1e-30 else gamma_f
+        except Exception:
+            cp_eq_per_kg = cp_f_per_kg
+            cv_eq_per_kg = cv_f_per_kg
+            gamma_s = gamma_f
+            gamma_eq = gamma_f
+            a_eq = math.sqrt(gamma_f * R_spec * T)
+    else:
         cp_eq_per_kg = cp_f_per_kg
         cv_eq_per_kg = cv_f_per_kg
         gamma_s = gamma_f
@@ -432,6 +442,7 @@ def solve_rocket_nozzle(
     verbose: bool = False,
     logger: Optional[IterationLogger] = None,
     max_gas_species: int = 60,
+    compute_equilibrium_derivatives: bool = True,
 ) -> RocketPerformance:
     """Полный расчёт ракетного сопла в равновесном приближении.
 
@@ -447,6 +458,10 @@ def solve_rocket_nozzle(
     """
     if logger is None:
         logger = NullLogger()
+
+    # по требованию считаем только 4 сечения:
+    # Injector, Nozzle inlet, Nozzle throat, Nozzle exit.
+    n_intermediate_stations = 0
 
     # ── 1) Энтальпия реагентов и элементный баланс ─────────────────────
     components = [oxidizer, fuel]
@@ -525,6 +540,7 @@ def solve_rocket_nozzle(
     station_chamber = _make_station(
         'Injector', species_list, elements, chamber, P_chamber,
         mass_total_g, H_chamber_per_kg,
+        compute_equilibrium_derivatives=compute_equilibrium_derivatives,
     )
 
     # ── 4) Поиск горловины (M=1) ───────────────────────────────────────
@@ -544,7 +560,8 @@ def solve_rocket_nozzle(
             tol_S=1e-6,
         )
         st = _make_station('throat?', species_list, elements, r, P_try,
-                           mass_total_g, H_chamber_per_kg)
+                           mass_total_g, H_chamber_per_kg,
+                           compute_equilibrium_derivatives=compute_equilibrium_derivatives)
         return st.M - 1.0, r, st
 
     # начальное приближение: P_throat ≈ P_chamber * (2/(gamma+1))^(gamma/(gamma-1))
@@ -602,6 +619,7 @@ def solve_rocket_nozzle(
     station_exit = _make_station(
         'Nozzle exit', species_list, elements, exit_eq, P_exit,
         mass_total_g, H_chamber_per_kg,
+        compute_equilibrium_derivatives=compute_equilibrium_derivatives,
     )
 
     # ── 6) "Nozzle inlet" — формально считаем что вход в сопло = камера
@@ -609,6 +627,7 @@ def solve_rocket_nozzle(
     station_inlet = _make_station(
         'Nozzle inlet', species_list, elements, chamber, P_chamber,
         mass_total_g, H_chamber_per_kg,
+        compute_equilibrium_derivatives=compute_equilibrium_derivatives,
     )
 
     # ── 7) Промежуточные сечения между throat и exit ───────────────────
@@ -632,6 +651,7 @@ def solve_rocket_nozzle(
             st = _make_station(
                 f'Section {k}', species_list, elements, r_k, float(P_k),
                 mass_total_g, H_chamber_per_kg,
+                compute_equilibrium_derivatives=compute_equilibrium_derivatives,
             )
             intermediate.append(st)
 
@@ -685,6 +705,148 @@ def solve_rocket_nozzle(
         CF=CF,
         stations=stations,
     )
+
+
+def get_valid_propellant_components(species_db: Dict[str, Species]) -> Tuple[List[str], List[str]]:
+    """Возвращает списки допустимых окислителей и горючих для GUI.
+
+    Из выбора исключаются ионы/электроны и прочие нерелевантные записи.
+    """
+    def _is_neutral_name(name: str) -> bool:
+        return '+' not in name and '-' not in name and name.lower() != 'e-'
+
+    def _oxidation_capacity(sp: Species) -> float:
+        return sp.elements.get('O', 0.0)
+
+    def _reduction_demand(sp: Species) -> float:
+        e = sp.elements
+        return 2.0 * e.get('C', 0.0) + 0.5 * e.get('H', 0.0) - e.get('O', 0.0)
+
+    oxidizers: List[str] = []
+    fuels: List[str] = []
+
+    for name, sp in species_db.items():
+        if not sp.is_reactant_only:
+            continue
+        if not _is_neutral_name(name):
+            continue
+        if sp.mol_weight <= 0:
+            continue
+
+        ox_cap = _oxidation_capacity(sp)
+        red_dem = _reduction_demand(sp)
+
+        if ox_cap > 0 and red_dem <= 0:
+            oxidizers.append(name)
+        if red_dem > 0:
+            fuels.append(name)
+
+    return sorted(set(oxidizers)), sorted(set(fuels))
+
+
+def optimize_lox_lh2_mixture_ratio(
+    species_db: Dict[str, Species],
+    P_chamber: float = 10e6,
+    P_exit: float = 101325.0,
+    alpha_min: float = 0.5,
+    alpha_max: float = 1.4,
+    coarse_points: int = 11,
+) -> Dict[str, object]:
+    """Быстрый поиск оптимального O/F для LOX/LH2 по максимуму Isp.
+
+    Поиск ускорен:
+    1) грубая сетка по alpha;
+    2) локальная дооптимизация bounded Brent;
+    3) fast-mode (без дорогих численных производных Cp_eq/Cv_eq).
+    """
+    if "O2(L)" not in species_db or "H2(L)" not in species_db:
+        raise ValueError("Для оптимизации нужны O2(L) и H2(L) в NASA-базе.")
+
+    of_stoich = stoichiometric_OF([species_db["O2(L)"]], [species_db["H2(L)"]])
+    if not (math.isfinite(of_stoich) and of_stoich > 0):
+        raise ValueError("Не удалось вычислить стехиометрическое O/F для O2(L)/H2(L).")
+
+    cache: Dict[float, RocketPerformance] = {}
+    eval_count = 0
+
+    def _perf_for_alpha(alpha: float) -> RocketPerformance:
+        nonlocal eval_count
+        key = round(float(alpha), 6)
+        if key in cache:
+            return cache[key]
+
+        of_target = key * of_stoich
+        mass_fu = 1.0 / (1.0 + of_target)
+        mass_ox = 1.0 - mass_fu
+
+        perf = solve_rocket_nozzle(
+            oxidizer=Propellant("O2(L)", mass_kg=mass_ox),
+            fuel=Propellant("H2(L)", mass_kg=mass_fu),
+            P_chamber=P_chamber,
+            P_exit=P_exit,
+            species_db=species_db,
+            n_intermediate_stations=0,
+            include_condensed=True,
+            verbose=False,
+            logger=NullLogger(),
+            compute_equilibrium_derivatives=False,
+        )
+        cache[key] = perf
+        eval_count += 1
+        return perf
+
+    def _objective(alpha: float) -> float:
+        return -_perf_for_alpha(alpha).Isp_s
+
+    coarse_points = max(5, int(coarse_points))
+    coarse_grid = np.linspace(alpha_min, alpha_max, coarse_points)
+    coarse_vals = [(_objective(a), a) for a in coarse_grid]
+    _, alpha_seed = min(coarse_vals, key=lambda t: t[0])
+
+    idx = int(np.argmin([v for v, _ in coarse_vals]))
+    lo_idx = max(0, idx - 1)
+    hi_idx = min(len(coarse_grid) - 1, idx + 1)
+    lo = float(coarse_grid[lo_idx])
+    hi = float(coarse_grid[hi_idx])
+    if hi <= lo:
+        lo, hi = alpha_min, alpha_max
+
+    opt = minimize_scalar(
+        _objective,
+        bounds=(lo, hi),
+        method='bounded',
+        options={'xatol': 5e-4, 'maxiter': 40},
+    )
+
+    alpha_best = float(opt.x)
+    perf_fast = _perf_for_alpha(alpha_best)
+
+    # Финальный точный пересчёт (те же 4 сечения, но с полноценными производными).
+    of_target = alpha_best * of_stoich
+    mass_fu = 1.0 / (1.0 + of_target)
+    mass_ox = 1.0 - mass_fu
+    perf_final = solve_rocket_nozzle(
+        oxidizer=Propellant("O2(L)", mass_kg=mass_ox),
+        fuel=Propellant("H2(L)", mass_kg=mass_fu),
+        P_chamber=P_chamber,
+        P_exit=P_exit,
+        species_db=species_db,
+        n_intermediate_stations=0,
+        include_condensed=True,
+        verbose=False,
+        logger=NullLogger(),
+        compute_equilibrium_derivatives=True,
+    )
+
+    return {
+        'alpha_opt': alpha_best,
+        'of_stoich': of_stoich,
+        'of_opt': perf_final.O_F,
+        'isp_opt_s': perf_final.Isp_s,
+        'perf': perf_final,
+        'perf_fast': perf_fast,
+        'evaluations': eval_count,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

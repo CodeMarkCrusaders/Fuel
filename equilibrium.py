@@ -415,74 +415,10 @@ def run_interactive():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# GUI entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import argparse
+    from gui_app import run_gui
 
-    cli = argparse.ArgumentParser(
-        description="Расчёт химического равновесия (TP / HP / SP)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Примеры:\n"
-            "  TP:  python equilibrium.py -r '2H2 + O2' -T 3000 -P '1 atm'\n"
-            "  HP:  python equilibrium.py -r '2H2 + O2' --HP -H -200000 -P '1 atm'\n"
-            "  SP:  python equilibrium.py -r '2H2 + O2' --SP -S 700    -P '1 atm'\n"
-            "  с логом итераций:\n"
-            "       python equilibrium.py -r '2H2 + O2' -T 3000 -P '1 atm' --log run.log\n"
-        ),
-    )
-    cli.add_argument('--reactants', '-r', type=str)
-    cli.add_argument('--temperature', '-T', type=float, help='температура (К) для TP')
-    cli.add_argument('--enthalpy', '-H', type=float, help='энтальпия (Дж) для HP')
-    cli.add_argument('--entropy',  '-S', type=float, help='энтропия (Дж/К) для SP')
-    cli.add_argument('--pressure', '-P', type=str)
-    cli.add_argument('--HP', action='store_true', help='HP-задача (нужны H и P)')
-    cli.add_argument('--SP', action='store_true', help='SP-задача (нужны S и P)')
-    cli.add_argument('--T-init', type=float, default=2000.0,
-                     help='начальная T для внешних итераций HP/SP (по умолч. 2000 К)')
-    cli.add_argument('--thermo-db', type=str)
-    cli.add_argument('--no-condensed', action='store_true')
-    cli.add_argument('--verbose', '-v', action='store_true')
-    cli.add_argument('--log', dest='log_path', type=str, default=None,
-                     help='путь к файлу с подробным журналом итераций')
-    args = cli.parse_args()
-
-    # определяем тип задачи
-    if args.HP:
-        problem_type = 'HP'
-    elif args.SP:
-        problem_type = 'SP'
-    else:
-        problem_type = 'TP'
-
-    # пакетный режим возможен, если переданы реагенты и P, и нужный целевой параметр
-    have_target = (
-        (problem_type == 'TP' and args.temperature is not None) or
-        (problem_type == 'HP' and args.enthalpy   is not None) or
-        (problem_type == 'SP' and args.entropy    is not None)
-    )
-
-    if args.reactants and args.pressure and have_target:
-        P = parse_pressure(args.pressure)
-        db_path = args.thermo_db or find_thermo_db()
-        species_db = parse_thermo_file(db_path)
-        result = run_batch(
-            reactants=args.reactants,
-            P=P,
-            T=args.temperature,
-            H=args.enthalpy,
-            S=args.entropy,
-            problem_type=problem_type,
-            thermo_db_path=args.thermo_db,
-            include_condensed=not args.no_condensed,
-            verbose=args.verbose,
-            log_path=args.log_path,
-            T_init=args.T_init,
-        )
-        print_result(result, species_db)
-        if args.log_path:
-            print(f"\n  Журнал итераций сохранён в: {args.log_path}")
-    else:
-        run_interactive()
+    run_gui()
