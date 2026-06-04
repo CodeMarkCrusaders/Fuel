@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import sys
 import time
 import traceback
@@ -73,9 +74,43 @@ from nozzle_flow import (
 )
 from iteration_logger import IterationLogger, NullLogger
 
+# единицы давления и каталог топливных пар + оптимизатор соотношения
+from units import parse_pressure, convert_pressure_pa_to
+from propellants_catalog import resolve_propellant
+from propellant_optimizer import (
+    RatioSpec, OptimizationResult, find_optimal_OF,
+)
+
 getcontext().prec = 28
 
 R_UNIVERSAL_J_KMOL_K = 8314.46261815324  # Дж/(кмоль·К)
+
+DEFAULT_OXIDIZER = "O2(L)"
+DEFAULT_FUEL = "H2(L)"
+DEFAULT_PC_PA = 10.0e6
+DEFAULT_PE_PA = 101325.0
+_OPT_KEYWORDS = {"opt", "optimal", "auto", "best", "оптимум", "авто"}
+
+
+def _is_likely_ion_name(name: str) -> bool:
+    n = name.strip()
+    if n.lower() == "e-":
+        return True
+    return bool(re.search(r"[A-Za-z0-9)](?:\+|-)$", n))
+
+
+def _is_valid_propellant_component(sp: Species) -> bool:
+    if not sp.is_reactant_only:
+        return False
+    if _is_likely_ion_name(sp.name):
+        return False
+    if sp.mol_weight <= 0 or not sp.elements:
+        return False
+    return True
+
+
+def list_selectable_propellant_components(species_db: Dict[str, Species]) -> List[str]:
+    return sorted(sp.name for sp in species_db.values() if _is_valid_propellant_component(sp))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,10 +237,113 @@ def read_csv_rows(path: Path):
             yield row
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Парсинг колонок с давлением (поддержка любых единиц)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_pressure_values(
+    row: dict,
+    base: str,
+    default_unit: str,
+) -> List[float]:
+    """Достаёт давление(я) в Па из CSV. Поддерживает:
+
+    1) Колонка ``{base}`` со строкой «10 MPa», «1 атм», «100 kgf/cm²» и т.п.
+       (если колонка без единиц — используется ``{base}_unit`` или
+       ``default_unit``).
+    2) Старые колонки ``{base}_MPa`` / ``{base}_MPa_from/_to/_step`` (число в МПа).
+    3) Новые колонки диапазона ``{base}_from`` / ``_to`` / ``_step`` (строки
+       с единицами или числа в ``{base}_unit``/``default_unit``).
+
+    Возвращает список значений в Паскалях.
+    """
+    # 1) современная колонка "Pc" / "Pe" с произвольным форматом строки
+    explicit_unit = (str(row.get(f"{base}_unit", "")).strip() or default_unit)
+
+    if has_value(row, base):
+        raw = str(row[base]).strip()
+        return [parse_pressure(raw, default_unit=explicit_unit)]
+
+    # 2) старая колонка "Pc_MPa" / "Pe_MPa"
+    if has_value(row, f"{base}_MPa"):
+        return [parse_float(row[f"{base}_MPa"]) * 1.0e6]
+
+    # 3) диапазон from/to/step — пробуем сначала «{base}_from/_to/_step»
+    if (has_value(row, f"{base}_from")
+            and has_value(row, f"{base}_to")
+            and has_value(row, f"{base}_step")):
+        # каждое значение может быть строкой с единицами или числом
+        a = str(row[f"{base}_from"]).strip()
+        b = str(row[f"{base}_to"]).strip()
+        st = str(row[f"{base}_step"]).strip()
+        # для «от/до» — позволяем смешанные единицы (но обычно одни и те же)
+        # шаг ВСЕГДА считается в тех же единицах, что и «от» (или в base_unit)
+        # Чтобы поддержать range("8 MPa", "12 MPa", "2 MPa") — переводим
+        # сначала «от» и «до» в Па; затем шаг — берём из той же единицы.
+        p_from = parse_pressure(a, default_unit=explicit_unit)
+        p_to   = parse_pressure(b, default_unit=explicit_unit)
+        # шаг — попробуем как давление, если не получится, считаем в МПа
+        try:
+            p_step = parse_pressure(st, default_unit=explicit_unit)
+        except Exception:
+            p_step = parse_float(st) * 1.0e6
+        # Decimal-арифметика для устойчивого шага
+        try:
+            start = Decimal(str(p_from))
+            stop  = Decimal(str(p_to))
+            step  = Decimal(str(p_step))
+            return decimal_range(start, stop, step)
+        except Exception:
+            # fallback: float-арифметика
+            vals: List[float] = []
+            x = p_from
+            if p_step > 0:
+                while x <= p_to + 1e-9 * max(abs(p_to), 1.0):
+                    vals.append(x)
+                    x += p_step
+            else:
+                while x >= p_to - 1e-9 * max(abs(p_to), 1.0):
+                    vals.append(x)
+                    x += p_step
+            return vals
+
+    # 4) старый диапазон в МПа
+    if (has_value(row, f"{base}_MPa_from")
+            and has_value(row, f"{base}_MPa_to")
+            and has_value(row, f"{base}_MPa_step")):
+        start = parse_decimal(row[f"{base}_MPa_from"]) * Decimal("1000000")
+        stop  = parse_decimal(row[f"{base}_MPa_to"])   * Decimal("1000000")
+        step  = parse_decimal(row[f"{base}_MPa_step"]) * Decimal("1000000")
+        return decimal_range(start, stop, step)
+
+    raise KeyError(
+        f"Для параметра {base!r} не найдено ни одного варианта столбцов: "
+        f"'{base}', '{base}_MPa', '{base}_from/_to/_step', "
+        f"'{base}_MPa_from/_to/_step'"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Разворачивание строки CSV в список кейсов
+# ─────────────────────────────────────────────────────────────────────────────
+
 def expand_cases_from_input_row(row: dict) -> List[dict]:
-    """Развёртывает одну строку входного CSV в список расчётных кейсов."""
-    oxidizer = str(pick(row, "oxidizer", "Окислитель")).strip()
-    fuel = str(pick(row, "fuel", "Горючее")).strip()
+    """Развёртывает одну строку входного CSV в список расчётных кейсов.
+
+    Поддерживает три режима задания соотношения компонентов:
+      ratio_mode = OF        → задаётся O/F (одиночное или диапазон)
+      ratio_mode = alpha     → задаётся α (одиночное или диапазон)  [по умолч.]
+      ratio_mode = optimal   → авто-поиск максимума по target (Isp/Isp_vac/...)
+
+    Давление поддерживает любые единицы: 'Pc' = '10 MPa' / '100 atm' / '1500 psi' и т.п.
+    Сохранена обратная совместимость со старыми колонками Pc_MPa, Pe_MPa, alpha.
+    """
+    raw_ox = str(row.get("oxidizer") or row.get("Окислитель") or DEFAULT_OXIDIZER).strip()
+    raw_fu = str(row.get("fuel") or row.get("Горючее") or DEFAULT_FUEL).strip()
+
+    # разрешаем псевдонимы из каталога (RPA-style: 'LOX', 'НДМГ' и т.п.)
+    _, oxidizer = resolve_propellant(raw_ox, kind="oxidizer")
+    _, fuel     = resolve_propellant(raw_fu, kind="fuel")
 
     # температуры — опциональные; None означает «возьми из базы / 298.15»
     def _opt_T(val):
@@ -216,20 +354,91 @@ def expand_cases_from_input_row(row: dict) -> List[dict]:
     oxidizer_temp_k = _opt_T(row.get("oxidizer_temp_K"))
     fuel_temp_k = _opt_T(row.get("fuel_temp_K"))
 
-    pc_values = get_values_from_row(
-        row,
-        single_key="Pc_MPa",
-        from_key="Pc_MPa_from",
-        to_key="Pc_MPa_to",
-        step_key="Pc_MPa_step",
-    )
-    pe_values = get_values_from_row(
-        row,
-        single_key="Pe_MPa",
-        from_key="Pe_MPa_from",
-        to_key="Pe_MPa_to",
-        step_key="Pe_MPa_step",
-    )
+    # ── давление ───────────────────────────────────────────────────────
+    has_pc = any(has_value(row, k) for k in ("Pc", "Pc_MPa", "Pc_from", "Pc_to", "Pc_step", "Pc_MPa_from", "Pc_MPa_to", "Pc_MPa_step"))
+    has_pe = any(has_value(row, k) for k in ("Pe", "Pe_MPa", "Pe_from", "Pe_to", "Pe_step", "Pe_MPa_from", "Pe_MPa_to", "Pe_MPa_step"))
+    pc_values_pa = _get_pressure_values(row, base="Pc", default_unit="MPa") if has_pc else [DEFAULT_PC_PA]
+    pe_values_pa = _get_pressure_values(row, base="Pe", default_unit="MPa") if has_pe else [DEFAULT_PE_PA]
+
+    # По требованию считаем только 4 сечения: Injector / Inlet / Throat / Exit.
+    n_intermediate = 0
+    top_species = parse_int_optional(row.get("top_species"), default=12)
+
+    # ── режим задания соотношения ───────────────────────────────────────
+    ratio_mode = (str(row.get("ratio_mode", "")).strip().lower() or None)
+    alpha_raw = str(row.get("alpha", "")).strip().lower()
+
+    # Авто-режим для LOX/LH2: если alpha не задана (или alpha=opt/auto),
+    # включаем ускорённый поиск оптимального массового соотношения.
+    if ratio_mode is None and (not alpha_raw or alpha_raw in _OPT_KEYWORDS):
+        ratio_mode = "optimal"
+
+    # «оптимизация» — отдельная ветка
+    if ratio_mode in ("optimal", "optimize", "opt", "оптимум", "оптимально",
+                      "оптимальное", "автомат", "авто"):
+        target = (str(row.get("optimize_target", "") or "Isp").strip())
+        # допустимые цели и нормализация
+        target_map = {
+            "isp": "Isp", "i_sp": "Isp", "исп": "Isp", "уи": "Isp",
+            "isp_vac": "Isp_vac", "isp_vacuum": "Isp_vac",
+            "исп_вак": "Isp_vac", "уи_вак": "Isp_vac",
+            "cstar": "Cstar", "c*": "Cstar", "характеристическая": "Cstar",
+            "t_chamber": "T_chamber", "tc": "T_chamber", "температура": "T_chamber",
+        }
+        tnorm = target_map.get(target.strip().lower(), target)
+
+        a_min = parse_float(row.get("alpha_min"), default=0.5)
+        a_max = parse_float(row.get("alpha_max"), default=1.2)
+        n_grid = parse_int_optional(row.get("n_grid"), default=7)
+        refine_str = str(row.get("refine", "") or "true").strip().lower()
+        refine = refine_str in ("1", "true", "yes", "да", "y", "t")
+
+        cases: List[dict] = []
+        for pc_pa, pe_pa in product(pc_values_pa, pe_values_pa):
+            cases.append({
+                "oxidizer": oxidizer,
+                "fuel": fuel,
+                "oxidizer_temp_K": oxidizer_temp_k,
+                "fuel_temp_K": fuel_temp_k,
+                "Pc_Pa": pc_pa,
+                "Pe_Pa": pe_pa,
+                "ratio_mode": "optimal",
+                "optimize_target": tnorm,
+                "alpha_min": a_min,
+                "alpha_max": a_max,
+                "n_grid": n_grid,
+                "refine": refine,
+                "n_intermediate_stations": n_intermediate,
+                "top_species": top_species,
+            })
+        return cases
+
+    # «OF» — задаётся O/F
+    if ratio_mode in ("of", "o/f", "o_f", "k", "к", "км", "km"):
+        of_values = get_values_from_row(
+            row,
+            single_key="OF",
+            from_key="OF_from",
+            to_key="OF_to",
+            step_key="OF_step",
+        )
+        cases = []
+        for pc_pa, pe_pa, of in product(pc_values_pa, pe_values_pa, of_values):
+            cases.append({
+                "oxidizer": oxidizer,
+                "fuel": fuel,
+                "oxidizer_temp_K": oxidizer_temp_k,
+                "fuel_temp_K": fuel_temp_k,
+                "Pc_Pa": pc_pa,
+                "Pe_Pa": pe_pa,
+                "ratio_mode": "OF",
+                "OF": of,
+                "n_intermediate_stations": n_intermediate,
+                "top_species": top_species,
+            })
+        return cases
+
+    # По умолчанию — режим alpha (обратная совместимость со старыми CSV)
     alpha_values = get_values_from_row(
         row,
         single_key="alpha",
@@ -238,18 +447,16 @@ def expand_cases_from_input_row(row: dict) -> List[dict]:
         step_key="alpha_step",
     )
 
-    n_intermediate = parse_int_optional(row.get("n_intermediate_stations"), default=0)
-    top_species = parse_int_optional(row.get("top_species"), default=12)
-
-    cases: List[dict] = []
-    for pc_mpa, pe_mpa, alpha in product(pc_values, pe_values, alpha_values):
+    cases = []
+    for pc_pa, pe_pa, alpha in product(pc_values_pa, pe_values_pa, alpha_values):
         cases.append({
             "oxidizer": oxidizer,
             "fuel": fuel,
             "oxidizer_temp_K": oxidizer_temp_k,
             "fuel_temp_K": fuel_temp_k,
-            "Pc_MPa": pc_mpa,
-            "Pe_MPa": pe_mpa,
+            "Pc_Pa": pc_pa,
+            "Pe_Pa": pe_pa,
+            "ratio_mode": "alpha",
             "alpha": alpha,
             "n_intermediate_stations": n_intermediate,
             "top_species": top_species,
@@ -299,18 +506,79 @@ def calculate_case(
     case: dict,
     species_db: Dict[str, Species],
     logger: Optional[IterationLogger] = None,
-) -> RocketPerformance:
-    """Запуск нашего решателя для одного кейса (Pc, Pe, alpha)."""
-    pc_mpa = case["Pc_MPa"]
-    pe_mpa = case["Pe_MPa"]
-    alpha = case["alpha"]
+) -> tuple:
+    """Запуск нашего решателя для одного кейса.
 
-    if pc_mpa <= 0:
+    Возвращает (perf, opt_result) где opt_result — OptimizationResult
+    (только для ratio_mode='optimal', иначе None).
+    """
+    pc_pa = case["Pc_Pa"]
+    pe_pa = case["Pe_Pa"]
+
+    if pc_pa <= 0:
         raise ValueError("Pc должно быть > 0")
-    if pe_mpa <= 0:
+    if pe_pa <= 0:
         raise ValueError("Pe должно быть > 0")
-    if pe_mpa >= pc_mpa:
+    if pe_pa >= pc_pa:
         raise ValueError("Должно выполняться Pe < Pc")
+
+    mode = case.get("ratio_mode", "alpha")
+
+    ox_sp = species_db.get(case["oxidizer"])
+    fu_sp = species_db.get(case["fuel"])
+    if ox_sp is None or fu_sp is None:
+        raise ValueError("Окислитель или горючее не найдены в базе NASA-9")
+    if not _is_valid_propellant_component(ox_sp) or not _is_valid_propellant_component(fu_sp):
+        raise ValueError(
+            "Выбранный компонент исключён: ионы и нереалистичные компоненты топлива не допускаются"
+        )
+
+    # ── режим optimal: вызываем оптимизатор ──────────────────────────
+    if mode == "optimal":
+        spec = RatioSpec(
+            mode="optimal",
+            target=case.get("optimize_target", "Isp"),
+            alpha_min=float(case.get("alpha_min", 0.3)),
+            alpha_max=float(case.get("alpha_max", 1.6)),
+            n_grid=int(case.get("n_grid", 13)),
+            refine=bool(case.get("refine", True)),
+        )
+        opt = find_optimal_OF(
+            oxidizer_name=case["oxidizer"],
+            fuel_name=case["fuel"],
+            spec=spec,
+            P_chamber_Pa=pc_pa, P_exit_Pa=pe_pa,
+            species_db=species_db,
+            oxidizer_T_K=case.get("oxidizer_temp_K"),
+            fuel_T_K=case.get("fuel_temp_K"),
+            n_intermediate_stations=0,
+            include_condensed=True,
+            logger=logger,
+        )
+        return opt.perf, opt
+
+    # ── режим OF: задано массовое соотношение ─────────────────────────
+    if mode == "OF":
+        of_actual = float(case["OF"])
+        if of_actual <= 0:
+            raise ValueError("O/F должно быть > 0")
+        m_fu = 1.0 / (1.0 + of_actual)
+        m_ox = 1.0 - m_fu
+        ox = Propellant(name=case["oxidizer"], mass_kg=m_ox, T_K=case.get("oxidizer_temp_K"))
+        fu = Propellant(name=case["fuel"],     mass_kg=m_fu, T_K=case.get("fuel_temp_K"))
+        perf = solve_rocket_nozzle(
+            oxidizer=ox, fuel=fu,
+            P_chamber=pc_pa, P_exit=pe_pa,
+            species_db=species_db,
+            n_intermediate_stations=0,
+            include_condensed=True,
+            verbose=False,
+            logger=logger if logger is not None else NullLogger(),
+        )
+        return perf, None
+
+    # ── режим alpha (по умолчанию) ───────────────────────────────────
+    alpha = float(case["alpha"])
     if alpha <= 0:
         raise ValueError("alpha должно быть > 0")
 
@@ -323,15 +591,14 @@ def calculate_case(
 
     perf = solve_rocket_nozzle(
         oxidizer=ox, fuel=fu,
-        P_chamber=pc_mpa * 1e6,
-        P_exit=pe_mpa * 1e6,
+        P_chamber=pc_pa, P_exit=pe_pa,
         species_db=species_db,
-        n_intermediate_stations=case.get("n_intermediate_stations", 0),
+        n_intermediate_stations=0,
         include_condensed=True,
         verbose=False,
         logger=logger if logger is not None else NullLogger(),
     )
-    return perf
+    return perf, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,6 +616,8 @@ CASE_HEADER_FIELDS = [
     "T_горючего_К",
     "Pc_задано_МПа",
     "Pe_задано_МПа",
+    "Режим_задания_соотношения",
+    "Цель_оптимизации",
     "Коэффициент_избытка_окислителя_alpha",
     "phi",
     "Стехиометрическое_соотношение_O_F",
@@ -518,18 +787,26 @@ def process_file(
     t0 = time.time()
     for k, (meta, case) in enumerate(zip(case_meta, all_cases), start=1):
         if not quiet:
+            mode = case.get("ratio_mode", "alpha")
+            if mode == "optimal":
+                ratio_str = f"OPTIMAL[{case.get('optimize_target', 'Isp')}]"
+            elif mode == "OF":
+                ratio_str = f"O/F={case['OF']}"
+            else:
+                ratio_str = f"α={case.get('alpha')}"
             print(f"      [{k}/{len(all_cases)}] "
                   f"{case['oxidizer']}/{case['fuel']}  "
-                  f"Pc={case['Pc_MPa']} МПа  Pe={case['Pe_MPa']} МПа  "
-                  f"α={case['alpha']}", file=sys.stderr)
+                  f"Pc={case['Pc_Pa']/1e6:.4f} МПа  "
+                  f"Pe={case['Pe_Pa']/1e6:.4f} МПа  "
+                  f"{ratio_str}", file=sys.stderr)
         try:
             if log_dir is not None:
                 log_path = log_dir / f"case_{meta['Глобальный_ID_варианта']:04d}.log"
                 with IterationLogger(str(log_path)) as logger:
-                    perf = calculate_case(case, species_db, logger=logger)
+                    perf, opt_res = calculate_case(case, species_db, logger=logger)
             else:
-                perf = calculate_case(case, species_db, logger=None)
-            successes.append((meta, case, perf))
+                perf, opt_res = calculate_case(case, species_db, logger=None)
+            successes.append((meta, case, perf, opt_res))
         except Exception as e:
             tb = traceback.format_exc(limit=2)
             failures.append({
@@ -538,9 +815,11 @@ def process_file(
                 "Горючее": case["fuel"],
                 "T_окислителя_К": case.get("oxidizer_temp_K"),
                 "T_горючего_К": case.get("fuel_temp_K"),
-                "Pc_задано_МПа": case["Pc_MPa"],
-                "Pe_задано_МПа": case["Pe_MPa"],
-                "Коэффициент_избытка_окислителя_alpha": case["alpha"],
+                "Pc_задано_МПа": case["Pc_Pa"] / 1e6,
+                "Pe_задано_МПа": case["Pe_Pa"] / 1e6,
+                "Режим_задания_соотношения": case.get("ratio_mode", ""),
+                "Цель_оптимизации": case.get("optimize_target", ""),
+                "Коэффициент_избытка_окислителя_alpha": case.get("alpha"),
                 ERROR_FIELD: f"{e!s}  ::  {tb.splitlines()[-1] if tb else ''}",
             })
 
@@ -555,7 +834,7 @@ def process_file(
         (c.get("top_species", 12) for c in all_cases), default=12,
     )
     top_species_count = max(int(top_species_count), 0)
-    perfs_only = [p for _m, _c, p in successes]
+    perfs_only = [p for _m, _c, p, _opt in successes]
     top_names = _select_top_species_globally(perfs_only, top_species_count)
 
     species_cols: List[str] = []
@@ -582,7 +861,7 @@ def process_file(
         out_rows.append({fn: er.get(fn, "") for fn in fieldnames})
 
     # успешные кейсы — по строке на сечение
-    for meta, case, perf in successes:
+    for meta, case, perf, opt_res in successes:
         common = {
             "Глобальный_ID_варианта": meta["Глобальный_ID_варианта"],
             "Строка_входного_CSV": meta["Строка_входного_CSV"],
@@ -591,8 +870,11 @@ def process_file(
             "Горючее": case["fuel"],
             "T_окислителя_К": case.get("oxidizer_temp_K"),
             "T_горючего_К": case.get("fuel_temp_K"),
-            "Pc_задано_МПа": case["Pc_MPa"],
-            "Pe_задано_МПа": case["Pe_MPa"],
+            "Pc_задано_МПа": case["Pc_Pa"] / 1e6,
+            "Pe_задано_МПа": case["Pe_Pa"] / 1e6,
+            "Режим_задания_соотношения": case.get("ratio_mode", "alpha"),
+            "Цель_оптимизации": case.get("optimize_target", "")
+                                if case.get("ratio_mode") == "optimal" else "",
             "Коэффициент_избытка_окислителя_alpha": perf.alpha,
             "phi": perf.phi,
             "Стехиометрическое_соотношение_O_F": perf.O_F_stoich,
@@ -606,6 +888,27 @@ def process_file(
             station_row = _station_to_row(st, i, top_names, top_species_count)
             full = {**common, **station_row, ERROR_FIELD: ""}
             out_rows.append({fn: full.get(fn, "") for fn in fieldnames})
+
+        # если это была оптимизация — добавим скан-таблицу как доп. строки
+        # с меткой "OPT_SCAN" (по одной на точку скана)
+        if opt_res is not None and opt_res.scan_table:
+            for j, pt in enumerate(opt_res.scan_table, start=1):
+                scan_row = {**common,
+                    "Сечение": 1000 + j,
+                    "Метка": f"OPT_SCAN  α={pt.alpha:.4f}",
+                    "Давление_МПа": "",
+                    "Температура_К": pt.T_chamber_K,
+                    "Энтальпия_кДж_кг": "",
+                    "Энтропия_кДж_кгК": "",
+                    "Удельный_импульс_с": pt.Isp_s,
+                    "Удельный_импульс_вакуум_с": pt.Isp_vac_s,
+                    "Характеристическая_скорость_Cstar_м_с": pt.Cstar_m_per_s,
+                    "Коэффициент_тяги_CF": pt.CF,
+                    "Коэффициент_избытка_окислителя_alpha": pt.alpha,
+                    "Текущее_соотношение_O_F": pt.OF,
+                    ERROR_FIELD: "",
+                }
+                out_rows.append({fn: scan_row.get(fn, "") for fn in fieldnames})
 
     # неуспешные — одна строка
     for fr in failures:
@@ -637,8 +940,8 @@ def main() -> int:
             "в CSV (semicolon-delimited)."
         ),
     )
-    parser.add_argument("input_csv", help="Путь к входному CSV")
-    parser.add_argument("output_csv", help="Путь к выходному CSV")
+    parser.add_argument("input_csv", nargs="?", help="Путь к входному CSV")
+    parser.add_argument("output_csv", nargs="?", help="Путь к выходному CSV")
     parser.add_argument(
         "--thermo-db", default=None,
         help="Путь к файлу NASA-9 thermo (если не указан — ищется автоматически)",
@@ -651,7 +954,21 @@ def main() -> int:
         "-q", "--quiet", action="store_true",
         help="Не печатать прогресс.",
     )
+    parser.add_argument(
+        "--list-propellants", action="store_true",
+        help="Показать допустимые компоненты топлива/окислителя (без ионов) и выйти.",
+    )
     args = parser.parse_args()
+
+    if args.list_propellants:
+        db_path = Path(args.thermo_db) if args.thermo_db else Path(find_thermo_db())
+        species_db = parse_thermo_file(str(db_path))
+        for name in list_selectable_propellant_components(species_db):
+            print(name)
+        return 0
+
+    if not args.input_csv or not args.output_csv:
+        parser.error("Нужно указать input_csv и output_csv (или использовать --list-propellants)")
 
     input_csv = Path(args.input_csv)
     output_csv = Path(args.output_csv)

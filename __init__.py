@@ -21,7 +21,13 @@ fuel_equilibrium — расчёт химического равновесия г
 
 __version__ = "1.2.0"
 
-from .nasa9_parser import parse_thermo_file, Species, get_products_for_elements
+from .nasa9_parser import (
+    parse_thermo_file,
+    Species,
+    get_products_for_elements,
+    get_propellant_component_names,
+    is_valid_propellant_component,
+)
 from .thermo_calc import cp_over_R, h_over_RT, s_over_R, g_over_RT, R_UNIVERSAL
 from .formula_parser import parse_reaction_string, get_total_elements, parse_formula
 from .gibbs_solver import (
