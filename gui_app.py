@@ -161,9 +161,9 @@ class RocketEquilibriumGUI:
                 species_db=self.species_db,
                 P_chamber=PC_DEFAULT_MPA * 1e6,
                 P_exit=PE_DEFAULT_PA,
-                alpha_min=0.5,
-                alpha_max=1.4,
-                coarse_points=11,
+                alpha_min=0.40,
+                alpha_max=0.90,
+                coarse_points=7,
             )
             output = _format_result_text(result)
             self.root.after(0, self._on_success, output)
