@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import sys
 import time
 import traceback
@@ -83,6 +84,33 @@ from propellant_optimizer import (
 getcontext().prec = 28
 
 R_UNIVERSAL_J_KMOL_K = 8314.46261815324  # Дж/(кмоль·К)
+
+DEFAULT_OXIDIZER = "O2(L)"
+DEFAULT_FUEL = "H2(L)"
+DEFAULT_PC_PA = 10.0e6
+DEFAULT_PE_PA = 101325.0
+_OPT_KEYWORDS = {"opt", "optimal", "auto", "best", "оптимум", "авто"}
+
+
+def _is_likely_ion_name(name: str) -> bool:
+    n = name.strip()
+    if n.lower() == "e-":
+        return True
+    return bool(re.search(r"[A-Za-z0-9)](?:\+|-)$", n))
+
+
+def _is_valid_propellant_component(sp: Species) -> bool:
+    if not sp.is_reactant_only:
+        return False
+    if _is_likely_ion_name(sp.name):
+        return False
+    if sp.mol_weight <= 0 or not sp.elements:
+        return False
+    return True
+
+
+def list_selectable_propellant_components(species_db: Dict[str, Species]) -> List[str]:
+    return sorted(sp.name for sp in species_db.values() if _is_valid_propellant_component(sp))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,8 +338,8 @@ def expand_cases_from_input_row(row: dict) -> List[dict]:
     Давление поддерживает любые единицы: 'Pc' = '10 MPa' / '100 atm' / '1500 psi' и т.п.
     Сохранена обратная совместимость со старыми колонками Pc_MPa, Pe_MPa, alpha.
     """
-    raw_ox = str(pick(row, "oxidizer", "Окислитель")).strip()
-    raw_fu = str(pick(row, "fuel", "Горючее")).strip()
+    raw_ox = str(row.get("oxidizer") or row.get("Окислитель") or DEFAULT_OXIDIZER).strip()
+    raw_fu = str(row.get("fuel") or row.get("Горючее") or DEFAULT_FUEL).strip()
 
     # разрешаем псевдонимы из каталога (RPA-style: 'LOX', 'НДМГ' и т.п.)
     _, oxidizer = resolve_propellant(raw_ox, kind="oxidizer")
@@ -327,14 +355,23 @@ def expand_cases_from_input_row(row: dict) -> List[dict]:
     fuel_temp_k = _opt_T(row.get("fuel_temp_K"))
 
     # ── давление ───────────────────────────────────────────────────────
-    pc_values_pa = _get_pressure_values(row, base="Pc", default_unit="MPa")
-    pe_values_pa = _get_pressure_values(row, base="Pe", default_unit="MPa")
+    has_pc = any(has_value(row, k) for k in ("Pc", "Pc_MPa", "Pc_from", "Pc_to", "Pc_step", "Pc_MPa_from", "Pc_MPa_to", "Pc_MPa_step"))
+    has_pe = any(has_value(row, k) for k in ("Pe", "Pe_MPa", "Pe_from", "Pe_to", "Pe_step", "Pe_MPa_from", "Pe_MPa_to", "Pe_MPa_step"))
+    pc_values_pa = _get_pressure_values(row, base="Pc", default_unit="MPa") if has_pc else [DEFAULT_PC_PA]
+    pe_values_pa = _get_pressure_values(row, base="Pe", default_unit="MPa") if has_pe else [DEFAULT_PE_PA]
 
-    n_intermediate = parse_int_optional(row.get("n_intermediate_stations"), default=0)
+    # По требованию считаем только 4 сечения: Injector / Inlet / Throat / Exit.
+    n_intermediate = 0
     top_species = parse_int_optional(row.get("top_species"), default=12)
 
     # ── режим задания соотношения ───────────────────────────────────────
     ratio_mode = (str(row.get("ratio_mode", "")).strip().lower() or None)
+    alpha_raw = str(row.get("alpha", "")).strip().lower()
+
+    # Авто-режим для LOX/LH2: если alpha не задана (или alpha=opt/auto),
+    # включаем ускорённый поиск оптимального массового соотношения.
+    if ratio_mode is None and (not alpha_raw or alpha_raw in _OPT_KEYWORDS):
+        ratio_mode = "optimal"
 
     # «оптимизация» — отдельная ветка
     if ratio_mode in ("optimal", "optimize", "opt", "оптимум", "оптимально",
@@ -350,9 +387,9 @@ def expand_cases_from_input_row(row: dict) -> List[dict]:
         }
         tnorm = target_map.get(target.strip().lower(), target)
 
-        a_min = parse_float(row.get("alpha_min"), default=0.3)
-        a_max = parse_float(row.get("alpha_max"), default=1.6)
-        n_grid = parse_int_optional(row.get("n_grid"), default=13)
+        a_min = parse_float(row.get("alpha_min"), default=0.5)
+        a_max = parse_float(row.get("alpha_max"), default=1.2)
+        n_grid = parse_int_optional(row.get("n_grid"), default=7)
         refine_str = str(row.get("refine", "") or "true").strip().lower()
         refine = refine_str in ("1", "true", "yes", "да", "y", "t")
 
@@ -487,6 +524,15 @@ def calculate_case(
 
     mode = case.get("ratio_mode", "alpha")
 
+    ox_sp = species_db.get(case["oxidizer"])
+    fu_sp = species_db.get(case["fuel"])
+    if ox_sp is None or fu_sp is None:
+        raise ValueError("Окислитель или горючее не найдены в базе NASA-9")
+    if not _is_valid_propellant_component(ox_sp) or not _is_valid_propellant_component(fu_sp):
+        raise ValueError(
+            "Выбранный компонент исключён: ионы и нереалистичные компоненты топлива не допускаются"
+        )
+
     # ── режим optimal: вызываем оптимизатор ──────────────────────────
     if mode == "optimal":
         spec = RatioSpec(
@@ -505,7 +551,7 @@ def calculate_case(
             species_db=species_db,
             oxidizer_T_K=case.get("oxidizer_temp_K"),
             fuel_T_K=case.get("fuel_temp_K"),
-            n_intermediate_stations=case.get("n_intermediate_stations", 0),
+            n_intermediate_stations=0,
             include_condensed=True,
             logger=logger,
         )
@@ -524,7 +570,7 @@ def calculate_case(
             oxidizer=ox, fuel=fu,
             P_chamber=pc_pa, P_exit=pe_pa,
             species_db=species_db,
-            n_intermediate_stations=case.get("n_intermediate_stations", 0),
+            n_intermediate_stations=0,
             include_condensed=True,
             verbose=False,
             logger=logger if logger is not None else NullLogger(),
@@ -547,7 +593,7 @@ def calculate_case(
         oxidizer=ox, fuel=fu,
         P_chamber=pc_pa, P_exit=pe_pa,
         species_db=species_db,
-        n_intermediate_stations=case.get("n_intermediate_stations", 0),
+        n_intermediate_stations=0,
         include_condensed=True,
         verbose=False,
         logger=logger if logger is not None else NullLogger(),
@@ -894,8 +940,8 @@ def main() -> int:
             "в CSV (semicolon-delimited)."
         ),
     )
-    parser.add_argument("input_csv", help="Путь к входному CSV")
-    parser.add_argument("output_csv", help="Путь к выходному CSV")
+    parser.add_argument("input_csv", nargs="?", help="Путь к входному CSV")
+    parser.add_argument("output_csv", nargs="?", help="Путь к выходному CSV")
     parser.add_argument(
         "--thermo-db", default=None,
         help="Путь к файлу NASA-9 thermo (если не указан — ищется автоматически)",
@@ -908,7 +954,21 @@ def main() -> int:
         "-q", "--quiet", action="store_true",
         help="Не печатать прогресс.",
     )
+    parser.add_argument(
+        "--list-propellants", action="store_true",
+        help="Показать допустимые компоненты топлива/окислителя (без ионов) и выйти.",
+    )
     args = parser.parse_args()
+
+    if args.list_propellants:
+        db_path = Path(args.thermo_db) if args.thermo_db else Path(find_thermo_db())
+        species_db = parse_thermo_file(str(db_path))
+        for name in list_selectable_propellant_components(species_db):
+            print(name)
+        return 0
+
+    if not args.input_csv or not args.output_csv:
+        parser.error("Нужно указать input_csv и output_csv (или использовать --list-propellants)")
 
     input_csv = Path(args.input_csv)
     output_csv = Path(args.output_csv)

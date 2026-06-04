@@ -1,2 +1,2 @@
 oxidizer;fuel;oxidizer_temp_K;fuel_temp_K;Pc_MPa;Pe_MPa;alpha;n_intermediate_stations;top_species
-O2(L);H2(L);;;10;0.1013;1.0;0;10
+O2(L);H2(L);;;10;0.101325;;0;10

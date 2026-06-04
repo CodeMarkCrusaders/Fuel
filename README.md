@@ -340,7 +340,7 @@ python rocket_csv.py examples/rocket_input_optimal.csv  out.csv
 
 ```csv
 oxidizer;fuel;oxidizer_temp_K;fuel_temp_K;Pc_MPa;Pe_MPa;alpha;n_intermediate_stations;top_species
-O2(L);H2(L);;;10;0.1013;1.0;3;12
+O2(L);H2(L);;;10;0.101325;opt;0;12
 ```
 
 ### 2) Любые единицы давления и аббревиатуры топлив (RPA-style)
@@ -411,6 +411,12 @@ LOX;LH2;8 MPa;12 MPa;2 MPa;1 atm;alpha;0.8;1.2;0.2;2;10
 Если `oxidizer_temp_K` / `fuel_temp_K` пустые, температура берётся из
 NASA-базы (`T_assigned` для криогенных реагентов вроде `O2(L)`, `H2(L)`)
 или 298.15 К по умолчанию.
+
+Для `rocket_csv.py` включён быстрый режим ракетного расчёта:
+- фиксируются 4 сечения: `Injector`, `Nozzle inlet`, `Nozzle throat`, `Nozzle exit`;
+- если `alpha` не задана (или `alpha=opt`/`auto`) — выполняется ускорённый
+  поиск оптимального массового соотношения O/F по максимуму `Isp`.
+- список выбираемых компонентов топлива очищен от ионов.
 
 **Выходной CSV** — одна строка на каждое сечение каждого кейса (плюс одна
 строка с описанием ошибки, если кейс не сошёлся).  Колонки:
