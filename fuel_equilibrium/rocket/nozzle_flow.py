@@ -703,8 +703,9 @@ def solve_rocket_nozzle(
         mass_total_g, H_chamber_per_kg,
     )
 
-    # ── 7) Промежуточные сечения между throat и exit ───────────────────
-    intermediate = []
+    # ── 7) Промежуточные сечения: до горловины и после горловины ────────
+    intermediate_pre_throat = []
+    intermediate_post_throat = []
     if n_intermediate_stations > 0:
         P_grid = _build_segmented_pressure_grid(
             P_chamber=P_chamber,
@@ -715,7 +716,13 @@ def solve_rocket_nozzle(
             density_critical=section_density_critical,
             density_supersonic=section_density_supersonic,
         )
-        for k, P_k in enumerate(P_grid, start=1):
+
+        eps = max(1e-6, 1e-8 * abs(P_throat))
+        P_pre = sorted([float(p) for p in P_grid if p > P_throat + eps], reverse=True)
+        P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
+
+        flow_pressures = [*P_pre, *P_post]
+        for k, P_k in enumerate(flow_pressures, start=1):
             r_k = solve_equilibrium_SP(
                 species_list=species_list,
                 element_abundances=elements,
@@ -730,12 +737,23 @@ def solve_rocket_nozzle(
                 f'Section {k}', species_list, elements, r_k, float(P_k),
                 mass_total_g, H_chamber_per_kg,
             )
-            intermediate.append(st)
+            if P_k > P_throat:
+                intermediate_pre_throat.append(st)
+            else:
+                intermediate_post_throat.append(st)
 
     # ── 8) Ae/At — из сохранения массового расхода ────────────────────
     # m_dot = rho * V * A = const => A/At = (rho_t * V_t) / (rho * V)
     flux_throat = station_throat.mass_flux_kg_per_m2_s
-    for st in [station_chamber, station_inlet, station_throat, *intermediate, station_exit]:
+    all_stations_for_area = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
+    for st in all_stations_for_area:
         if st.mass_flux_kg_per_m2_s > 1e-30:
             st.Ae_At = flux_throat / st.mass_flux_kg_per_m2_s
         else:
@@ -768,8 +786,16 @@ def solve_rocket_nozzle(
         logger.log(f'V_exit         = {V_exit:.4f} м/с')
         logger.log(f'Ae/At          = {station_exit.Ae_At:.4f}')
 
-    # порядок: Injector, Nozzle inlet, Nozzle throat, [Section k...], Nozzle exit
-    stations = [station_chamber, station_inlet, station_throat, *intermediate, station_exit]
+    # порядок: Injector, Nozzle inlet, [Section pre...], Nozzle throat,
+    #          [Section post...], Nozzle exit
+    stations = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
 
     return RocketPerformance(
         O_F=of_actual,
