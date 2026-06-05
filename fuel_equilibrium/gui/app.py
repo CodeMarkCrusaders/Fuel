@@ -685,11 +685,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(gb_fuel)
 
-        # ─── Условия в сопле ───
-        gb_cond = QtWidgets.QGroupBox("Условия")
-        form2 = QtWidgets.QFormLayout(gb_cond)
-        form2.setSpacing(6)
-
+        # ─── Условия + газодинамические настройки по вкладкам ───
         self.sp_Pc = QtWidgets.QDoubleSpinBox()
         self.sp_Pc.setRange(0.000001, 1e6)
         self.sp_Pc.setDecimals(6)
@@ -723,8 +719,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_n_inter.setRange(0, 1048)
         self.sp_n_inter.setValue(8)
         self.sp_n_inter.setToolTip(
-            "Число промежуточных сечений только для газодинамических параметров\n"
-            "между горловиной и срезом.\n"
+            "Общее число промежуточных газодинамических сечений\n"
+            "по всему соплу: дозвук + критика + сверхзвук.\n"
             "Состав продуктов всегда показывается на 4 сечениях:\n"
             "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
@@ -763,12 +759,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_condensed = QtWidgets.QCheckBox("Учитывать конденсат")
         self.chk_condensed.setChecked(True)
 
-        form2.addRow("Давление в камере:", w_Pc)
-        form2.addRow("Давление на срезе:", w_Pe)
-        form2.addRow("Промежут. сечений (газодин.):", self.sp_n_inter)
-        form2.addRow("Плотность сечений:", density_widget)
-        form2.addRow("", self.chk_condensed)
-        layout.addWidget(gb_cond)
+        self.input_tabs = QtWidgets.QTabWidget()
+
+        tab_basic = QtWidgets.QWidget()
+        form_basic = QtWidgets.QFormLayout(tab_basic)
+        form_basic.setSpacing(6)
+        form_basic.addRow("Давление в камере:", w_Pc)
+        form_basic.addRow("Давление на срезе:", w_Pe)
+        form_basic.addRow("", self.chk_condensed)
+
+        tab_gasd = QtWidgets.QWidget()
+        form_gasd = QtWidgets.QFormLayout(tab_gasd)
+        form_gasd.setSpacing(6)
+        form_gasd.addRow("Промежут. сечений:", self.sp_n_inter)
+        form_gasd.addRow("Плотность сечений:", density_widget)
+
+        gasd_hint = QtWidgets.QLabel(
+            "Распределение промежуточных сечений выполняется\n"
+            "на участках: дозвук, критика, сверхзвук."
+        )
+        gasd_hint.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        gasd_hint.setWordWrap(True)
+        form_gasd.addRow("", gasd_hint)
+
+        self.input_tabs.addTab(tab_basic, "Условия")
+        self.input_tabs.addTab(tab_gasd, "Газодинамический расчет")
+        layout.addWidget(self.input_tabs)
 
         # ─── Решатель ───
         gb_solver = QtWidgets.QGroupBox("Решатель")
@@ -855,16 +871,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
-
-        self.btn_export = QtWidgets.QPushButton("⬇  Экспорт в CSV…")
-        self.btn_export.clicked.connect(self.on_export_csv)
-        self.btn_export.setEnabled(False)
-        layout.addWidget(self.btn_export)
-
-        self.btn_export_amesim = QtWidgets.QPushButton("⬇  Экспорт в формате Amesim (.data)")
-        self.btn_export_amesim.clicked.connect(self.on_export_amesim)
-        self.btn_export_amesim.setEnabled(False)
-        layout.addWidget(self.btn_export_amesim)
 
         layout.addStretch(1)
         return w
@@ -1021,10 +1027,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         m_file = mb.addMenu("&Файл")
-        a_save_csv = m_file.addAction("Экспорт CSV…")
-        a_save_csv.triggered.connect(self.on_export_csv)
-        a_save_amesim = m_file.addAction("Экспорт Amesim (.data)…")
-        a_save_amesim.triggered.connect(self.on_export_amesim)
+        self.act_export_csv = m_file.addAction("Экспорт CSV…")
+        self.act_export_csv.triggered.connect(self.on_export_csv)
+        self.act_export_csv.setEnabled(False)
+        self.act_export_amesim = m_file.addAction("Экспорт Amesim (.data)…")
+        self.act_export_amesim.triggered.connect(self.on_export_amesim)
+        self.act_export_amesim.setEnabled(False)
         m_file.addSeparator()
         a_save_cfg = m_file.addAction("Сохранить конфигурацию…")
         a_save_cfg.triggered.connect(self.on_save_config)
@@ -1184,8 +1192,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.btn_calc.setEnabled(False)
-        self.btn_export.setEnabled(False)
-        self.btn_export_amesim.setEnabled(False)
+        self.act_export_csv.setEnabled(False)
+        self.act_export_amesim.setEnabled(False)
         self.progress.setVisible(True)
         self.statusBar().showMessage(f"Расчёт ({solver})... подождите.")
 
@@ -1198,8 +1206,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_calc_done(self, perf: RocketPerformance):
         self.perf = perf
         self.btn_calc.setEnabled(True)
-        self.btn_export.setEnabled(True)
-        self.btn_export_amesim.setEnabled(True)
+        self.act_export_csv.setEnabled(True)
+        self.act_export_amesim.setEnabled(True)
         self.progress.setVisible(False)
         self.statusBar().showMessage(
             f"Готово. T_камеры = {perf.stations[0].T_K:.1f} К, "

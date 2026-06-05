@@ -20,7 +20,7 @@
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from scipy.optimize import brentq
 
 from ..core.nasa9_parser import Species, parse_thermo_file, get_products_for_elements
@@ -101,6 +101,27 @@ class RocketPerformance:
     Isp_vac_s: float               # вакуумный удельный импульс
     CF: float                      # коэффициент тяги
     stations: List[StationResult]
+
+
+@dataclass
+class NozzleContourPoint:
+    """Точка контура сопла в осесимметричной постановке (x, r), м."""
+    x_m: float
+    r_m: float
+
+
+@dataclass
+class NozzleContour:
+    """Геометрия контура сопла (трансзвуковая + сверхзвуковая части)."""
+    method: str
+    throat_radius_m: float
+    exit_radius_m: float
+    area_ratio: float
+    length_m: float
+    theta_exit_deg: float
+    theta_max_deg: float
+    points: List[NozzleContourPoint]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -703,8 +724,9 @@ def solve_rocket_nozzle(
         mass_total_g, H_chamber_per_kg,
     )
 
-    # ── 7) Промежуточные сечения между throat и exit ───────────────────
-    intermediate = []
+    # ── 7) Промежуточные сечения: до горловины и после горловины ────────
+    intermediate_pre_throat = []
+    intermediate_post_throat = []
     if n_intermediate_stations > 0:
         P_grid = _build_segmented_pressure_grid(
             P_chamber=P_chamber,
@@ -715,7 +737,13 @@ def solve_rocket_nozzle(
             density_critical=section_density_critical,
             density_supersonic=section_density_supersonic,
         )
-        for k, P_k in enumerate(P_grid, start=1):
+
+        eps = max(1e-6, 1e-8 * abs(P_throat))
+        P_pre = sorted([float(p) for p in P_grid if p > P_throat + eps], reverse=True)
+        P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
+
+        flow_pressures = [*P_pre, *P_post]
+        for k, P_k in enumerate(flow_pressures, start=1):
             r_k = solve_equilibrium_SP(
                 species_list=species_list,
                 element_abundances=elements,
@@ -730,12 +758,23 @@ def solve_rocket_nozzle(
                 f'Section {k}', species_list, elements, r_k, float(P_k),
                 mass_total_g, H_chamber_per_kg,
             )
-            intermediate.append(st)
+            if P_k > P_throat:
+                intermediate_pre_throat.append(st)
+            else:
+                intermediate_post_throat.append(st)
 
     # ── 8) Ae/At — из сохранения массового расхода ────────────────────
     # m_dot = rho * V * A = const => A/At = (rho_t * V_t) / (rho * V)
     flux_throat = station_throat.mass_flux_kg_per_m2_s
-    for st in [station_chamber, station_inlet, station_throat, *intermediate, station_exit]:
+    all_stations_for_area = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
+    for st in all_stations_for_area:
         if st.mass_flux_kg_per_m2_s > 1e-30:
             st.Ae_At = flux_throat / st.mass_flux_kg_per_m2_s
         else:
@@ -768,8 +807,16 @@ def solve_rocket_nozzle(
         logger.log(f'V_exit         = {V_exit:.4f} м/с')
         logger.log(f'Ae/At          = {station_exit.Ae_At:.4f}')
 
-    # порядок: Injector, Nozzle inlet, Nozzle throat, [Section k...], Nozzle exit
-    stations = [station_chamber, station_inlet, station_throat, *intermediate, station_exit]
+    # порядок: Injector, Nozzle inlet, [Section pre...], Nozzle throat,
+    #          [Section post...], Nozzle exit
+    stations = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
 
     return RocketPerformance(
         O_F=of_actual,
@@ -785,5 +832,224 @@ def solve_rocket_nozzle(
 
 
 # Печать таблиц / отчётов вынесена в fuel_equilibrium.io.reporting.
-# Здесь — только физика (структуры данных и решатель сопла).
+# Здесь — только физика (структуры данных, решатель сопла и построение контуров).
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _throat_arc_points(
+    throat_radius_m: float,
+    theta_max_deg: float,
+    throat_rounding_factor: float,
+    n_points: int,
+) -> Tuple[List[NozzleContourPoint], float, float]:
+    """Строит выходной скруглённый участок горловины AA_n."""
+    theta_m = math.radians(theta_max_deg)
+    r_skr = throat_rounding_factor * throat_radius_m
+    n_points = max(n_points, 8)
+
+    points: List[NozzleContourPoint] = []
+    for i in range(n_points):
+        phi = theta_m * i / (n_points - 1)
+        x = r_skr * math.sin(phi)
+        r = throat_radius_m + r_skr * (1.0 - math.cos(phi))
+        points.append(NozzleContourPoint(x_m=x, r_m=r))
+
+    p_last = points[-1]
+    return points, p_last.x_m, p_last.r_m
+
+
+def build_profiled_nozzle_contour(
+    throat_radius_m: float,
+    area_ratio: float,
+    theta_exit_deg: float = 12.0,
+    theta_max_deg: float = 34.25,
+    inlet_rounding_factor: float = 1.5,
+    throat_rounding_factor: float = 0.45,
+    length_m: Optional[float] = None,
+    n_points: int = 160,
+) -> NozzleContour:
+    """Изменённый метод построения профилированного сопла."""
+    if throat_radius_m <= 0:
+        raise ValueError("throat_radius_m должен быть > 0")
+    if area_ratio <= 1.0:
+        raise ValueError("area_ratio должен быть > 1")
+
+    theta_exit_deg = _clamp(theta_exit_deg, 3.0, 25.0)
+    theta_max_deg = _clamp(theta_max_deg, theta_exit_deg + 1e-3, 45.0)
+
+    arc_pts, x_an, r_an = _throat_arc_points(
+        throat_radius_m=throat_radius_m,
+        theta_max_deg=theta_max_deg,
+        throat_rounding_factor=throat_rounding_factor,
+        n_points=max(12, n_points // 4),
+    )
+
+    r_exit = throat_radius_m * math.sqrt(area_ratio)
+    t_m = math.tan(math.radians(theta_max_deg))
+    t_a = math.tan(math.radians(theta_exit_deg))
+
+    if length_m is None:
+        l_cone = (r_exit - r_an) / max(t_a, 1e-6)
+        length_m = max(0.82 * l_cone, 0.05 * throat_radius_m)
+
+    n_div = max(n_points - len(arc_pts), 32)
+    div_pts: List[NozzleContourPoint] = []
+    for i in range(n_div):
+        s = i / (n_div - 1)
+        h00 = 2*s**3 - 3*s**2 + 1
+        h10 = s**3 - 2*s**2 + s
+        h01 = -2*s**3 + 3*s**2
+        h11 = s**3 - s**2
+        r = (
+            h00 * r_an
+            + h10 * length_m * t_m
+            + h01 * r_exit
+            + h11 * length_m * t_a
+        )
+        x = x_an + s * length_m
+        div_pts.append(NozzleContourPoint(x_m=x, r_m=r))
+
+    pts = arc_pts + div_pts[1:]
+    return NozzleContour(
+        method="profiled_modified",
+        throat_radius_m=throat_radius_m,
+        exit_radius_m=r_exit,
+        area_ratio=area_ratio,
+        length_m=pts[-1].x_m,
+        theta_exit_deg=theta_exit_deg,
+        theta_max_deg=theta_max_deg,
+        points=pts,
+        metadata={
+            "inlet_rounding_factor": inlet_rounding_factor,
+            "throat_rounding_factor": throat_rounding_factor,
+            "construction": "arc + cubic_hermite",
+        },
+    )
+
+
+def build_approximate_optimal_contour_ch26(
+    throat_radius_m: float,
+    area_ratio: float,
+    theta_exit_deg: float = 12.0,
+    theta_max_deg: Optional[float] = None,
+    inlet_rounding_factor: float = 1.5,
+    throat_rounding_factor: float = 0.45,
+    length_m: Optional[float] = None,
+    n_points: int = 140,
+) -> NozzleContour:
+    """Приближённый метод построения оптимального контура (гл. 2.6)."""
+    if throat_radius_m <= 0:
+        raise ValueError("throat_radius_m должен быть > 0")
+    if area_ratio <= 1.0:
+        raise ValueError("area_ratio должен быть > 1")
+
+    theta_exit_deg = _clamp(theta_exit_deg, 3.0, 25.0)
+    if theta_max_deg is None:
+        theta_max_deg = 34.25 - 2.0 * math.log10(max(area_ratio, 1.0001))
+    theta_max_deg = _clamp(theta_max_deg, theta_exit_deg + 1e-3, 40.0)
+
+    arc_pts, x_an, r_an = _throat_arc_points(
+        throat_radius_m=throat_radius_m,
+        theta_max_deg=theta_max_deg,
+        throat_rounding_factor=throat_rounding_factor,
+        n_points=max(12, n_points // 4),
+    )
+
+    r_exit = throat_radius_m * math.sqrt(area_ratio)
+    t_m = math.tan(math.radians(theta_max_deg))
+    t_a = math.tan(math.radians(theta_exit_deg))
+
+    if length_m is None:
+        length_m = 2.0 * (r_exit - r_an) / max(t_m + t_a, 1e-8)
+    length_m = max(length_m, 0.05 * throat_radius_m)
+
+    a_par = (t_a - t_m) / (2.0 * length_m)
+
+    n_div = max(n_points - len(arc_pts), 24)
+    div_pts: List[NozzleContourPoint] = []
+    for i in range(n_div):
+        x_local = length_m * i / (n_div - 1)
+        r = r_an + t_m * x_local + a_par * x_local * x_local
+        x = x_an + x_local
+        div_pts.append(NozzleContourPoint(x_m=x, r_m=r))
+
+    pts = arc_pts + div_pts[1:]
+    return NozzleContour(
+        method="optimal_approx_ch26",
+        throat_radius_m=throat_radius_m,
+        exit_radius_m=r_exit,
+        area_ratio=area_ratio,
+        length_m=pts[-1].x_m,
+        theta_exit_deg=theta_exit_deg,
+        theta_max_deg=theta_max_deg,
+        points=pts,
+        metadata={
+            "R_skr_over_Rkr": inlet_rounding_factor,
+            "r_skr_over_Rkr": throat_rounding_factor,
+            "construction": "arc + parabola",
+            "chapter_ref": "2.6",
+        },
+    )
+
+
+def build_optimal_nozzle_contour(
+    perf: RocketPerformance,
+    throat_radius_m: float,
+    p_ambient_Pa: Optional[float] = None,
+    theta_exit_deg: Optional[float] = None,
+    theta_max_deg: Optional[float] = None,
+    n_points: int = 140,
+) -> NozzleContour:
+    """Построение оптимального сопла по результатам solve_rocket_nozzle."""
+    st_exit = next((s for s in perf.stations if s.label == 'Nozzle exit'), perf.stations[-1])
+    area_ratio = st_exit.Ae_At
+    if not (math.isfinite(area_ratio) and area_ratio > 1.0):
+        raise ValueError("Некорректное Ae/At на срезе для построения контура")
+
+    if theta_exit_deg is None:
+        theta_calc = None
+        if p_ambient_Pa is not None and st_exit.M > 1.0 and st_exit.rho_kg_per_m3 > 0.0:
+            q_dyn = 0.5 * st_exit.rho_kg_per_m3 * st_exit.V_m_per_s ** 2
+            if q_dyn > 1e-12:
+                rhs = ((st_exit.P_Pa - p_ambient_Pa) / q_dyn) * math.sqrt(st_exit.M ** 2 - 1.0)
+                rhs = _clamp(rhs, -1.0, 1.0)
+                theta_calc = 0.5 * math.degrees(math.asin(rhs))
+        theta_exit_deg = theta_calc if theta_calc is not None else 12.0
+        theta_exit_deg = _clamp(theta_exit_deg, 10.0, 14.0)
+
+    return build_approximate_optimal_contour_ch26(
+        throat_radius_m=throat_radius_m,
+        area_ratio=area_ratio,
+        theta_exit_deg=float(theta_exit_deg),
+        theta_max_deg=theta_max_deg,
+        n_points=n_points,
+    )
+
+
+def build_nozzle_contour(
+    throat_radius_m: float,
+    area_ratio: float,
+    method: str = "profiled",
+    **kwargs,
+) -> NozzleContour:
+    """Унифицированный интерфейс построения контуров сопла."""
+    key = method.strip().lower()
+    if key in ("profiled", "profiled_modified"):
+        return build_profiled_nozzle_contour(
+            throat_radius_m=throat_radius_m,
+            area_ratio=area_ratio,
+            **kwargs,
+        )
+    if key in ("optimal_approx", "optimal_approx_ch26", "ch2.6", "2.6"):
+        return build_approximate_optimal_contour_ch26(
+            throat_radius_m=throat_radius_m,
+            area_ratio=area_ratio,
+            **kwargs,
+        )
+    raise ValueError(
+        f"Неизвестный method='{method}'. Допустимо: profiled, optimal_approx"
+    )
 

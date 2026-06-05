@@ -476,7 +476,8 @@ def solve_rocket_nozzle_cea(
     )
 
     # ── 5) Промежуточные сечения
-    intermediate = []
+    intermediate_pre_throat = []
+    intermediate_post_throat = []
     if n_intermediate_stations > 0:
         if progress_cb:
             progress_cb(f"Расчёт {n_intermediate_stations} промежуточных сечений...")
@@ -489,17 +490,34 @@ def solve_rocket_nozzle_cea(
             density_critical=section_density_critical,
             density_supersonic=section_density_supersonic,
         )
-        for k, P_k in enumerate(P_grid, start=1):
+
+        eps = max(1e-6, 1e-8 * abs(P_throat))
+        P_pre = sorted([float(p) for p in P_grid if p > P_throat + eps], reverse=True)
+        P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
+
+        flow_pressures = [*P_pre, *P_post]
+        for k, P_k in enumerate(flow_pressures, start=1):
             _sp_solve(S_chamber_per_kg, float(P_k),
                       T_guess=station_throat.T_K * 0.8)
             st = _make_station_cantera(
                 f'Section {k}', gas, float(P_k), H_chamber_per_kg, species_list
             )
-            intermediate.append(st)
+            if P_k > P_throat:
+                intermediate_pre_throat.append(st)
+            else:
+                intermediate_post_throat.append(st)
 
     # ── 6) Ae/At
     flux_throat = station_throat.mass_flux_kg_per_m2_s
-    for st in [station_chamber, station_inlet, station_throat, *intermediate, station_exit]:
+    all_stations_for_area = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
+    for st in all_stations_for_area:
         if st.mass_flux_kg_per_m2_s > 1e-30:
             st.Ae_At = flux_throat / st.mass_flux_kg_per_m2_s
         else:
@@ -516,7 +534,14 @@ def solve_rocket_nozzle_cea(
     Cstar = P_chamber / flux_throat if flux_throat > 1e-30 else float('nan')
     CF = V_exit / Cstar if Cstar > 0 else float('nan')
 
-    stations = [station_chamber, station_inlet, station_throat, *intermediate, station_exit]
+    stations = [
+        station_chamber,
+        station_inlet,
+        *intermediate_pre_throat,
+        station_throat,
+        *intermediate_post_throat,
+        station_exit,
+    ]
     return RocketPerformance(
         O_F=of_actual,
         O_F_stoich=of_stoich,
@@ -553,6 +578,17 @@ def build_nozzle_geometry(
     x = np.zeros(n)
     L_total = L_chamber + L_conv + L_div
 
+    p_chamber = max(stations[0].P_Pa, 1.0)
+    p_exit = max(stations[-1].P_Pa, 1.0)
+    throat_station = next((s for s in stations if s.label.lower() in ('nozzle throat', 'горловина')), None)
+    p_throat = max(throat_station.P_Pa if throat_station is not None else math.sqrt(p_chamber * p_exit), 1.0)
+
+    ln_pc = math.log(p_chamber)
+    ln_pt = math.log(p_throat)
+    ln_pe = math.log(p_exit)
+    span_sub = max(ln_pc - ln_pt, 1e-12)
+    span_sup = max(ln_pt - ln_pe, 1e-12)
+
     for i, st in enumerate(stations):
         lab = st.label.lower()
         if lab in ('injector', 'камера'):
@@ -564,19 +600,18 @@ def build_nozzle_geometry(
         elif lab in ('nozzle exit', 'срез сопла'):
             x[i] = L_total
         else:
-            # Промежуточные сечения — распределяем равномерно между throat и exit
-            # на основе их Ae/At (логарифмическая интерполяция)
-            try:
-                ratio = math.log(max(st.Ae_At, 1.0)) / math.log(max(stations[-1].Ae_At, 1.001))
+            p = max(st.P_Pa, 1.0)
+            ln_p = math.log(p)
+            if p >= p_throat:
+                # Дозвуковая часть: inlet -> throat
+                ratio = (ln_pc - ln_p) / span_sub
+                ratio = min(1.0, max(0.0, ratio))
+                x[i] = L_chamber + L_conv * ratio
+            else:
+                # Сверхзвуковая часть: throat -> exit
+                ratio = (ln_pt - ln_p) / span_sup
+                ratio = min(1.0, max(0.0, ratio))
                 x[i] = L_chamber + L_conv + L_div * ratio
-            except Exception:
-                # fallback — равномерно
-                section_idx = i - 2  # после injector, inlet, throat
-                total_intermediate = n - 4
-                if total_intermediate > 0:
-                    x[i] = L_chamber + L_conv + L_div * section_idx / (total_intermediate + 1)
-                else:
-                    x[i] = L_chamber + L_conv
 
     return x
 
