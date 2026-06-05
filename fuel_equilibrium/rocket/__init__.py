@@ -11,8 +11,14 @@ from .nozzle_flow import (
     Propellant,
     StationResult,
     RocketPerformance,
+    NozzleContourPoint,
+    NozzleContour,
     solve_rocket_nozzle,
     stoichiometric_OF,
+    build_profiled_nozzle_contour,
+    build_approximate_optimal_contour_ch26,
+    build_optimal_nozzle_contour,
+    build_nozzle_contour,
 )
 
 # CEA-решатель опционален: требует cantera
@@ -30,8 +36,14 @@ __all__ = [
     "Propellant",
     "StationResult",
     "RocketPerformance",
+    "NozzleContourPoint",
+    "NozzleContour",
     "solve_rocket_nozzle",
     "stoichiometric_OF",
+    "build_profiled_nozzle_contour",
+    "build_approximate_optimal_contour_ch26",
+    "build_optimal_nozzle_contour",
+    "build_nozzle_contour",
     "CANTERA_AVAILABLE",
 ]
 
