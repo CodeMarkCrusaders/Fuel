@@ -552,6 +552,9 @@ class NozzleSolverWorker(QThread):
                     P_chamber=p['P_chamber'],
                     P_exit=p['P_exit'],
                     n_intermediate_stations=p.get('n_inter', 5),
+                    section_density_subsonic=p.get('density_sub', 1.0),
+                    section_density_critical=p.get('density_crit', 1.0),
+                    section_density_supersonic=p.get('density_sup', 1.0),
                     include_condensed=p.get('include_condensed', False),
                     verbose=False,
                     progress_cb=lambda s: self.progress.emit(s),
@@ -564,6 +567,9 @@ class NozzleSolverWorker(QThread):
                     P_exit=p['P_exit'],
                     species_db=self.species_db,
                     n_intermediate_stations=p.get('n_inter', 5),
+                    section_density_subsonic=p.get('density_sub', 1.0),
+                    section_density_critical=p.get('density_crit', 1.0),
+                    section_density_supersonic=p.get('density_sup', 1.0),
                     include_condensed=p.get('include_condensed', True),
                     verbose=False,
                     logger=NullLogger(),
@@ -714,7 +720,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h_Pe.addWidget(self.cb_Pe_unit)
 
         self.sp_n_inter = QtWidgets.QSpinBox()
-        self.sp_n_inter.setRange(0, 50)
+        self.sp_n_inter.setRange(0, 1048)
         self.sp_n_inter.setValue(8)
         self.sp_n_inter.setToolTip(
             "Число промежуточных сечений только для газодинамических параметров\n"
@@ -723,12 +729,44 @@ class MainWindow(QtWidgets.QMainWindow):
             "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
 
+        self.sp_density_sub = QtWidgets.QDoubleSpinBox()
+        self.sp_density_sub.setRange(0.0, 20.0)
+        self.sp_density_sub.setDecimals(2)
+        self.sp_density_sub.setValue(1.0)
+        self.sp_density_sub.setSingleStep(0.1)
+        self.sp_density_sub.setToolTip("Относительная плотность сечений в дозвуковой зоне (камера → горловина).")
+
+        self.sp_density_crit = QtWidgets.QDoubleSpinBox()
+        self.sp_density_crit.setRange(0.0, 20.0)
+        self.sp_density_crit.setDecimals(2)
+        self.sp_density_crit.setValue(1.0)
+        self.sp_density_crit.setSingleStep(0.1)
+        self.sp_density_crit.setToolTip("Относительная плотность сечений в критической зоне (вблизи горловины).")
+
+        self.sp_density_sup = QtWidgets.QDoubleSpinBox()
+        self.sp_density_sup.setRange(0.0, 20.0)
+        self.sp_density_sup.setDecimals(2)
+        self.sp_density_sup.setValue(1.0)
+        self.sp_density_sup.setSingleStep(0.1)
+        self.sp_density_sup.setToolTip("Относительная плотность сечений в сверхзвуковой зоне (горловина → срез).")
+
+        density_widget = QtWidgets.QWidget()
+        density_layout = QtWidgets.QHBoxLayout(density_widget)
+        density_layout.setContentsMargins(0, 0, 0, 0)
+        density_layout.addWidget(QtWidgets.QLabel("дозвук"))
+        density_layout.addWidget(self.sp_density_sub)
+        density_layout.addWidget(QtWidgets.QLabel("критика"))
+        density_layout.addWidget(self.sp_density_crit)
+        density_layout.addWidget(QtWidgets.QLabel("сверхзвук"))
+        density_layout.addWidget(self.sp_density_sup)
+
         self.chk_condensed = QtWidgets.QCheckBox("Учитывать конденсат")
         self.chk_condensed.setChecked(True)
 
         form2.addRow("Давление в камере:", w_Pc)
         form2.addRow("Давление на срезе:", w_Pe)
         form2.addRow("Промежут. сечений (газодин.):", self.sp_n_inter)
+        form2.addRow("Плотность сечений:", density_widget)
         form2.addRow("", self.chk_condensed)
         layout.addWidget(gb_cond)
 
@@ -1130,6 +1168,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'P_chamber': pv_to_pa(self.sp_Pc.value(), self.cb_Pc_unit.currentText()),
             'P_exit': pv_to_pa(self.sp_Pe.value(), self.cb_Pe_unit.currentText()),
             'n_inter': self.sp_n_inter.value(),
+            'density_sub': self.sp_density_sub.value(),
+            'density_crit': self.sp_density_crit.value(),
+            'density_sup': self.sp_density_sup.value(),
             'include_condensed': self.chk_condensed.isChecked(),
         }
         solver = 'cea' if self.rb_cea.isChecked() else 'own'
@@ -1835,6 +1876,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'Pc_MPa': self.sp_Pc.value(),
             'Pe_MPa': self.sp_Pe.value(),
             'n_inter': self.sp_n_inter.value(),
+            'density_sub': self.sp_density_sub.value(),
+            'density_crit': self.sp_density_crit.value(),
+            'density_sup': self.sp_density_sup.value(),
             'include_condensed': self.chk_condensed.isChecked(),
             'solver': 'cea' if self.rb_cea.isChecked() else 'own',
             'L_chamber': self.sp_L_chamber.value(),
@@ -1889,6 +1933,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sp_Pc.setValue(cfg.get('Pc_MPa', 10.0))
             self.sp_Pe.setValue(cfg.get('Pe_MPa', 0.1013))
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
+            self.sp_density_sub.setValue(cfg.get('density_sub', 1.0))
+            self.sp_density_crit.setValue(cfg.get('density_crit', 1.0))
+            self.sp_density_sup.setValue(cfg.get('density_sup', 1.0))
             self.chk_condensed.setChecked(cfg.get('include_condensed', True))
             if cfg.get('solver') == 'cea' and CANTERA_AVAILABLE:
                 self.rb_cea.setChecked(True)
