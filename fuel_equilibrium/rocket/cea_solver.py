@@ -23,7 +23,12 @@ except ImportError:
     CANTERA_AVAILABLE = False
 
 # Используем те же dataclass-структуры, что и в nozzle_flow:
-from .nozzle_flow import StationResult, RocketPerformance, Propellant
+from .nozzle_flow import (
+    StationResult,
+    RocketPerformance,
+    Propellant,
+    _build_segmented_pressure_grid,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,6 +297,9 @@ def solve_rocket_nozzle_cea(
     P_chamber: float,
     P_exit: float,
     n_intermediate_stations: int = 3,
+    section_density_subsonic: float = 1.0,
+    section_density_critical: float = 1.0,
+    section_density_supersonic: float = 1.0,
     include_condensed: bool = False,
     verbose: bool = False,
     progress_cb=None,
@@ -306,6 +314,8 @@ def solve_rocket_nozzle_cea(
             "Решатель CEA (Cantera) недоступен.\n"
             "Установите cantera: pip install cantera"
         )
+
+    n_intermediate_stations = int(max(0, min(1048, n_intermediate_stations)))
 
     ox_name, T_ox_default, ox_latent = _resolve_component(oxidizer.name)
     fu_name, T_fu_default, fu_latent = _resolve_component(fuel.name)
@@ -470,9 +480,15 @@ def solve_rocket_nozzle_cea(
     if n_intermediate_stations > 0:
         if progress_cb:
             progress_cb(f"Расчёт {n_intermediate_stations} промежуточных сечений...")
-        P_grid = np.exp(np.linspace(
-            math.log(P_throat), math.log(P_exit), n_intermediate_stations + 2,
-        ))[1:-1]
+        P_grid = _build_segmented_pressure_grid(
+            P_chamber=P_chamber,
+            P_throat=P_throat,
+            P_exit=P_exit,
+            n_total=n_intermediate_stations,
+            density_subsonic=section_density_subsonic,
+            density_critical=section_density_critical,
+            density_supersonic=section_density_supersonic,
+        )
         for k, P_k in enumerate(P_grid, start=1):
             _sp_solve(S_chamber_per_kg, float(P_k),
                       T_guess=station_throat.T_K * 0.8)

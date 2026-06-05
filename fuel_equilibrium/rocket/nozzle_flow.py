@@ -418,6 +418,91 @@ def _make_station(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Распределение промежуточных сечений по зонам сопла
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_segmented_pressure_grid(
+    P_chamber: float,
+    P_throat: float,
+    P_exit: float,
+    n_total: int,
+    density_subsonic: float = 1.0,
+    density_critical: float = 1.0,
+    density_supersonic: float = 1.0,
+) -> np.ndarray:
+    """Строит сетку давлений для промежуточных сечений по трём зонам.
+
+    Зоны:
+        - дозвуковая: между камерой и горловиной;
+        - критическая: сгущение в окрестности горловины;
+        - сверхзвуковая: между горловиной и срезом.
+
+    Возвращает массив давлений (Па), отсортированный по ходу потока
+    (от большего к меньшему), без граничных точек Pc/Pt/Pe.
+    """
+    n_total = int(max(0, min(1048, n_total)))
+    if n_total <= 0:
+        return np.array([], dtype=float)
+
+    weights = np.array([
+        max(0.0, float(density_subsonic)),
+        max(0.0, float(density_critical)),
+        max(0.0, float(density_supersonic)),
+    ], dtype=float)
+    if np.all(weights <= 0):
+        weights[:] = 1.0
+
+    raw = n_total * weights / weights.sum()
+    counts = np.floor(raw).astype(int)
+    remainder = n_total - int(counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw - counts))
+        for i in order[:remainder]:
+            counts[i] += 1
+
+    n_sub, n_crit, n_sup = int(counts[0]), int(counts[1]), int(counts[2])
+    pressures: List[float] = []
+
+    if n_sub > 0 and P_chamber > P_throat:
+        P_sub = np.exp(np.linspace(math.log(P_chamber), math.log(P_throat), n_sub + 2))[1:-1]
+        pressures.extend(float(p) for p in P_sub)
+
+    if n_sup > 0 and P_throat > P_exit:
+        P_sup = np.exp(np.linspace(math.log(P_throat), math.log(P_exit), n_sup + 2))[1:-1]
+        pressures.extend(float(p) for p in P_sup)
+
+    if n_crit > 0 and P_chamber > P_throat > P_exit:
+        ln_pc, ln_pt, ln_pe = math.log(P_chamber), math.log(P_throat), math.log(P_exit)
+        span_sub = max(ln_pc - ln_pt, 1e-9)
+        span_sup = max(ln_pt - ln_pe, 1e-9)
+        crit_share = 0.18
+
+        n_up = (n_crit + 1) // 2
+        n_dn = n_crit - n_up
+
+        for i in range(1, n_up + 1):
+            frac = (i / (n_up + 1)) ** 1.4
+            ln_p = ln_pt + crit_share * span_sub * frac
+            pressures.append(float(math.exp(ln_p)))
+
+        for i in range(1, n_dn + 1):
+            frac = (i / (n_dn + 1)) ** 1.4
+            ln_p = ln_pt - crit_share * span_sup * frac
+            pressures.append(float(math.exp(ln_p)))
+
+    # Фильтрация, сортировка по ходу потока и удаление «почти дублей».
+    filtered = [p for p in pressures if (P_exit < p < P_chamber)]
+    filtered.sort(reverse=True)
+
+    dedup: List[float] = []
+    for p in filtered:
+        if not dedup or abs(p - dedup[-1]) > max(1e-6, 1e-8 * abs(p)):
+            dedup.append(p)
+
+    return np.array(dedup, dtype=float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Основная функция: расчёт сопла «от Pc до Pe» с произвольным числом сечений
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -428,6 +513,9 @@ def solve_rocket_nozzle(
     P_exit: float,
     species_db: Dict[str, Species],
     n_intermediate_stations: int = 0,
+    section_density_subsonic: float = 1.0,
+    section_density_critical: float = 1.0,
+    section_density_supersonic: float = 1.0,
     include_condensed: bool = True,
     verbose: bool = False,
     logger: Optional[IterationLogger] = None,
@@ -438,8 +526,10 @@ def solve_rocket_nozzle(
     Параметры:
         oxidizer, fuel  — компоненты топлива (mass_kg в сумме обычно = 1 кг).
         P_chamber, P_exit — давления в камере и на срезе, Па.
-        n_intermediate_stations — сколько дополнительных сечений между
-                                  горловиной и срезом (0 = только injector/throat/exit).
+        n_intermediate_stations — общее число дополнительных сечений
+                                  (0..1048) для газодинамического расчёта.
+        section_density_*       — относительная плотность сечений по зонам
+                                  дозвук/критика/сверхзвук.
         species_db      — база NASA-9.
         logger          — куда писать журнал итераций.
 
@@ -447,6 +537,8 @@ def solve_rocket_nozzle(
     """
     if logger is None:
         logger = NullLogger()
+
+    n_intermediate_stations = int(max(0, min(1048, n_intermediate_stations)))
 
     # ── 1) Энтальпия реагентов и элементный баланс ─────────────────────
     components = [oxidizer, fuel]
@@ -614,10 +706,15 @@ def solve_rocket_nozzle(
     # ── 7) Промежуточные сечения между throat и exit ───────────────────
     intermediate = []
     if n_intermediate_stations > 0:
-        # давления — лог-распределение от P_throat до P_exit
-        P_grid = np.exp(np.linspace(
-            math.log(P_throat), math.log(P_exit), n_intermediate_stations + 2,
-        ))[1:-1]  # без концов
+        P_grid = _build_segmented_pressure_grid(
+            P_chamber=P_chamber,
+            P_throat=P_throat,
+            P_exit=P_exit,
+            n_total=n_intermediate_stations,
+            density_subsonic=section_density_subsonic,
+            density_critical=section_density_critical,
+            density_supersonic=section_density_supersonic,
+        )
         for k, P_k in enumerate(P_grid, start=1):
             r_k = solve_equilibrium_SP(
                 species_list=species_list,
