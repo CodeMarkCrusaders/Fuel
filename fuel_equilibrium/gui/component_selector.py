@@ -9,6 +9,98 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from ..core.nasa9_parser import Species
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Классификация веществ: окислитель / горючее / ион
+# ═══════════════════════════════════════════════════════════════════════════
+# Элементы, характерные для окислителей (галогены + кислород).
+_OXIDIZER_ELEMENTS = {"F", "O", "CL", "BR", "I"}
+# Элементы, характерные для горючих (водород, углерод, металлы, бор и т.п.).
+_FUEL_ELEMENTS = {
+    "H", "C", "B", "AL", "BE", "LI", "MG", "NA", "K", "SI", "S", "P",
+    "ZR", "TI", "FE", "CU", "ZN", "W", "MO", "CR", "NI", "MN", "CA",
+    "BA", "SR",
+}
+
+
+def is_ion(name: str, species: Species) -> bool:
+    """Определить, является ли вещество ионом (заряженной частицей).
+
+    Ионы нельзя добавлять как компоненты топлива. Признаки:
+      * имя заканчивается на ``+`` или ``-`` (Ag+, ALO2-, e-);
+        дефис ВНУТРИ имени (RP-1, JP-4) не считается зарядом;
+      * имя содержит ``++`` / ``--`` (двойной заряд);
+      * элементный состав содержит псевдо-элемент ``E`` (электрон).
+    """
+    n = (name or "").strip()
+    if not n:
+        return False
+    if n.endswith("+") or n.endswith("-"):
+        return True
+    if "++" in n or "--" in n:
+        return True
+    try:
+        els = {str(k).upper() for k in species.elements.keys()}
+    except Exception:
+        els = set()
+    if "E" in els:
+        return True
+    return False
+
+
+def classify_role(name: str, species: Species) -> str:
+    """Классифицировать вещество: ``'oxidizer'`` | ``'fuel'`` | ``'both'``.
+
+    Эвристика по элементному составу:
+      * только окислительные элементы → окислитель;
+      * только горючие элементы → горючее;
+      * смешанный состав → по доминированию:
+          - если единственный горючий элемент — водород (H) и
+            окислительных атомов не меньше (перекиси, кислоты: H2O2, HNO3)
+            → окислитель;
+          - если окислительных атомов вдвое больше горючих → окислитель;
+          - иначе → горючее;
+      * нет ни тех, ни других (инертные: Ar, N2) → ``'both'``.
+    """
+    try:
+        els = {str(k).upper(): float(v) for k, v in species.elements.items()}
+    except Exception:
+        els = {}
+    # Исключаем псевдо-элемент электрона из подсчёта.
+    els.pop("E", None)
+
+    ox_atoms = sum(c for el, c in els.items() if el in _OXIDIZER_ELEMENTS)
+    fuel_atoms = sum(c for el, c in els.items() if el in _FUEL_ELEMENTS)
+    fuel_only_elements = {el for el in els if el in _FUEL_ELEMENTS}
+
+    if ox_atoms <= 0 and fuel_atoms <= 0:
+        return "both"
+    if ox_atoms > 0 and fuel_atoms <= 0:
+        return "oxidizer"
+    if fuel_atoms > 0 and ox_atoms <= 0:
+        return "fuel"
+
+    # Смешанный состав.
+    if fuel_only_elements == {"H"} and ox_atoms >= fuel_atoms:
+        # Перекиси / кислоты, где «горючая» часть — только водород.
+        return "oxidizer"
+    if ox_atoms >= 2.0 * fuel_atoms:
+        return "oxidizer"
+    return "fuel"
+
+
+def allowed_for_mode(name: str, species: Species, mode: str) -> bool:
+    """Разрешено ли добавлять вещество в заданном режиме (ox/fuel).
+
+    Ионы запрещены всегда. ``'both'`` разрешено в обоих режимах.
+    """
+    if is_ion(name, species):
+        return False
+    role = classify_role(name, species)
+    if role == "both":
+        return True
+    return role == mode
+
+
 class ComponentSelectorDialog(QtWidgets.QDialog):
     """Диалог выбора компонентов топлива с фильтрацией и поиском."""
     
@@ -70,7 +162,17 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
         filter_layout.addWidget(self.rb_solid)
         filter_layout.addStretch()
         layout.addLayout(filter_layout)
-        
+
+        # Подсказка о фильтрации по роли компонента
+        role_word = "окислителя" if self.mode == "oxidizer" else "горючего"
+        self.hint_label = QtWidgets.QLabel(
+            f"Показаны только вещества, подходящие в качестве {role_word}. "
+            f"Ионы исключены."
+        )
+        self.hint_label.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
         # Таблица компонентов
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(4)
@@ -124,6 +226,11 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
         self.table.setRowCount(0)
         
         for name, species in self.all_components:
+            # Исключить ионы и вещества, не подходящие для текущего режима
+            # (нельзя добавить горючее как окислитель и наоборот).
+            if not allowed_for_mode(name, species, self.mode):
+                continue
+
             # Поиск по имени или элементам
             if search_text and search_text not in name.lower():
                 # Проверить поиск по элементам

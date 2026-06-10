@@ -54,6 +54,13 @@ from ..rocket.nozzle_flow import (
     Propellant, StationResult, RocketPerformance,
     solve_rocket_nozzle,
 )
+from ..rocket.nozzle_geometry import (
+    build_conical_nozzle, build_profiled_nozzle,
+    build_geometry_from_performance, optimal_angles_from_area_ratio,
+    dispersion_loss_coeff, NozzleGeometry,
+    build_rpa_parabolic_nozzle, rao_reference_length_15deg, estimate_bell_angles,
+)
+from ..rocket.nozzle_flow_2d import solve_nozzle_2d, Nozzle2DResult
 from ..io.reporting import print_nozzle_table
 from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
@@ -506,6 +513,73 @@ class MplCanvas(FigureCanvas):
         self.ax = self.fig.add_subplot(111)
 
 
+class CollapsibleSection(QtWidgets.QWidget):
+    """Раскрывающаяся секция (как выпадающий список разделов настроек).
+
+    Заголовок-кнопка со стрелкой ▶/▼; по клику тело секции скрывается/
+    показывается. В тело через ``setContentLayout``/``setContentWidget``
+    помещается любой layout или виджет.
+    """
+
+    def __init__(self, title: str = "", parent=None, expanded: bool = True):
+        super().__init__(parent)
+        self._toggle = QtWidgets.QToolButton(self)
+        self._toggle.setStyleSheet(
+            "QToolButton {"
+            "  border: 1px solid #44403c;"
+            "  border-radius: 4px;"
+            "  background: #2a2724;"
+            "  font-weight: bold;"
+            "  text-align: left;"
+            "  padding: 6px 8px;"
+            "}"
+            "QToolButton:hover { background: #353230; }"
+        )
+        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._toggle.setText(title)
+        self._toggle.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self._toggle.clicked.connect(self._on_toggled)
+
+        self._content = QtWidgets.QWidget(self)
+        self._content.setVisible(expanded)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self._toggle)
+        lay.addWidget(self._content)
+
+    def setContentLayout(self, content_layout):
+        old = self._content.layout()
+        if old is not None:
+            QtWidgets.QWidget().setLayout(old)
+        self._content.setLayout(content_layout)
+
+    def setContentWidget(self, widget):
+        """Помещает один виджет внутрь раскрывающейся секции."""
+        lay = QtWidgets.QVBoxLayout()
+        lay.setContentsMargins(4, 2, 4, 4)
+        lay.setSpacing(4)
+        lay.addWidget(widget)
+        self.setContentLayout(lay)
+
+    def _on_toggled(self, checked: bool):
+        self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self._content.setVisible(checked)
+
+    def setExpanded(self, expanded: bool):
+        self._toggle.setChecked(expanded)
+        self._on_toggled(expanded)
+
+    def isExpanded(self) -> bool:
+        return self._toggle.isChecked()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Worker для асинхронного расчёта
 # ═══════════════════════════════════════════════════════════════════════════
@@ -619,31 +693,58 @@ class MainWindow(QtWidgets.QMainWindow):
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidget(left_widget)
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(400)
-        left_scroll.setMaximumWidth(460)
+        # Минимальная ширина обеспечивает полную видимость панели настроек
+        # по умолчанию; верхний предел снят, чтобы пользователь мог свободно
+        # расширять панель слайдером.
+        left_scroll.setMinimumWidth(440)
+        # Не ограничиваем максимум — иначе панель «обрезается» справа.
+        left_scroll.setMaximumWidth(16777215)
         splitter.addWidget(left_scroll)
 
-        # ─── Правая часть: вкладки результатов ───
+        # ─── Правая часть: вкладки результатов, сгруппированы как в RPA ───
+        # Верхний уровень: Газодинамика | Равновесный состав | Геометрия
         self.tabs = QtWidgets.QTabWidget()
         splitter.addWidget(self.tabs)
 
-        # Вкладка: Параметры по сечениям (таблица RPA-style)
+        # ═══ Группа 1: Газодинамические параметры (1D/2D) ═══
+        self.tabs_gasdynamics = QtWidgets.QTabWidget()
+        self.tabs_gasdynamics.setObjectName("subtabs")
+
         self.tab_table = self._build_table_tab()
-        self.tabs.addTab(self.tab_table, "Параметры по сечениям")
+        self.tabs_gasdynamics.addTab(self.tab_table, "Параметры по сечениям")
 
-        # Вкладка: Графики по длине сопла
+        # Вкладка «Графики по длине сопла» содержит внутри подвкладку
+        # «Поле течения (2D)» (см. _build_plot_tab) — отдельной вкладки 2D нет.
         self.tab_plots = self._build_plot_tab()
-        self.tabs.addTab(self.tab_plots, "Графики по длине сопла")
+        self.tabs_gasdynamics.addTab(self.tab_plots, "Графики по длине сопла")
 
-        # Вкладка: Состав продуктов
-        self.tab_species = self._build_species_tab()
-        self.tabs.addTab(self.tab_species, "Состав продуктов сгорания")
-
-        # Вкладка: Тяговые характеристики
         self.tab_perf = self._build_perf_tab()
-        self.tabs.addTab(self.tab_perf, "Тяговые характеристики")
+        self.tabs_gasdynamics.addTab(self.tab_perf, "Тяговые характеристики")
 
-        splitter.setSizes([400, 1100])
+        self.tabs.addTab(self.tabs_gasdynamics, "Газодинамика")
+
+        # ═══ Группа 2: Равновесный состав продуктов сгорания ═══
+        self.tabs_equilibrium = QtWidgets.QTabWidget()
+        self.tabs_equilibrium.setObjectName("subtabs")
+        self.tab_species = self._build_species_tab()
+        self.tabs_equilibrium.addTab(self.tab_species, "Состав продуктов сгорания")
+        self.tabs.addTab(self.tabs_equilibrium, "Равновесный состав")
+
+        # ═══ Группа 3: Геометрия сопла ═══
+        self.tabs_geometry = QtWidgets.QTabWidget()
+        self.tabs_geometry.setObjectName("subtabs")
+        self.tab_geometry = self._build_geometry_tab()
+        self.tabs_geometry.addTab(self.tab_geometry, "Контур сопла (Size & Geometry)")
+        self.tabs.addTab(self.tabs_geometry, "Геометрия")
+
+        # По умолчанию слайдер выставлен так, чтобы панель настроек слева была
+        # полностью видна (не обрезалась справа), а результаты занимали остаток.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([480, 1040])
+        # Гарантируем, что главное окно достаточно широкое для полной панели.
+        self.setMinimumWidth(1100)
 
     def _build_input_panel(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -683,7 +784,13 @@ class MainWindow(QtWidgets.QMainWindow):
         of_layout.addStretch()
         gb_fuel_layout.addLayout(of_layout)
 
-        layout.addWidget(gb_fuel)
+        # Раскрывающаяся секция «Топливо» (заголовок убираем у группы, чтобы
+        # не было двойного заголовка внутри раскрывающейся секции).
+        gb_fuel.setTitle("")
+        gb_fuel.setFlat(True)
+        self.sec_fuel = CollapsibleSection("Топливо (RPA-style)", expanded=True)
+        self.sec_fuel.setContentWidget(gb_fuel)
+        layout.addWidget(self.sec_fuel)
 
         # ─── Условия + газодинамические настройки по вкладкам ───
         self.sp_Pc = QtWidgets.QDoubleSpinBox()
@@ -782,9 +889,57 @@ class MainWindow(QtWidgets.QMainWindow):
         gasd_hint.setWordWrap(True)
         form_gasd.addRow("", gasd_hint)
 
-        self.input_tabs.addTab(tab_basic, "Условия")
-        self.input_tabs.addTab(tab_gasd, "Газодинамический расчет")
-        layout.addWidget(self.input_tabs)
+        # ─── Выбор размерности расчёта газодинамики: 1D / 2D ───
+        w_dim = QtWidgets.QWidget()
+        h_dim = QtWidgets.QHBoxLayout(w_dim)
+        h_dim.setContentsMargins(0, 0, 0, 0)
+        self.rb_dim_1d = QtWidgets.QRadioButton("Одномерный (1D)")
+        self.rb_dim_2d = QtWidgets.QRadioButton("Двумерный (2D)")
+        self.rb_dim_1d.setChecked(True)
+        self.rb_dim_1d.setToolTip(
+            "Одномерный квазигазодинамический расчёт по оси сопла\n"
+            "(стандартная модель равновесного течения)."
+        )
+        self.rb_dim_2d.setToolTip(
+            "Двумерный (осесимметричный) расчёт поля течения.\n"
+            "ЗАГОТОВКА: квази-2D обёртка 1D-профиля на сетку (n_r×n_x)\n"
+            "с поправкой на угол стенки. Полный метод характеристик (MOC) — TODO."
+        )
+        self.rb_dim_1d.toggled.connect(self._on_dim_mode_changed)
+        self.rb_dim_2d.toggled.connect(self._on_dim_mode_changed)
+        h_dim.addWidget(self.rb_dim_1d)
+        h_dim.addWidget(self.rb_dim_2d)
+        h_dim.addStretch(1)
+        form_gasd.addRow("Размерность расчёта:", w_dim)
+
+        self.sp_n_radial_2d = QtWidgets.QSpinBox()
+        self.sp_n_radial_2d.setRange(5, 121)
+        self.sp_n_radial_2d.setValue(21)
+        self.sp_n_radial_2d.setToolTip("Число радиальных узлов 2D-сетки (только для 2D).")
+        form_gasd.addRow("Радиальных узлов (2D):", self.sp_n_radial_2d)
+
+        self.input_tabs.addTab(tab_basic, "Исходные данные")
+        self.input_tabs.addTab(tab_gasd, "Газодинамика (1D/2D)")
+
+        # ─── Третья вкладка исходных данных: Геометрия (Size & Geometry) ───
+        self.tab_input_geom = QtWidgets.QWidget()
+        self.form_input_geom = QtWidgets.QVBoxLayout(self.tab_input_geom)
+        self.form_input_geom.setContentsMargins(2, 2, 2, 2)
+        self.form_input_geom.setSpacing(8)
+        geom_hdr = QtWidgets.QLabel(
+            "Геометрия сопла (как в RPA: Size & Geometry).\n"
+            "Здесь задаётся профиль сопла и габариты для оси X графиков."
+        )
+        geom_hdr.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        geom_hdr.setWordWrap(True)
+        self.form_input_geom.addWidget(geom_hdr)
+        self.input_tabs.addTab(self.tab_input_geom, "Геометрия (Size & Geometry)")
+
+        # Раскрывающаяся секция «Параметры расчёта» (содержит вкладки
+        # Исходные данные / Газодинамика / Геометрия).
+        self.sec_params = CollapsibleSection("Параметры расчёта", expanded=True)
+        self.sec_params.setContentWidget(self.input_tabs)
+        layout.addWidget(self.sec_params)
 
         # ─── Решатель ───
         gb_solver = QtWidgets.QGroupBox("Решатель")
@@ -807,7 +962,14 @@ class MainWindow(QtWidgets.QMainWindow):
         info.setStyleSheet("color: #a8a29e; font-size: 10px;")
         info.setWordWrap(True)
         form3.addWidget(info)
-        layout.addWidget(gb_solver)
+
+        # Раскрывающаяся секция «Решатель» (по умолчанию свёрнута, как
+        # второстепенная настройка).
+        gb_solver.setTitle("")
+        gb_solver.setFlat(True)
+        self.sec_solver = CollapsibleSection("Решатель", expanded=False)
+        self.sec_solver.setContentWidget(gb_solver)
+        layout.addWidget(self.sec_solver)
 
         # ─── Геометрия сопла (для оси X на графиках) ───
         gb_geom = QtWidgets.QGroupBox("Геометрия сопла (для оси X)")
@@ -858,7 +1020,220 @@ class MainWindow(QtWidgets.QMainWindow):
         form4.addRow("Длина камеры:", w_L_ch)
         form4.addRow("Конфузор:", w_L_co)
         form4.addRow("Дивергент:", w_L_di)
-        layout.addWidget(gb_geom)
+        self.form_input_geom.addWidget(gb_geom)
+
+        # ─── Профиль по Добровольскому (выбор типа + ручной ввод геометрии) ───
+        gb_prof = QtWidgets.QGroupBox("Профиль сопла (Добровольский, гл. 2)")
+        formP = QtWidgets.QFormLayout(gb_prof)
+        formP.setSpacing(6)
+
+        self.chk_use_dobro = QtWidgets.QCheckBox(
+            "Строить профиль по выбранному типу и параметрам"
+        )
+        self.chk_use_dobro.setChecked(True)
+        self.chk_use_dobro.setToolTip(
+            "Если включено, профиль сопла на графике строится по методике\n"
+            "Добровольского (коническое §2.3 / профилированное §2.6) с\n"
+            "указанными ниже параметрами. Степень расширения F_a/F_кр\n"
+            "берётся из результата газодинамического расчёта."
+        )
+        formP.addRow(self.chk_use_dobro)
+
+        # Тип сопла
+        w_type = QtWidgets.QWidget()
+        h_type = QtWidgets.QHBoxLayout(w_type)
+        h_type.setContentsMargins(0, 0, 0, 0)
+        self.rb_calc_conical = QtWidgets.QRadioButton("Коническое")
+        self.rb_calc_profiled = QtWidgets.QRadioButton("Профилированное")
+        self.rb_calc_rpa = QtWidgets.QRadioButton("RPA (bell)")
+        self.rb_calc_profiled.setChecked(True)
+        self.rb_calc_conical.toggled.connect(self._on_calc_geom_type_changed)
+        self.rb_calc_profiled.toggled.connect(self._on_calc_geom_type_changed)
+        self.rb_calc_rpa.toggled.connect(self._on_calc_geom_type_changed)
+        h_type.addWidget(self.rb_calc_conical)
+        h_type.addWidget(self.rb_calc_profiled)
+        h_type.addWidget(self.rb_calc_rpa)
+        formP.addRow("Тип сопла:", w_type)
+
+        # R_кр (горловина)
+        w_Rkr = QtWidgets.QWidget()
+        h_Rkr = QtWidgets.QHBoxLayout(w_Rkr)
+        h_Rkr.setContentsMargins(0, 0, 0, 0)
+        self.sp_calc_Rthroat = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_Rthroat.setRange(0.0001, 100.0)
+        self.sp_calc_Rthroat.setDecimals(4)
+        self.sp_calc_Rthroat.setValue(0.0500)
+        self.sp_calc_Rthroat.setSingleStep(0.005)
+        self.sp_calc_Rthroat.setToolTip("R_кр — радиус критического сечения (горловины)")
+        h_Rkr.addWidget(self.sp_calc_Rthroat)
+        self.cb_calc_Rthroat_unit = QtWidgets.QComboBox()
+        self.cb_calc_Rthroat_unit.addItems(["м", "см", "мм"])
+        self.cb_calc_Rthroat_unit.setCurrentText("м")
+        h_Rkr.addWidget(self.cb_calc_Rthroat_unit)
+        formP.addRow("R_кр (горловина):", w_Rkr)
+
+        # R_камеры / R_кр
+        self.sp_calc_Rcham = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_Rcham.setRange(1.05, 20.0)
+        self.sp_calc_Rcham.setDecimals(3)
+        self.sp_calc_Rcham.setValue(2.500)
+        self.sp_calc_Rcham.setSingleStep(0.1)
+        self.sp_calc_Rcham.setToolTip("R_камеры / R_кр")
+        formP.addRow("R_камеры / R_кр:", self.sp_calc_Rcham)
+
+        # Углы
+        self.sp_calc_theta_in = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_theta_in.setRange(10.0, 45.0)
+        self.sp_calc_theta_in.setDecimals(2)
+        self.sp_calc_theta_in.setValue(30.0)
+        self.sp_calc_theta_in.setSingleStep(1.0)
+        self.sp_calc_theta_in.setToolTip("θ_вх — полуугол дозвукового конуса (2θ_вх=45…80°)")
+        formP.addRow("θ_вх (дозвук), °:", self.sp_calc_theta_in)
+
+        self.chk_calc_auto_angles = QtWidgets.QCheckBox(
+            "θ_m, θ_a, длина — авто (Рис. 2.14)"
+        )
+        self.chk_calc_auto_angles.setChecked(True)
+        self.chk_calc_auto_angles.setToolTip(
+            "Для профилированного сопла: углы и длина берутся из семейства\n"
+            "оптимальных контуров (Рис. 2.14, γ=1.23) по F_a/F_кр.\n"
+            "Снимите галочку, чтобы задать θ_m, θ_a и длину вручную."
+        )
+        self.chk_calc_auto_angles.toggled.connect(self._on_calc_geom_auto_toggled)
+        formP.addRow(self.chk_calc_auto_angles)
+
+        self.sp_calc_theta_max = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_theta_max.setRange(5.0, 50.0)
+        self.sp_calc_theta_max.setDecimals(2)
+        self.sp_calc_theta_max.setValue(30.0)
+        self.sp_calc_theta_max.setSingleStep(0.5)
+        self.sp_calc_theta_max.setToolTip("θ_m — угол контура в начале св/зв части (профиль)")
+        formP.addRow("θ_m (начало св/зв), °:", self.sp_calc_theta_max)
+
+        self.sp_calc_theta_exit = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_theta_exit.setRange(3.0, 25.0)
+        self.sp_calc_theta_exit.setDecimals(2)
+        self.sp_calc_theta_exit.setValue(15.0)
+        self.sp_calc_theta_exit.setSingleStep(0.5)
+        self.sp_calc_theta_exit.setToolTip(
+            "θ_a — угол на срезе.\n"
+            "Конус: полуугол раствора (2θ_a=25…30° ⇒ 12.5…15°).\n"
+            "Профиль: угол на срезе."
+        )
+        formP.addRow("θ_a (срез), °:", self.sp_calc_theta_exit)
+
+        self.sp_calc_len_ratio = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_len_ratio.setRange(0.5, 200.0)
+        self.sp_calc_len_ratio.setDecimals(2)
+        self.sp_calc_len_ratio.setValue(9.5)
+        self.sp_calc_len_ratio.setSingleStep(0.5)
+        self.sp_calc_len_ratio.setToolTip("x̄_a = L_сверхзв / R_кр (профиль)")
+        formP.addRow("x̄_a = L/R_кр:", self.sp_calc_len_ratio)
+
+        # Скругления
+        self.sp_calc_Rsub = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_Rsub.setRange(0.1, 5.0)
+        self.sp_calc_Rsub.setDecimals(3)
+        self.sp_calc_Rsub.setValue(1.500)
+        self.sp_calc_Rsub.setSingleStep(0.05)
+        self.sp_calc_Rsub.setToolTip(
+            "R_скр перед горловиной. Конус: ×D_кр (0.65…1.5). Профиль: ×R_кр (≈1.5)."
+        )
+        formP.addRow("R_скр × (D_кр/R_кр):", self.sp_calc_Rsub)
+
+        self.sp_calc_rsup = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rsup.setRange(0.05, 3.0)
+        self.sp_calc_rsup.setDecimals(3)
+        self.sp_calc_rsup.setValue(0.450)
+        self.sp_calc_rsup.setSingleStep(0.05)
+        self.sp_calc_rsup.setToolTip("r_скр за горловиной ×R_кр (≈0.45·R_кр)")
+        formP.addRow("r_скр × R_кр:", self.sp_calc_rsup)
+
+        self.sp_calc_R1 = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_R1.setRange(0.5, 10.0)
+        self.sp_calc_R1.setDecimals(3)
+        self.sp_calc_R1.setValue(3.000)
+        self.sp_calc_R1.setSingleStep(0.25)
+        self.sp_calc_R1.setToolTip("R_1 — скругление на входе из камеры ×D_кр (2…4)")
+        formP.addRow("R_1 × D_кр:", self.sp_calc_R1)
+
+        # ─── Поля RPA (параболический bell, нотация RPA Size & Geometry) ───
+        self.sp_calc_rpa_b = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_b.setRange(10.0, 60.0)
+        self.sp_calc_rpa_b.setDecimals(2)
+        self.sp_calc_rpa_b.setValue(30.0)
+        self.sp_calc_rpa_b.setSingleStep(1.0)
+        self.sp_calc_rpa_b.setToolTip("Contraction angle b — угол сжатия конфузора, °")
+        formP.addRow("b (contraction), °:", self.sp_calc_rpa_b)
+
+        self.sp_calc_rpa_R1Rt = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_R1Rt.setRange(0.2, 10.0)
+        self.sp_calc_rpa_R1Rt.setDecimals(3)
+        self.sp_calc_rpa_R1Rt.setValue(1.500)
+        self.sp_calc_rpa_R1Rt.setSingleStep(0.1)
+        self.sp_calc_rpa_R1Rt.setToolTip("R1/Rt — скругление сходящейся стороны горловины")
+        formP.addRow("R1/Rt:", self.sp_calc_rpa_R1Rt)
+
+        self.sp_calc_rpa_R2 = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_R2.setRange(0.0, 1.0)
+        self.sp_calc_rpa_R2.setDecimals(3)
+        self.sp_calc_rpa_R2.setValue(0.500)
+        self.sp_calc_rpa_R2.setSingleStep(0.05)
+        self.sp_calc_rpa_R2.setToolTip("R2/R2max — относительный радиус входа в конфузор (0…1)")
+        formP.addRow("R2/R2max (0…1):", self.sp_calc_rpa_R2)
+
+        self.sp_calc_rpa_RnRt = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_RnRt.setRange(0.1, 2.0)
+        self.sp_calc_rpa_RnRt.setDecimals(3)
+        self.sp_calc_rpa_RnRt.setValue(0.382)
+        self.sp_calc_rpa_RnRt.setSingleStep(0.01)
+        self.sp_calc_rpa_RnRt.setToolTip("Rn/Rt — скругление расходящейся стороны горловины (RPA=0.382)")
+        formP.addRow("Rn/Rt:", self.sp_calc_rpa_RnRt)
+
+        self.chk_calc_rpa_auto = QtWidgets.QCheckBox("Tn, Te — авто (по ε, Le/Le15)")
+        self.chk_calc_rpa_auto.setChecked(True)
+        self.chk_calc_rpa_auto.toggled.connect(self._on_calc_geom_auto_toggled)
+        formP.addRow(self.chk_calc_rpa_auto)
+
+        self.sp_calc_rpa_Tn = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_Tn.setRange(5.0, 55.0)
+        self.sp_calc_rpa_Tn.setDecimals(2)
+        self.sp_calc_rpa_Tn.setValue(27.0)
+        self.sp_calc_rpa_Tn.setSingleStep(0.5)
+        self.sp_calc_rpa_Tn.setToolTip("Tn — начальный угол параболы, °")
+        formP.addRow("Tn (нач. парабола), °:", self.sp_calc_rpa_Tn)
+
+        self.sp_calc_rpa_Te = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_Te.setRange(1.0, 24.0)
+        self.sp_calc_rpa_Te.setDecimals(2)
+        self.sp_calc_rpa_Te.setValue(10.0)
+        self.sp_calc_rpa_Te.setSingleStep(0.5)
+        self.sp_calc_rpa_Te.setToolTip("Te — конечный угол параболы, °")
+        formP.addRow("Te (кон. парабола), °:", self.sp_calc_rpa_Te)
+
+        self.sp_calc_rpa_LeLe15 = QtWidgets.QDoubleSpinBox()
+        self.sp_calc_rpa_LeLe15.setRange(50.0, 120.0)
+        self.sp_calc_rpa_LeLe15.setDecimals(1)
+        self.sp_calc_rpa_LeLe15.setValue(80.0)
+        self.sp_calc_rpa_LeLe15.setSingleStep(1.0)
+        self.sp_calc_rpa_LeLe15.setToolTip("Relative length Le/Le15, %")
+        formP.addRow("Le/Le15, %:", self.sp_calc_rpa_LeLe15)
+
+        # Списки полей для переключения видимости по типу сопла
+        self._calc_rpa_widgets = [
+            self.sp_calc_rpa_b, self.sp_calc_rpa_R1Rt, self.sp_calc_rpa_R2,
+            self.sp_calc_rpa_RnRt, self.chk_calc_rpa_auto,
+            self.sp_calc_rpa_Tn, self.sp_calc_rpa_Te, self.sp_calc_rpa_LeLe15,
+        ]
+        self._calc_dobro_widgets = [
+            self.sp_calc_theta_in, self.chk_calc_auto_angles,
+            self.sp_calc_theta_max, self.sp_calc_theta_exit, self.sp_calc_len_ratio,
+            self.sp_calc_Rsub, self.sp_calc_rsup, self.sp_calc_R1,
+        ]
+        self._calc_formP = formP
+
+        self.form_input_geom.addWidget(gb_prof)
+        self.form_input_geom.addStretch(1)
 
         # ─── Кнопки ───
         self.btn_calc = QtWidgets.QPushButton("▶  Рассчитать сопло")
@@ -873,6 +1248,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.progress)
 
         layout.addStretch(1)
+        # начальная синхронизация активности полей геометрии профиля
+        self._on_calc_geom_type_changed()
+        self._on_dim_mode_changed()
         return w
 
     def _build_table_tab(self) -> QtWidgets.QWidget:
@@ -891,7 +1269,11 @@ class MainWindow(QtWidgets.QMainWindow):
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(4, 4, 4, 4)
 
-        # Слева — графики (сетка 2x2)
+        # Слева — внутренние подвкладки: графики 1D и поле течения 2D.
+        self.plot_subtabs = QtWidgets.QTabWidget()
+        self.plot_subtabs.setObjectName("subtabs")
+
+        # Подвкладка 1: графики 1D (сетка 2x2)
         plot_widget = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(plot_widget)
         grid.setSpacing(4)
@@ -905,7 +1287,14 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.canvas_VM, 0, 1)
         grid.addWidget(self.canvas_RHO, 1, 0)
         grid.addWidget(self.canvas_PROFILE, 1, 1)
-        h.addWidget(plot_widget, 1)
+        self.plot_subtabs.addTab(plot_widget, "Графики (1D)")
+
+        # Подвкладка 2: поле течения (2D) — теперь живёт здесь, внутри
+        # раздела «Графики по длине сопла».
+        self.tab_field_2d = self._build_field_2d_tab()
+        self.plot_subtabs.addTab(self.tab_field_2d, "Поле течения (2D)")
+
+        h.addWidget(self.plot_subtabs, 1)
 
         # Справа — панель настройки стиля
         side = QtWidgets.QWidget()
@@ -1023,6 +1412,738 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         v.addWidget(self.txt_perf)
         return w
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Вкладка «Поле течения (2D)» — заготовка квази-2D расчёта
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_field_2d_tab(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+
+        ctrl = QtWidgets.QHBoxLayout()
+        ctrl.addWidget(QtWidgets.QLabel("Поле:"))
+        self.cb_field_2d = QtWidgets.QComboBox()
+        self.cb_field_2d.addItems([
+            "M (число Маха)", "P (давление)", "T (температура)",
+            "V (скорость)", "Угол потока, °",
+        ])
+        self._field_2d_keys = {
+            0: ("M", "M"), 1: ("P_Pa", "P, Па"), 2: ("T_K", "T, К"),
+            3: ("V_m_per_s", "V, м/с"), 4: ("flow_angle_deg", "угол, °"),
+        }
+        self.cb_field_2d.currentIndexChanged.connect(lambda *_: self._render_field_2d())
+        ctrl.addWidget(self.cb_field_2d)
+        ctrl.addStretch(1)
+        v.addLayout(ctrl)
+
+        self.lbl_field_2d_info = QtWidgets.QLabel(
+            "Двумерный (осесимметричный) расчёт: квази-2D модель.\n"
+            "Параметры (M, P, T, V) меняются по ДВУМ координатам — вдоль оси x\n"
+            "и по радиусу r. Радиальное распределение числа Маха строится по\n"
+            "источниковому (source-flow) приближению расходящегося потока, а\n"
+            "T, P и V пересчитываются из M по изэнтропическим соотношениям.\n"
+            "Полный метод характеристик (MOC) — следующий шаг (TODO).\n"
+            "Выберите режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)» и\n"
+            "выполните расчёт, чтобы построить поле течения."
+        )
+        self.lbl_field_2d_info.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        self.lbl_field_2d_info.setWordWrap(True)
+        v.addWidget(self.lbl_field_2d_info)
+
+        self.canvas_field_2d = MplCanvas(width=7, height=4.5)
+        v.addWidget(self.canvas_field_2d, 1)
+
+        self._last_field_2d: Optional[Nozzle2DResult] = None
+        return w
+
+    def _update_field_2d_from_perf(self):
+        """Выполняет квази-2D расчёт, если выбран режим 2D, иначе очищает."""
+        self._last_field_2d = None
+        is_2d = (getattr(self, "rb_dim_2d", None) is not None
+                 and self.rb_dim_2d.isChecked())
+        if not is_2d or self.perf is None:
+            self._render_field_2d()
+            return
+        try:
+            geom = self._build_calc_geometry(self.perf)
+            if geom is None:
+                self._render_field_2d()
+                return
+            n_r = int(self.sp_n_radial_2d.value()) if hasattr(self, "sp_n_radial_2d") else 21
+            self._last_field_2d = solve_nozzle_2d(
+                self.perf, geom, n_radial=n_r, method="quasi2d_stub"
+            )
+        except Exception as e:
+            self.statusBar().showMessage(f"2D-расчёт пропущен: {e}", 5000)
+            self._last_field_2d = None
+        self._render_field_2d()
+
+    def _render_field_2d(self):
+        c = getattr(self, "canvas_field_2d", None)
+        if c is None:
+            return
+        c.fig.clear()
+        res = self._last_field_2d
+        if res is None:
+            ax = c.fig.add_subplot(111)
+            ax.text(0.5, 0.5,
+                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт.",
+                    ha='center', va='center', fontsize=11, color='#888')
+            ax.set_axis_off()
+            c.fig.tight_layout()
+            c.draw()
+            return
+        idx = self.cb_field_2d.currentIndex()
+        key, label = self._field_2d_keys.get(idx, ("M", "M"))
+        try:
+            vals = res.field_values(key)
+        except Exception:
+            vals = None
+        ax = c.fig.add_subplot(111)
+        if vals is None:
+            ax.text(0.5, 0.5, f"Поле '{key}' недоступно", ha='center', va='center')
+            ax.set_axis_off()
+        else:
+            pcm = ax.pcolormesh(res.x_grid, res.r_grid, vals, shading='auto', cmap='viridis')
+            ax.plot(res.wall_x, res.wall_r, '-', color='#cc785c', lw=1.8)
+            c.fig.colorbar(pcm, ax=ax, label=label)
+            ax.set_xlabel("x, м")
+            ax.set_ylabel("r, м")
+            if res.metadata.get("is_stub"):
+                tag = " (ЗАГОТОВКА, квази-2D)"
+            else:
+                tag = " (квази-2D, source-flow)"
+            ax.set_title(f"Поле течения 2D — {label}{tag}")
+            try:
+                ax.set_aspect('equal', adjustable='datalim')
+            except Exception:
+                pass
+        c.fig.tight_layout()
+        c.draw()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Вкладка «Геометрия сопла (Добровольский, гл. 2)»
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_geometry_tab(self) -> QtWidgets.QWidget:
+        """Панель настройки ВСЕХ параметров геометрии сопла по Добровольскому
+        (§2.3 коническое, §2.6 профилированное) + визуализация контура."""
+        w = QtWidgets.QWidget()
+        root = QtWidgets.QHBoxLayout(w)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # ── Левая колонка: параметры ──
+        params = QtWidgets.QWidget()
+        pv = QtWidgets.QVBoxLayout(params)
+        pv.setContentsMargins(4, 4, 4, 4)
+        pv.setSpacing(10)
+        params.setMinimumWidth(360)
+        params.setMaximumWidth(420)
+
+        # Тип сопла
+        gb_type = QtWidgets.QGroupBox("Тип сопла")
+        ht = QtWidgets.QHBoxLayout(gb_type)
+        self.rb_geom_conical = QtWidgets.QRadioButton("Коническое (§2.3)")
+        self.rb_geom_profiled = QtWidgets.QRadioButton("Профилированное (§2.6)")
+        self.rb_geom_rpa = QtWidgets.QRadioButton("RPA (bell)")
+        self.rb_geom_profiled.setChecked(True)
+        self.rb_geom_conical.toggled.connect(self._on_geom_type_changed)
+        self.rb_geom_profiled.toggled.connect(self._on_geom_type_changed)
+        self.rb_geom_rpa.toggled.connect(self._on_geom_type_changed)
+        ht.addWidget(self.rb_geom_conical)
+        ht.addWidget(self.rb_geom_profiled)
+        ht.addWidget(self.rb_geom_rpa)
+        pv.addWidget(gb_type)
+
+        # Базовые размеры
+        gb_base = QtWidgets.QGroupBox("Основные размеры")
+        fb = QtWidgets.QFormLayout(gb_base)
+        fb.setSpacing(6)
+
+        self.sp_geom_Rthroat = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_Rthroat.setRange(0.0001, 100.0)
+        self.sp_geom_Rthroat.setDecimals(4)
+        self.sp_geom_Rthroat.setValue(0.0500)
+        self.sp_geom_Rthroat.setSingleStep(0.005)
+        self.sp_geom_Rthroat.setToolTip("R_кр — радиус критического сечения (горловины), м")
+
+        self.sp_geom_AR = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_AR.setRange(1.001, 1000.0)
+        self.sp_geom_AR.setDecimals(3)
+        self.sp_geom_AR.setValue(16.000)
+        self.sp_geom_AR.setSingleStep(1.0)
+        self.sp_geom_AR.setToolTip("F_a/F_кр — геометрическая степень расширения")
+        self.sp_geom_AR.valueChanged.connect(self._on_geom_ar_changed)
+
+        self.sp_geom_Rcham_factor = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_Rcham_factor.setRange(1.05, 20.0)
+        self.sp_geom_Rcham_factor.setDecimals(3)
+        self.sp_geom_Rcham_factor.setValue(2.500)
+        self.sp_geom_Rcham_factor.setSingleStep(0.1)
+        self.sp_geom_Rcham_factor.setToolTip("R_камеры / R_кр")
+
+        fb.addRow("R_кр (горловина), м:", self.sp_geom_Rthroat)
+        fb.addRow("F_a/F_кр:", self.sp_geom_AR)
+        fb.addRow("R_камеры / R_кр:", self.sp_geom_Rcham_factor)
+        pv.addWidget(gb_base)
+
+        # Углы
+        gb_ang = QtWidgets.QGroupBox("Углы контура")
+        fa = QtWidgets.QFormLayout(gb_ang)
+        fa.setSpacing(6)
+
+        self.sp_geom_theta_in = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_theta_in.setRange(10.0, 45.0)
+        self.sp_geom_theta_in.setDecimals(2)
+        self.sp_geom_theta_in.setValue(30.0)
+        self.sp_geom_theta_in.setSingleStep(1.0)
+        self.sp_geom_theta_in.setToolTip("θ_вх — полуугол дозвукового конуса (2θ_вх=45…80°)")
+
+        self.sp_geom_theta_exit = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_theta_exit.setRange(3.0, 25.0)
+        self.sp_geom_theta_exit.setDecimals(2)
+        self.sp_geom_theta_exit.setValue(15.0)
+        self.sp_geom_theta_exit.setSingleStep(0.5)
+        self.sp_geom_theta_exit.setToolTip(
+            "θ_a — угол контура на срезе.\n"
+            "Конус: полуугол раствора (2θ_a=25…30° ⇒ 12.5…15°).\n"
+            "Профиль: угол на срезе (по Рис. 2.14, если 'авто')."
+        )
+
+        self.sp_geom_theta_max = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_theta_max.setRange(5.0, 50.0)
+        self.sp_geom_theta_max.setDecimals(2)
+        self.sp_geom_theta_max.setValue(30.0)
+        self.sp_geom_theta_max.setSingleStep(0.5)
+        self.sp_geom_theta_max.setToolTip(
+            "θ_m — угол контура в начале сверхзвуковой части (только профиль, §2.6)"
+        )
+
+        # «Авто» из Рис. 2.14 для профилированного
+        self.chk_geom_auto_angles = QtWidgets.QCheckBox(
+            "θ_m, θ_a, длина — авто из Рис. 2.14 (γ=1.23)"
+        )
+        self.chk_geom_auto_angles.setChecked(True)
+        self.chk_geom_auto_angles.toggled.connect(self._on_geom_auto_toggled)
+
+        self.sp_geom_len_ratio = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_len_ratio.setRange(0.5, 200.0)
+        self.sp_geom_len_ratio.setDecimals(2)
+        self.sp_geom_len_ratio.setValue(9.5)
+        self.sp_geom_len_ratio.setSingleStep(0.5)
+        self.sp_geom_len_ratio.setToolTip(
+            "x̄_a = L_сверхзв / R_кр — относительная длина (только профиль)"
+        )
+
+        fa.addRow("θ_вх (дозвук), °:", self.sp_geom_theta_in)
+        fa.addRow("θ_a (срез), °:", self.sp_geom_theta_exit)
+        fa.addRow("θ_m (начало св/зв), °:", self.sp_geom_theta_max)
+        fa.addRow(self.chk_geom_auto_angles)
+        fa.addRow("x̄_a = L/R_кр:", self.sp_geom_len_ratio)
+        pv.addWidget(gb_ang)
+
+        # Скругления
+        gb_round = QtWidgets.QGroupBox("Скругления (множители)")
+        fr = QtWidgets.QFormLayout(gb_round)
+        fr.setSpacing(6)
+
+        self.sp_geom_Rsub = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_Rsub.setRange(0.1, 5.0)
+        self.sp_geom_Rsub.setDecimals(3)
+        self.sp_geom_Rsub.setValue(1.500)
+        self.sp_geom_Rsub.setSingleStep(0.05)
+        self.sp_geom_Rsub.setToolTip(
+            "R_скр перед горловиной.\n"
+            "Конус: ×D_кр (0.65…1.5). Профиль: ×R_кр (≈1.5·R_кр)."
+        )
+
+        self.sp_geom_rsup = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rsup.setRange(0.05, 3.0)
+        self.sp_geom_rsup.setDecimals(3)
+        self.sp_geom_rsup.setValue(0.450)
+        self.sp_geom_rsup.setSingleStep(0.05)
+        self.sp_geom_rsup.setToolTip("r_скр за горловиной ×R_кр (≈0.45·R_кр)")
+
+        self.sp_geom_R1 = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_R1.setRange(0.5, 10.0)
+        self.sp_geom_R1.setDecimals(3)
+        self.sp_geom_R1.setValue(3.000)
+        self.sp_geom_R1.setSingleStep(0.25)
+        self.sp_geom_R1.setToolTip("R_1 — скругление на входе из камеры ×D_кр (2…4)")
+
+        fr.addRow("R_скр × (D_кр/R_кр):", self.sp_geom_Rsub)
+        fr.addRow("r_скр × R_кр:", self.sp_geom_rsup)
+        fr.addRow("R_1 × D_кр:", self.sp_geom_R1)
+        pv.addWidget(gb_round)
+        self._geom_dobro_groups = [gb_ang, gb_round]
+
+        # ── RPA Size & Geometry (параболический bell, нотация RPA) ──
+        self.gb_geom_rpa = QtWidgets.QGroupBox("RPA Size & Geometry (bell)")
+        frpa = QtWidgets.QFormLayout(self.gb_geom_rpa)
+        frpa.setSpacing(6)
+
+        self.sp_geom_rpa_b = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_b.setRange(10.0, 60.0); self.sp_geom_rpa_b.setDecimals(2)
+        self.sp_geom_rpa_b.setValue(30.0); self.sp_geom_rpa_b.setSingleStep(1.0)
+        self.sp_geom_rpa_b.setToolTip("Contraction angle b — угол сжатия конфузора, °")
+        frpa.addRow("b (contraction), °:", self.sp_geom_rpa_b)
+
+        self.sp_geom_rpa_R1Rt = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_R1Rt.setRange(0.2, 10.0); self.sp_geom_rpa_R1Rt.setDecimals(3)
+        self.sp_geom_rpa_R1Rt.setValue(1.500); self.sp_geom_rpa_R1Rt.setSingleStep(0.1)
+        self.sp_geom_rpa_R1Rt.setToolTip("R1/Rt — скругление сходящейся стороны горловины")
+        frpa.addRow("R1/Rt:", self.sp_geom_rpa_R1Rt)
+
+        self.sp_geom_rpa_R2 = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_R2.setRange(0.0, 1.0); self.sp_geom_rpa_R2.setDecimals(3)
+        self.sp_geom_rpa_R2.setValue(0.500); self.sp_geom_rpa_R2.setSingleStep(0.05)
+        self.sp_geom_rpa_R2.setToolTip("R2/R2max — относительный радиус входа в конфузор (0…1)")
+        frpa.addRow("R2/R2max (0…1):", self.sp_geom_rpa_R2)
+
+        self.sp_geom_rpa_RnRt = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_RnRt.setRange(0.1, 2.0); self.sp_geom_rpa_RnRt.setDecimals(3)
+        self.sp_geom_rpa_RnRt.setValue(0.382); self.sp_geom_rpa_RnRt.setSingleStep(0.01)
+        self.sp_geom_rpa_RnRt.setToolTip("Rn/Rt — скругление расходящейся стороны горловины (RPA=0.382)")
+        frpa.addRow("Rn/Rt:", self.sp_geom_rpa_RnRt)
+
+        self.chk_geom_rpa_auto = QtWidgets.QCheckBox("Tn, Te — авто (по ε, Le/Le15)")
+        self.chk_geom_rpa_auto.setChecked(True)
+        self.chk_geom_rpa_auto.toggled.connect(self._on_geom_rpa_auto_toggled)
+        frpa.addRow(self.chk_geom_rpa_auto)
+
+        self.sp_geom_rpa_Tn = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_Tn.setRange(5.0, 55.0); self.sp_geom_rpa_Tn.setDecimals(2)
+        self.sp_geom_rpa_Tn.setValue(27.0); self.sp_geom_rpa_Tn.setSingleStep(0.5)
+        self.sp_geom_rpa_Tn.setToolTip("Tn — начальный угол параболы, °")
+        frpa.addRow("Tn (нач. парабола), °:", self.sp_geom_rpa_Tn)
+
+        self.sp_geom_rpa_Te = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_Te.setRange(1.0, 24.0); self.sp_geom_rpa_Te.setDecimals(2)
+        self.sp_geom_rpa_Te.setValue(10.0); self.sp_geom_rpa_Te.setSingleStep(0.5)
+        self.sp_geom_rpa_Te.setToolTip("Te — конечный угол параболы, °")
+        frpa.addRow("Te (кон. парабола), °:", self.sp_geom_rpa_Te)
+
+        self.sp_geom_rpa_LeLe15 = QtWidgets.QDoubleSpinBox()
+        self.sp_geom_rpa_LeLe15.setRange(50.0, 120.0); self.sp_geom_rpa_LeLe15.setDecimals(1)
+        self.sp_geom_rpa_LeLe15.setValue(80.0); self.sp_geom_rpa_LeLe15.setSingleStep(1.0)
+        self.sp_geom_rpa_LeLe15.setToolTip("Relative length Le/Le15, %")
+        frpa.addRow("Le/Le15, %:", self.sp_geom_rpa_LeLe15)
+
+        pv.addWidget(self.gb_geom_rpa)
+
+        # Кнопки
+        self.btn_geom_build = QtWidgets.QPushButton("▶  Построить контур")
+        self.btn_geom_build.setObjectName("primary")
+        self.btn_geom_build.setMinimumHeight(36)
+        self.btn_geom_build.clicked.connect(self.on_build_geometry)
+        pv.addWidget(self.btn_geom_build)
+
+        self.btn_geom_from_perf = QtWidgets.QPushButton("⤵  Взять F_a/F_кр из расчёта")
+        self.btn_geom_from_perf.setToolTip(
+            "Подставить степень расширения и θ_a (ур. 2.23) из последнего\n"
+            "газодинамического расчёта сопла."
+        )
+        self.btn_geom_from_perf.clicked.connect(self.on_geometry_from_perf)
+        pv.addWidget(self.btn_geom_from_perf)
+
+        self.btn_geom_export = QtWidgets.QPushButton("💾  Экспорт контура (CSV)")
+        self.btn_geom_export.clicked.connect(self.on_export_geometry_csv)
+        pv.addWidget(self.btn_geom_export)
+
+        pv.addStretch(1)
+
+        # ── Правая колонка: график + сводка ──
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(4, 4, 4, 4)
+
+        self.canvas_geometry = MplCanvas(width=7, height=4.5)
+        rv.addWidget(self.canvas_geometry, 4)
+
+        self.txt_geom_summary = QtWidgets.QPlainTextEdit()
+        self.txt_geom_summary.setReadOnly(True)
+        self.txt_geom_summary.setMaximumHeight(180)
+        self.txt_geom_summary.setStyleSheet(
+            "QPlainTextEdit { font-family: 'Consolas','DejaVu Sans Mono',monospace; "
+            "font-size: 10pt; }"
+        )
+        rv.addWidget(self.txt_geom_summary, 1)
+
+        splitter = QtWidgets.QSplitter(Qt.Horizontal)
+        params_scroll = QtWidgets.QScrollArea()
+        params_scroll.setWidget(params)
+        params_scroll.setWidgetResizable(True)
+        params_scroll.setMinimumWidth(370)
+        params_scroll.setMaximumWidth(430)
+        splitter.addWidget(params_scroll)
+        splitter.addWidget(right)
+        splitter.setSizes([380, 900])
+        root.addWidget(splitter)
+
+        # последняя построенная геометрия
+        self.last_geometry: Optional[NozzleGeometry] = None
+        # синхронизировать активность виджетов
+        self._on_geom_type_changed()
+        self._on_geom_auto_toggled(self.chk_geom_auto_angles.isChecked())
+        self._on_geom_rpa_auto_toggled()
+        return w
+
+    # ── обработчики состояния панели геометрии ───────────────────────────────
+    def _on_geom_type_changed(self, *args):
+        is_rpa = (getattr(self, "rb_geom_rpa", None) is not None
+                  and self.rb_geom_rpa.isChecked())
+        # Показываем RPA-группу только для RPA, добровольские группы — иначе
+        if hasattr(self, "gb_geom_rpa"):
+            self.gb_geom_rpa.setVisible(is_rpa)
+        for gb in getattr(self, "_geom_dobro_groups", []):
+            gb.setVisible(not is_rpa)
+        if is_rpa:
+            self._on_geom_rpa_auto_toggled(self.chk_geom_rpa_auto.isChecked())
+            return
+
+        is_conical = self.rb_geom_conical.isChecked()
+        # θ_m, авто-углы и длина имеют смысл только для профилированного
+        self.sp_geom_theta_max.setEnabled(not is_conical)
+        self.chk_geom_auto_angles.setEnabled(not is_conical)
+        if is_conical:
+            self.sp_geom_len_ratio.setEnabled(False)
+            self.sp_geom_theta_exit.setEnabled(True)
+        else:
+            self._on_geom_auto_toggled(self.chk_geom_auto_angles.isChecked())
+
+    def _on_geom_rpa_auto_toggled(self, *args):
+        auto = self.chk_geom_rpa_auto.isChecked()
+        self.sp_geom_rpa_Tn.setEnabled(not auto)
+        self.sp_geom_rpa_Te.setEnabled(not auto)
+
+    def _on_geom_auto_toggled(self, checked: bool):
+        if getattr(self, "rb_geom_rpa", None) is not None and self.rb_geom_rpa.isChecked():
+            return
+        if self.rb_geom_conical.isChecked():
+            return
+        # при «авто» углы θ_m/θ_a/длина берутся из Рис. 2.14 → блокируем поля
+        self.sp_geom_theta_max.setEnabled(not checked)
+        self.sp_geom_theta_exit.setEnabled(not checked)
+        self.sp_geom_len_ratio.setEnabled(not checked)
+        if checked:
+            self._on_geom_ar_changed()
+
+    def _on_geom_ar_changed(self, *args):
+        # при «авто» подставить предлагаемые значения из Рис. 2.14
+        if getattr(self, "rb_geom_rpa", None) is not None and self.rb_geom_rpa.isChecked():
+            return
+        if self.rb_geom_conical.isChecked() or not self.chk_geom_auto_angles.isChecked():
+            return
+        try:
+            tm, ta, xa = optimal_angles_from_area_ratio(self.sp_geom_AR.value())
+            self.sp_geom_theta_max.setValue(tm)
+            self.sp_geom_theta_exit.setValue(ta)
+            self.sp_geom_len_ratio.setValue(xa)
+        except Exception:
+            pass
+
+    # ── обработчики панели профиля в основном расчёте ────────────────────────
+    def _set_form_row_visible(self, form, widget, visible: bool):
+        """Скрывает/показывает поле формы вместе с его меткой (QFormLayout)."""
+        if widget is None:
+            return
+        widget.setVisible(visible)
+        try:
+            if isinstance(form, QtWidgets.QFormLayout):
+                lbl = form.labelForField(widget)
+                if lbl is not None:
+                    lbl.setVisible(visible)
+        except Exception:
+            pass
+
+    def _on_dim_mode_changed(self, *args):
+        """Переключение 1D/2D режима газодинамического расчёта."""
+        is_2d = (getattr(self, "rb_dim_2d", None) is not None
+                 and self.rb_dim_2d.isChecked())
+        if hasattr(self, "sp_n_radial_2d"):
+            self.sp_n_radial_2d.setEnabled(is_2d)
+
+    def _on_calc_geom_type_changed(self, *args):
+        """Включает/выключает поля под выбранный тип сопла в панели расчёта."""
+        is_rpa = (getattr(self, "rb_calc_rpa", None) is not None
+                  and self.rb_calc_rpa.isChecked())
+        is_conical = self.rb_calc_conical.isChecked()
+        is_profiled = self.rb_calc_profiled.isChecked()
+
+        formP = getattr(self, "_calc_formP", None)
+        for wdg in getattr(self, "_calc_rpa_widgets", []):
+            self._set_form_row_visible(formP, wdg, is_rpa)
+        for wdg in getattr(self, "_calc_dobro_widgets", []):
+            self._set_form_row_visible(formP, wdg, not is_rpa)
+
+        if is_rpa:
+            self._on_calc_geom_auto_toggled(self.chk_calc_rpa_auto.isChecked())
+            return
+
+        # Режим Добровольского (conical / profiled)
+        self.sp_calc_theta_max.setEnabled(is_profiled)
+        self.chk_calc_auto_angles.setEnabled(is_profiled)
+        if is_conical:
+            self.sp_calc_len_ratio.setEnabled(False)
+            self.sp_calc_theta_exit.setEnabled(True)
+        else:
+            self._on_calc_geom_auto_toggled(self.chk_calc_auto_angles.isChecked())
+
+    def _on_calc_geom_auto_toggled(self, checked: bool):
+        # Режим RPA: авто Tn/Te блокирует ручные углы
+        if getattr(self, "rb_calc_rpa", None) is not None and self.rb_calc_rpa.isChecked():
+            auto = self.chk_calc_rpa_auto.isChecked()
+            self.sp_calc_rpa_Tn.setEnabled(not auto)
+            self.sp_calc_rpa_Te.setEnabled(not auto)
+            return
+        if self.rb_calc_conical.isChecked():
+            return
+        # при «авто» θ_m/θ_a/длина блокируются (берутся из Рис. 2.14 по F_a/F_кр)
+        self.sp_calc_theta_max.setEnabled(not checked)
+        self.sp_calc_theta_exit.setEnabled(not checked)
+        self.sp_calc_len_ratio.setEnabled(not checked)
+
+    @staticmethod
+    def _length_to_m(v: float, unit: str) -> float:
+        if unit == 'см':
+            return v * 0.01
+        if unit == 'мм':
+            return v * 0.001
+        return v
+
+    def _build_calc_geometry(self, perf: "RocketPerformance") -> Optional["NozzleGeometry"]:
+        """Строит геометрию сопла по выбранному в панели расчёта типу и
+        параметрам, используя F_a/F_кр из результата расчёта (perf)."""
+        try:
+            ar = float(perf.stations[-1].Ae_At)
+            if not (math.isfinite(ar) and ar > 1.0):
+                return None
+            R_throat = self._length_to_m(
+                self.sp_calc_Rthroat.value(),
+                self.cb_calc_Rthroat_unit.currentText(),
+            )
+            R_cham = self.sp_calc_Rcham.value() * R_throat
+
+            if getattr(self, "rb_calc_rpa", None) is not None and self.rb_calc_rpa.isChecked():
+                auto = self.chk_calc_rpa_auto.isChecked()
+                return build_rpa_parabolic_nozzle(
+                    R_throat, ar,
+                    R_chamber_m=R_cham,
+                    contraction_angle_deg=self.sp_calc_rpa_b.value(),
+                    R1_over_Rt=self.sp_calc_rpa_R1Rt.value(),
+                    Rn_over_Rt=self.sp_calc_rpa_RnRt.value(),
+                    R2_over_R2max=self.sp_calc_rpa_R2.value(),
+                    theta_n_deg=None if auto else self.sp_calc_rpa_Tn.value(),
+                    theta_e_deg=None if auto else self.sp_calc_rpa_Te.value(),
+                    length_fraction_pct=self.sp_calc_rpa_LeLe15.value(),
+                )
+
+            if self.rb_calc_conical.isChecked():
+                return build_conical_nozzle(
+                    R_throat, ar,
+                    R_chamber_m=R_cham,
+                    theta_exit_deg=self.sp_calc_theta_exit.value(),
+                    theta_in_deg=self.sp_calc_theta_in.value(),
+                    R_round_sub_factor=self.sp_calc_Rsub.value(),
+                    R1_inlet_factor=self.sp_calc_R1.value(),
+                    r_round_sup_factor=self.sp_calc_rsup.value(),
+                )
+            auto = self.chk_calc_auto_angles.isChecked()
+            return build_profiled_nozzle(
+                R_throat, ar,
+                R_chamber_m=R_cham,
+                theta_exit_deg=None if auto else self.sp_calc_theta_exit.value(),
+                theta_max_deg=None if auto else self.sp_calc_theta_max.value(),
+                length_ratio=None if auto else self.sp_calc_len_ratio.value(),
+                theta_in_deg=self.sp_calc_theta_in.value(),
+                R_round_sub_factor=self.sp_calc_Rsub.value(),
+                r_round_sup_factor=self.sp_calc_rsup.value(),
+                R1_inlet_factor=self.sp_calc_R1.value(),
+            )
+        except Exception:
+            return None
+
+    def on_geometry_from_perf(self):
+        if self.perf is None:
+            QtWidgets.QMessageBox.information(
+                self, "Нет данных",
+                "Сначала выполните газодинамический расчёт сопла "
+                "(кнопка «Рассчитать сопло»)."
+            )
+            return
+        try:
+            ar = float(self.perf.stations[-1].Ae_At)
+            if math.isfinite(ar) and ar > 1.0:
+                self.sp_geom_AR.setValue(ar)
+            self._on_geom_ar_changed()
+            self.statusBar().showMessage(
+                f"Степень расширения F_a/F_кр = {ar:.3f} взята из расчёта", 5000
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", str(e))
+
+    def on_build_geometry(self):
+        try:
+            R_throat = float(self.sp_geom_Rthroat.value())
+            ar = float(self.sp_geom_AR.value())
+            R_cham = self.sp_geom_Rcham_factor.value() * R_throat
+
+            if getattr(self, "rb_geom_rpa", None) is not None and self.rb_geom_rpa.isChecked():
+                auto = self.chk_geom_rpa_auto.isChecked()
+                geom = build_rpa_parabolic_nozzle(
+                    R_throat, ar,
+                    R_chamber_m=R_cham,
+                    contraction_angle_deg=self.sp_geom_rpa_b.value(),
+                    R1_over_Rt=self.sp_geom_rpa_R1Rt.value(),
+                    Rn_over_Rt=self.sp_geom_rpa_RnRt.value(),
+                    R2_over_R2max=self.sp_geom_rpa_R2.value(),
+                    theta_n_deg=None if auto else self.sp_geom_rpa_Tn.value(),
+                    theta_e_deg=None if auto else self.sp_geom_rpa_Te.value(),
+                    length_fraction_pct=self.sp_geom_rpa_LeLe15.value(),
+                )
+            elif self.rb_geom_conical.isChecked():
+                geom = build_conical_nozzle(
+                    R_throat, ar,
+                    R_chamber_m=R_cham,
+                    theta_exit_deg=self.sp_geom_theta_exit.value(),
+                    theta_in_deg=self.sp_geom_theta_in.value(),
+                    R_round_sub_factor=self.sp_geom_Rsub.value(),
+                    R1_inlet_factor=self.sp_geom_R1.value(),
+                    r_round_sup_factor=self.sp_geom_rsup.value(),
+                )
+            else:
+                auto = self.chk_geom_auto_angles.isChecked()
+                geom = build_profiled_nozzle(
+                    R_throat, ar,
+                    R_chamber_m=R_cham,
+                    theta_exit_deg=None if auto else self.sp_geom_theta_exit.value(),
+                    theta_max_deg=None if auto else self.sp_geom_theta_max.value(),
+                    length_ratio=None if auto else self.sp_geom_len_ratio.value(),
+                    theta_in_deg=self.sp_geom_theta_in.value(),
+                    R_round_sub_factor=self.sp_geom_Rsub.value(),
+                    r_round_sup_factor=self.sp_geom_rsup.value(),
+                    R1_inlet_factor=self.sp_geom_R1.value(),
+                )
+            self.last_geometry = geom
+            self._render_geometry(geom)
+            self._update_geometry_summary(geom)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка построения", str(e))
+
+    def _render_geometry(self, geom: "NozzleGeometry"):
+        c = self.canvas_geometry
+        c.fig.clear()
+        ax = c.fig.add_subplot(111)
+        x, r = geom.as_xy_arrays()
+
+        # дозвуковая / сверхзвуковая части — разными цветами
+        x_throat = geom.length_subsonic_m
+        col = '#cc785c'
+        ax.plot(x, r, '-', color=col, lw=2.0)
+        ax.plot(x, -r, '-', color=col, lw=2.0)
+        ax.fill_between(x, -r, r, alpha=0.12, color=col)
+
+        # горловина и срез
+        ax.axvline(x_throat, color='#6b9bd1', ls='--', lw=1.0, alpha=0.8,
+                   label=f"горловина R_кр={geom.R_throat_m*1e3:.1f} мм")
+        ax.axvline(geom.length_total_m, color='#86b386', ls=':', lw=1.0, alpha=0.8,
+                   label=f"срез R_a={geom.R_exit_m*1e3:.1f} мм")
+
+        style = self._collect_style()
+        if geom.method == "rpa_parabolic":
+            title = "RPA параболическое сопло (bell)"
+        elif geom.method == "conical":
+            title = "Коническое сопло (§2.3)"
+        else:
+            title = "Профилированное сопло (§2.6)"
+        style.title = (f"{title}  |  L={geom.length_total_m*1e3:.1f} мм  "
+                       f"θ_a={geom.theta_exit_deg:.1f}°  φ_рас={geom.phi_dispersion:.4f}")
+        style.xlabel = "Координата x, м"
+        style.ylabel = "Радиус r, м"
+        ax.set_aspect('equal', adjustable='datalim')
+        ax.legend(loc='upper left', fontsize=8)
+        apply_plot_style(c.fig, ax, style)
+        c.fig.tight_layout()
+        c.draw()
+
+    def _update_geometry_summary(self, geom: "NozzleGeometry"):
+        if geom.method == "rpa_parabolic":
+            self._update_geometry_summary_rpa(geom)
+            return
+        s = []
+        s.append("═══ ГЕОМЕТРИЯ СОПЛА (Добровольский, гл. 2) ═══")
+        s.append(f"Тип:                {'коническое (§2.3)' if geom.method=='conical' else 'профилированное (§2.6)'}")
+        s.append(f"R_кр (горловина):   {geom.R_throat_m*1e3:.3f} мм")
+        s.append(f"R_a (срез):         {geom.R_exit_m*1e3:.3f} мм")
+        s.append(f"R_камеры:           {geom.R_chamber_m*1e3:.3f} мм")
+        s.append(f"F_a/F_кр:           {geom.area_ratio:.4f}   (R_a/R_кр = {math.sqrt(geom.area_ratio):.4f})")
+        s.append(f"θ_вх (дозвук):      {geom.theta_in_deg:.2f}°  (2θ_вх = {2*geom.theta_in_deg:.1f}°)")
+        if geom.method != 'conical':
+            s.append(f"θ_m (начало св/зв): {geom.theta_max_deg:.2f}°")
+        s.append(f"θ_a (срез):         {geom.theta_exit_deg:.2f}°  (2θ_a = {2*geom.theta_exit_deg:.1f}°)")
+        s.append(f"φ_рас:              {geom.phi_dispersion:.4f}   = (1+cos θ_a)/2")
+        s.append(f"R_скр / r_скр / R_1: {geom.R_round_sub_m*1e3:.2f} / "
+                 f"{geom.r_round_sup_m*1e3:.2f} / {geom.R1_inlet_m*1e3:.2f} мм")
+        s.append(f"Длина дозвук./св.зв./полная: {geom.length_subsonic_m*1e3:.2f} / "
+                 f"{geom.length_supersonic_m*1e3:.2f} / {geom.length_total_m*1e3:.2f} мм")
+        s.append(f"Точек контура:      {len(geom.points)}")
+        self.txt_geom_summary.setPlainText("\n".join(s))
+
+    def _update_geometry_summary_rpa(self, geom: "NozzleGeometry"):
+        md = geom.metadata or {}
+        def g(key, default=float('nan')):
+            return md.get(key, default)
+        s = []
+        s.append("═══ ГЕОМЕТРИЯ СОПЛА (RPA Size & Geometry, bell) ═══")
+        s.append(f"Тип:                параболическое (Rao bell)")
+        s.append(f"R_кр (Rt):          {geom.R_throat_m*1e3:.3f} мм")
+        s.append(f"R_a (Re, срез):     {geom.R_exit_m*1e3:.3f} мм")
+        s.append(f"R_камеры (Rc):      {geom.R_chamber_m*1e3:.3f} мм")
+        s.append(f"ε = Ae/At:          {geom.area_ratio:.4f}   (Re/Rt = {math.sqrt(geom.area_ratio):.4f})")
+        s.append(f"b (contraction):    {g('contraction_angle_deg'):.2f}°")
+        s.append(f"R1/Rt:              {g('R1_over_Rt'):.3f}")
+        s.append(f"R2/R2max:           {g('R2_over_R2max'):.3f}")
+        s.append(f"Rn/Rt:              {g('Rn_over_Rt'):.3f}")
+        s.append(f"Tn (нач. парабола): {g('theta_n_deg'):.2f}°")
+        s.append(f"Te (кон. парабола): {g('theta_e_deg'):.2f}°   (θ_a={geom.theta_exit_deg:.2f}°)")
+        s.append(f"Le/Le15:            {g('Le_over_Le15_pct'):.1f} %")
+        le15 = g('Le15_m')
+        if le15 == le15:  # not NaN
+            s.append(f"Le15 (15°-конус):   {le15*1e3:.2f} мм")
+        s.append(f"φ_рас:              {geom.phi_dispersion:.4f}   = (1+cos θ_a)/2")
+        s.append(f"Длина дозвук./св.зв./полная: {geom.length_subsonic_m*1e3:.2f} / "
+                 f"{geom.length_supersonic_m*1e3:.2f} / {geom.length_total_m*1e3:.2f} мм")
+        s.append(f"Точек контура:      {len(geom.points)}")
+        self.txt_geom_summary.setPlainText("\n".join(s))
+
+    def on_export_geometry_csv(self):
+        if getattr(self, "last_geometry", None) is None:
+            QtWidgets.QMessageBox.information(
+                self, "Нет данных", "Сначала постройте контур сопла."
+            )
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Сохранить контур сопла", "nozzle_contour.csv",
+            "CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            import csv
+            geom = self.last_geometry
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                wr = csv.writer(f, delimiter=";")
+                wr.writerow([f"# Геометрия сопла ({geom.method}), Добровольский гл.2"])
+                wr.writerow([f"# R_кр={geom.R_throat_m:.6f} м, R_a={geom.R_exit_m:.6f} м, "
+                             f"F_a/F_кр={geom.area_ratio:.4f}, "
+                             f"theta_a={geom.theta_exit_deg:.3f} град, "
+                             f"phi_рас={geom.phi_dispersion:.5f}"])
+                wr.writerow(["x_m", "r_m"])
+                for p in geom.points:
+                    wr.writerow([f"{p.x_m:.6f}", f"{p.r_m:.6f}"])
+            self.statusBar().showMessage(f"Контур сохранён: {path}", 5000)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка экспорта", str(e))
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -1218,6 +2339,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fill_species_table(perf)
         self._redraw_plots()
         self._draw_species_plot()
+        self._update_field_2d_from_perf()
 
     def _on_calc_failed(self, msg: str):
         self.btn_calc.setEnabled(True)
@@ -1486,11 +2608,51 @@ class MainWindow(QtWidgets.QMainWindow):
         c = self.canvas_PROFILE
         c.fig.clear()
         ax = c.fig.add_subplot(111)
-        r = nozzle_radius(stations)
-        # ограничим радиус камеры разумным значением
-        r_max = float(np.max(r))
 
-        # Гладкий контур: интерполируем между ключевыми точками
+        # Вариант А: профиль по Добровольскому (выбранный тип + параметры)
+        geom = None
+        if getattr(self, "chk_use_dobro", None) is not None and self.chk_use_dobro.isChecked():
+            geom = self._build_calc_geometry(self.perf)
+
+        if geom is not None:
+            self.last_geometry = geom  # синхронизируем с вкладкой геометрии
+            gx, gr = geom.as_xy_arrays()
+            r_max = float(np.max(gr))
+            ax.plot(gx, gr, '-', color='#cc785c', lw=style.line_width * 1.2)
+            ax.plot(gx, -gr, '-', color='#cc785c', lw=style.line_width * 1.2)
+            ax.fill_between(gx, -gr, gr, alpha=0.15, color='#cc785c')
+
+            # горловина и срез
+            ax.axvline(geom.length_subsonic_m, color='#6b9bd1', ls='--', lw=0.9,
+                       alpha=0.8, label="горловина")
+            ax.axvline(geom.length_total_m, color='#86b386', ls=':', lw=0.9,
+                       alpha=0.8, label="срез")
+            ax.legend(loc='upper left', fontsize=8)
+
+            style4 = self._collect_style()
+            tname = ("Коническое (§2.3)" if geom.method == "conical"
+                     else "Профилированное (§2.6)")
+            style4.title = (f"Профиль сопла — {tname} | "
+                            f"L={geom.length_total_m*1e3:.1f} мм, "
+                            f"θ_a={geom.theta_exit_deg:.1f}°, "
+                            f"φ_рас={geom.phi_dispersion:.4f}")
+            style4.xlabel = "Координата x, м"
+            style4.ylabel = "Радиус r, м"
+            ax.set_aspect('equal', adjustable='datalim')
+            apply_plot_style(c.fig, ax, style4)
+            c.fig.tight_layout()
+            c.draw()
+            # также обновим вкладку «Геометрия сопла»
+            try:
+                self._render_geometry(geom)
+                self._update_geometry_summary(geom)
+            except Exception:
+                pass
+            return
+
+        # Вариант Б (запасной): сглаженный профиль из сечений солвера
+        r = nozzle_radius(stations)
+        r_max = float(np.max(r))
         x_smooth, r_smooth = self._smooth_profile(stations, x, r)
 
         ax.plot(x_smooth, r_smooth, '-', color='#cc785c',
@@ -1892,6 +3054,36 @@ class MainWindow(QtWidgets.QMainWindow):
             'L_chamber': self.sp_L_chamber.value(),
             'L_conv': self.sp_L_conv.value(),
             'L_div': self.sp_L_div.value(),
+            'gasdynamics': {
+                'dim_mode': '2d' if self.rb_dim_2d.isChecked() else '1d',
+                'n_radial_2d': self.sp_n_radial_2d.value(),
+            },
+            'geometry_profile': {
+                'use_dobro': self.chk_use_dobro.isChecked(),
+                'type': ('rpa' if self.rb_calc_rpa.isChecked()
+                         else 'conical' if self.rb_calc_conical.isChecked()
+                         else 'profiled'),
+                'R_throat': self.sp_calc_Rthroat.value(),
+                'R_throat_unit': self.cb_calc_Rthroat_unit.currentText(),
+                'R_chamber_factor': self.sp_calc_Rcham.value(),
+                'theta_in': self.sp_calc_theta_in.value(),
+                'auto_angles': self.chk_calc_auto_angles.isChecked(),
+                'theta_max': self.sp_calc_theta_max.value(),
+                'theta_exit': self.sp_calc_theta_exit.value(),
+                'len_ratio': self.sp_calc_len_ratio.value(),
+                'R_sub': self.sp_calc_Rsub.value(),
+                'r_sup': self.sp_calc_rsup.value(),
+                'R1': self.sp_calc_R1.value(),
+                # RPA-параметры
+                'rpa_b': self.sp_calc_rpa_b.value(),
+                'rpa_R1Rt': self.sp_calc_rpa_R1Rt.value(),
+                'rpa_R2': self.sp_calc_rpa_R2.value(),
+                'rpa_RnRt': self.sp_calc_rpa_RnRt.value(),
+                'rpa_auto': self.chk_calc_rpa_auto.isChecked(),
+                'rpa_Tn': self.sp_calc_rpa_Tn.value(),
+                'rpa_Te': self.sp_calc_rpa_Te.value(),
+                'rpa_LeLe15': self.sp_calc_rpa_LeLe15.value(),
+            },
             'style': {
                 'font': self.cb_font.currentText(),
                 'font_axis': self.sp_font_axis.value(),
@@ -1952,6 +3144,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sp_L_chamber.setValue(cfg.get('L_chamber', 0.1))
             self.sp_L_conv.setValue(cfg.get('L_conv', 0.05))
             self.sp_L_div.setValue(cfg.get('L_div', 0.2))
+            gd = cfg.get('gasdynamics')
+            if isinstance(gd, dict):
+                if gd.get('dim_mode') == '2d':
+                    self.rb_dim_2d.setChecked(True)
+                else:
+                    self.rb_dim_1d.setChecked(True)
+                self.sp_n_radial_2d.setValue(int(gd.get('n_radial_2d', 21)))
+                self._on_dim_mode_changed()
+            gp = cfg.get('geometry_profile')
+            if isinstance(gp, dict):
+                self.chk_use_dobro.setChecked(gp.get('use_dobro', True))
+                gtype = gp.get('type')
+                if gtype == 'rpa':
+                    self.rb_calc_rpa.setChecked(True)
+                elif gtype == 'conical':
+                    self.rb_calc_conical.setChecked(True)
+                else:
+                    self.rb_calc_profiled.setChecked(True)
+                self.sp_calc_Rthroat.setValue(gp.get('R_throat', 0.05))
+                self.cb_calc_Rthroat_unit.setCurrentText(gp.get('R_throat_unit', 'м'))
+                self.sp_calc_Rcham.setValue(gp.get('R_chamber_factor', 2.5))
+                self.sp_calc_theta_in.setValue(gp.get('theta_in', 30.0))
+                self.chk_calc_auto_angles.setChecked(gp.get('auto_angles', True))
+                self.sp_calc_theta_max.setValue(gp.get('theta_max', 30.0))
+                self.sp_calc_theta_exit.setValue(gp.get('theta_exit', 15.0))
+                self.sp_calc_len_ratio.setValue(gp.get('len_ratio', 9.5))
+                self.sp_calc_Rsub.setValue(gp.get('R_sub', 1.5))
+                self.sp_calc_rsup.setValue(gp.get('r_sup', 0.45))
+                self.sp_calc_R1.setValue(gp.get('R1', 3.0))
+                # RPA-параметры
+                self.sp_calc_rpa_b.setValue(gp.get('rpa_b', 30.0))
+                self.sp_calc_rpa_R1Rt.setValue(gp.get('rpa_R1Rt', 1.5))
+                self.sp_calc_rpa_R2.setValue(gp.get('rpa_R2', 0.5))
+                self.sp_calc_rpa_RnRt.setValue(gp.get('rpa_RnRt', 0.382))
+                self.chk_calc_rpa_auto.setChecked(gp.get('rpa_auto', True))
+                self.sp_calc_rpa_Tn.setValue(gp.get('rpa_Tn', 27.0))
+                self.sp_calc_rpa_Te.setValue(gp.get('rpa_Te', 10.0))
+                self.sp_calc_rpa_LeLe15.setValue(gp.get('rpa_LeLe15', 80.0))
+                self._on_calc_geom_type_changed()
             st = cfg.get('style', {})
             self.cb_font.setCurrentText(st.get('font', 'DejaVu Serif'))
             self.sp_font_axis.setValue(st.get('font_axis', 12))
