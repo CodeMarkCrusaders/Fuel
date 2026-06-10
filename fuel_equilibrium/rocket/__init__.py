@@ -21,6 +21,35 @@ from .nozzle_flow import (
     build_nozzle_contour,
 )
 
+# Построение геометрии сопла по учебнику Добровольского (гл. 2):
+# коническое (§2.3) и профилированное оптимальное (§2.6) сопла.
+from .nozzle_geometry import (
+    ContourPoint,
+    NozzleGeometry,
+    dispersion_loss_coeff,
+    exit_angle_from_dispersion,
+    exit_angle_from_underexpansion,
+    optimal_angles_from_area_ratio,
+    set_optimal_grid,
+    build_conical_nozzle,
+    build_profiled_nozzle,
+    build_rpa_parabolic_nozzle,
+    rao_reference_length_15deg,
+    estimate_bell_angles,
+    build_geometry_from_performance,
+)
+# Диспетчер геометрии импортируем под отдельным именем, чтобы не конфликтовать
+# с build_nozzle_geometry из cea_solver (другая сигнатура/назначение).
+from .nozzle_geometry import build_nozzle_geometry as build_dobrovolsky_geometry
+
+# Двумерный (осесимметричный) расчёт сопла — заготовка (1D/2D выбор в GUI).
+from .nozzle_flow_2d import (
+    Nozzle2DField,
+    Nozzle2DResult,
+    solve_nozzle_2d,
+    build_axisymmetric_grid,
+)
+
 # CEA-решатель опционален: требует cantera
 try:
     from .cea_solver import (
@@ -44,6 +73,26 @@ __all__ = [
     "build_approximate_optimal_contour_ch26",
     "build_optimal_nozzle_contour",
     "build_nozzle_contour",
+    # геометрия сопла по Добровольскому (гл. 2)
+    "ContourPoint",
+    "NozzleGeometry",
+    "dispersion_loss_coeff",
+    "exit_angle_from_dispersion",
+    "exit_angle_from_underexpansion",
+    "optimal_angles_from_area_ratio",
+    "set_optimal_grid",
+    "build_conical_nozzle",
+    "build_profiled_nozzle",
+    "build_rpa_parabolic_nozzle",
+    "rao_reference_length_15deg",
+    "estimate_bell_angles",
+    "build_dobrovolsky_geometry",
+    "build_geometry_from_performance",
+    # двумерный (осесимметричный) расчёт — заготовка
+    "Nozzle2DField",
+    "Nozzle2DResult",
+    "solve_nozzle_2d",
+    "build_axisymmetric_grid",
     "CANTERA_AVAILABLE",
 ]
 
