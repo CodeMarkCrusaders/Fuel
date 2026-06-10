@@ -69,9 +69,10 @@ def test_solve_nozzle_2d_fields_shapes():
 
 
 def test_solve_nozzle_2d_varies_in_two_coordinates():
-    """Параметры должны меняться И по оси x, И по радиусу r."""
+    """Невязкое ядро должно меняться И по оси x, И по радиусу r."""
     geom = _geom()
-    res = solve_nozzle_2d(_Perf(), geom, n_radial=21)
+    # Отключаем пограничный слой — проверяем именно невязкое source-flow ядро.
+    res = solve_nozzle_2d(_Perf(), geom, n_radial=21, boundary_layer=False)
     n_r, n_x = res.shape
 
     M = res.field_values("M")
@@ -96,6 +97,60 @@ def test_solve_nozzle_2d_varies_in_two_coordinates():
     for key in ("M", "P_Pa", "T_K", "V_m_per_s"):
         arr = res.field_values(key)
         assert np.all(np.isfinite(arr))
+
+
+def test_solve_nozzle_2d_boundary_layer_no_slip():
+    """Пограничный слой: условие прилипания у стенки и температура восстановления."""
+    geom = _geom()
+    res = solve_nozzle_2d(_Perf(), geom, n_radial=41, boundary_layer=True)
+    n_r, n_x = res.shape
+
+    V = res.field_values("V_m_per_s")
+    T = res.field_values("T_K")
+    M = res.field_values("M")
+    P = res.field_values("P_Pa")
+
+    j = n_x - 1  # столбец на срезе сопла
+
+    # 1) Условие прилипания: скорость у стенки → 0, на оси — высокая.
+    assert V[-1, j] < 1.0, "скорость у стенки должна стремиться к нулю (прилипание)"
+    assert V[0, j] > 1000.0, "скорость на оси должна оставаться высокой"
+
+    # 2) Число Маха у стенки → 0.
+    assert M[-1, j] < 0.05, "число Маха у стенки должно стремиться к нулю"
+
+    # 3) Температура восстановления: у стенки T выше ядровой (вязкий нагрев).
+    assert T[-1, j] > T[0, j], "температура восстановления у стенки должна быть выше"
+
+    # 4) Давление поперёк тонкого слоя постоянно: значение у стенки совпадает
+    #    с невязким (core) — пограничный слой не меняет поле давления.
+    res_inv = solve_nozzle_2d(_Perf(), geom, n_radial=41, boundary_layer=False)
+    P_inv = res_inv.field_values("P_Pa")
+    assert np.allclose(P[:, j], P_inv[:, j], rtol=1e-6), (
+        "пограничный слой не должен изменять поле давления"
+    )
+
+    # 5) Метаданные пограничного слоя присутствуют.
+    md = res.metadata
+    assert md.get("boundary_layer") is True
+    assert 0.0 < md.get("bl_fraction_at_exit", 0.0) <= 1.0
+    assert md.get("bl_wall_velocity_max", 1e9) < 1.0
+
+    # 6) Поля конечны.
+    for key in ("M", "P_Pa", "T_K", "V_m_per_s"):
+        arr = res.field_values(key)
+        assert np.all(np.isfinite(arr))
+
+
+def test_solve_nozzle_2d_inviscid_keeps_wall_velocity():
+    """Без пограничного слоя скорость у стенки остаётся высокой (нет прилипания)."""
+    geom = _geom()
+    res = solve_nozzle_2d(_Perf(), geom, n_radial=41, boundary_layer=False)
+    n_x = res.shape[1]
+    V = res.field_values("V_m_per_s")
+    j = n_x - 1
+    assert V[-1, j] > 1000.0, "в невязком режиме скорость у стенки должна быть высокой"
+    assert res.metadata.get("boundary_layer", False) is False
 
 
 def test_solve_nozzle_2d_unknown_method():
