@@ -866,7 +866,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_condensed = QtWidgets.QCheckBox("Учитывать конденсат")
         self.chk_condensed.setChecked(True)
 
-        self.input_tabs = QtWidgets.QTabWidget()
+        # Внутренний контейнер вместо QTabWidget: три ВЛОЖЕННЫХ раскрывающихся
+        # подраздела (Исходные данные / Газодинамика / Геометрия), которые
+        # ведут себя как выпадающие списки, аналогично основному разделу.
+        self.input_tabs = QtWidgets.QWidget()
+        input_tabs_layout = QtWidgets.QVBoxLayout(self.input_tabs)
+        input_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        input_tabs_layout.setSpacing(6)
 
         tab_basic = QtWidgets.QWidget()
         form_basic = QtWidgets.QFormLayout(tab_basic)
@@ -918,10 +924,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_n_radial_2d.setToolTip("Число радиальных узлов 2D-сетки (только для 2D).")
         form_gasd.addRow("Радиальных узлов (2D):", self.sp_n_radial_2d)
 
-        self.input_tabs.addTab(tab_basic, "Исходные данные")
-        self.input_tabs.addTab(tab_gasd, "Газодинамика (1D/2D)")
+        # ── Пограничный слой (2D) ──
+        self.chk_bl_2d = QtWidgets.QCheckBox("Учитывать пограничный слой")
+        self.chk_bl_2d.setChecked(True)
+        self.chk_bl_2d.setToolTip(
+            "Вязкий пристеночный слой: условие прилипания (скорость → 0 у стенки),\n"
+            "температура восстановления (вязкий нагрев), профиль 1/7."
+        )
+        self.chk_bl_2d.toggled.connect(lambda *_: self._update_field_2d_from_perf())
+        form_gasd.addRow("Пограничный слой (2D):", self.chk_bl_2d)
 
-        # ─── Третья вкладка исходных данных: Геометрия (Size & Geometry) ───
+        self.sp_bl_delta_2d = QtWidgets.QDoubleSpinBox()
+        self.sp_bl_delta_2d.setRange(0.01, 0.50)
+        self.sp_bl_delta_2d.setSingleStep(0.01)
+        self.sp_bl_delta_2d.setDecimals(2)
+        self.sp_bl_delta_2d.setValue(0.12)
+        self.sp_bl_delta_2d.setToolTip(
+            "Относительная толщина пограничного слоя δ/R на срезе сопла."
+        )
+        self.sp_bl_delta_2d.valueChanged.connect(lambda *_: self._update_field_2d_from_perf())
+        form_gasd.addRow("Толщина δ/R на срезе (2D):", self.sp_bl_delta_2d)
+
+        # Вложенные раскрывающиеся подразделы «Исходные данные» и «Газодинамика»
+        self.sec_basic = CollapsibleSection("Исходные данные", expanded=True)
+        self.sec_basic.setContentWidget(tab_basic)
+        input_tabs_layout.addWidget(self.sec_basic)
+
+        self.sec_gasd = CollapsibleSection("Газодинамика (1D/2D)", expanded=False)
+        self.sec_gasd.setContentWidget(tab_gasd)
+        input_tabs_layout.addWidget(self.sec_gasd)
+
+        # ─── Третий подраздел исходных данных: Геометрия (Size & Geometry) ───
         self.tab_input_geom = QtWidgets.QWidget()
         self.form_input_geom = QtWidgets.QVBoxLayout(self.tab_input_geom)
         self.form_input_geom.setContentsMargins(2, 2, 2, 2)
@@ -933,10 +966,15 @@ class MainWindow(QtWidgets.QMainWindow):
         geom_hdr.setStyleSheet("color: #a8a29e; font-size: 10px;")
         geom_hdr.setWordWrap(True)
         self.form_input_geom.addWidget(geom_hdr)
-        self.input_tabs.addTab(self.tab_input_geom, "Геометрия (Size & Geometry)")
 
-        # Раскрывающаяся секция «Параметры расчёта» (содержит вкладки
-        # Исходные данные / Газодинамика / Геометрия).
+        self.sec_geom_input = CollapsibleSection(
+            "Геометрия (Size & Geometry)", expanded=False
+        )
+        self.sec_geom_input.setContentWidget(self.tab_input_geom)
+        input_tabs_layout.addWidget(self.sec_geom_input)
+
+        # Раскрывающаяся секция «Параметры расчёта» содержит три вложенных
+        # раскрывающихся подраздела.
         self.sec_params = CollapsibleSection("Параметры расчёта", expanded=True)
         self.sec_params.setContentWidget(self.input_tabs)
         layout.addWidget(self.sec_params)
@@ -1364,8 +1402,47 @@ class MainWindow(QtWidgets.QMainWindow):
         sf.addRow("", btn_save)
 
         side_v.addWidget(gb_style)
+
+        # ─── Наложение графиков (сравнение нескольких 1D-расчётов) ───
+        gb_overlay = QtWidgets.QGroupBox("Наложение графиков (1D)")
+        of = QtWidgets.QVBoxLayout(gb_overlay)
+        of.setSpacing(4)
+
+        self.chk_overlay_show = QtWidgets.QCheckBox("Показывать наложения")
+        self.chk_overlay_show.setChecked(True)
+        self.chk_overlay_show.setToolTip(
+            "Отображать ранее зафиксированные кривые поверх текущего расчёта "
+            "для сравнения вариантов."
+        )
+        self.chk_overlay_show.toggled.connect(self._redraw_plots)
+        of.addWidget(self.chk_overlay_show)
+
+        self.sp_overlay_name = QtWidgets.QLineEdit()
+        self.sp_overlay_name.setPlaceholderText("Имя варианта (необязательно)")
+        of.addWidget(self.sp_overlay_name)
+
+        btn_overlay_add = QtWidgets.QPushButton("➕ Зафиксировать как наложение")
+        btn_overlay_add.setToolTip(
+            "Сохранить кривые текущего 1D-расчёта как наложение, чтобы "
+            "сравнить с последующими расчётами."
+        )
+        btn_overlay_add.clicked.connect(self._add_overlay_snapshot)
+        of.addWidget(btn_overlay_add)
+
+        btn_overlay_clear = QtWidgets.QPushButton("🗑 Очистить наложения")
+        btn_overlay_clear.clicked.connect(self._clear_overlays)
+        of.addWidget(btn_overlay_clear)
+
+        self.lbl_overlay_count = QtWidgets.QLabel("Наложений: 0")
+        self.lbl_overlay_count.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        of.addWidget(self.lbl_overlay_count)
+
+        side_v.addWidget(gb_overlay)
         side_v.addStretch(1)
         h.addWidget(side)
+
+        # Хранилище снимков для наложения (список dict с массивами кривых)
+        self._overlays = []
         return w
 
     def _build_species_tab(self) -> QtWidgets.QWidget:
@@ -1471,8 +1548,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._render_field_2d()
                 return
             n_r = int(self.sp_n_radial_2d.value()) if hasattr(self, "sp_n_radial_2d") else 21
+            bl_on = self.chk_bl_2d.isChecked() if hasattr(self, "chk_bl_2d") else True
+            bl_delta = float(self.sp_bl_delta_2d.value()) if hasattr(self, "sp_bl_delta_2d") else 0.12
             self._last_field_2d = solve_nozzle_2d(
-                self.perf, geom, n_radial=n_r, method="quasi2d_stub"
+                self.perf, geom, n_radial=n_r, method="quasi2d_stub",
+                boundary_layer=bl_on, bl_delta_frac=bl_delta,
             )
         except Exception as e:
             self.statusBar().showMessage(f"2D-расчёт пропущен: {e}", 5000)
@@ -1862,6 +1942,10 @@ class MainWindow(QtWidgets.QMainWindow):
                  and self.rb_dim_2d.isChecked())
         if hasattr(self, "sp_n_radial_2d"):
             self.sp_n_radial_2d.setEnabled(is_2d)
+        if hasattr(self, "chk_bl_2d"):
+            self.chk_bl_2d.setEnabled(is_2d)
+        if hasattr(self, "sp_bl_delta_2d"):
+            self.sp_bl_delta_2d.setEnabled(is_2d and self.chk_bl_2d.isChecked())
 
     def _on_calc_geom_type_changed(self, *args):
         """Включает/выключает поля под выбранный тип сопла в панели расчёта."""
@@ -2497,6 +2581,95 @@ class MainWindow(QtWidgets.QMainWindow):
         s.tick_direction = self.cb_tick_dir.currentText().split()[0]
         return s
 
+    # ─── Наложение графиков (overlay) для сравнения 1D-расчётов ───
+
+    def _compute_curve_x(self, stations):
+        """Координата x по длине сопла для текущих сечений (как в _redraw_plots)."""
+        def length_to_m(v, unit):
+            if unit == 'см':
+                return v * 0.01
+            if unit == 'мм':
+                return v * 0.001
+            return v
+        return build_nozzle_geometry(
+            stations,
+            L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
+            L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
+            L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+        )
+
+    def _snapshot_curves(self, perf):
+        """Снимок кривых 1D-расчёта (x + P, T, V, M, ρ, γₛ) для наложения."""
+        stations = perf.stations
+        x = np.asarray(self._compute_curve_x(stations), dtype=float)
+        return {
+            "x": x,
+            "P": np.array([s.P_Pa / 1e6 for s in stations]),
+            "T": np.array([s.T_K for s in stations]),
+            "V": np.array([s.V_m_per_s for s in stations]),
+            "M": np.array([s.M for s in stations]),
+            "rho": np.array([s.rho_kg_per_m3 for s in stations]),
+            "gs": np.array([s.gamma_s for s in stations]),
+        }
+
+    def _add_overlay_snapshot(self):
+        """Зафиксировать текущий 1D-расчёт как наложение для сравнения."""
+        if getattr(self, "perf", None) is None:
+            self.statusBar().showMessage(
+                "Нет расчёта для фиксации наложения.", 4000
+            )
+            return
+        if not hasattr(self, "_overlays"):
+            self._overlays = []
+        name = self.sp_overlay_name.text().strip()
+        if not name:
+            name = f"Вариант {len(self._overlays) + 1}"
+        snap = self._snapshot_curves(self.perf)
+        # цвет наложения из палитры (циклически)
+        palette = ['#9aa0a6', '#d4a373', '#90be6d', '#577590',
+                   '#f9c74f', '#bc6c25', '#8ecae6', '#e07a5f']
+        snap["label"] = name
+        snap["color"] = palette[len(self._overlays) % len(palette)]
+        self._overlays.append(snap)
+        self._update_overlay_count()
+        self.sp_overlay_name.clear()
+        self.statusBar().showMessage(f"Наложение «{name}» добавлено.", 4000)
+        self._redraw_plots()
+
+    def _clear_overlays(self):
+        """Очистить все наложения."""
+        self._overlays = []
+        self._update_overlay_count()
+        self._redraw_plots()
+
+    def _update_overlay_count(self):
+        if hasattr(self, "lbl_overlay_count"):
+            n = len(getattr(self, "_overlays", []))
+            self.lbl_overlay_count.setText(f"Наложений: {n}")
+
+    def _draw_overlays(self, ax, key, *, twin=False):
+        """Нарисовать наложенные кривые ``key`` на оси ``ax`` (фоном).
+
+        Возвращает список handle'ов для легенды (по одному на наложение,
+        только для основной оси, чтобы не дублировать в легенде).
+        """
+        handles = []
+        if not getattr(self, "chk_overlay_show", None) or not self.chk_overlay_show.isChecked():
+            return handles
+        for ov in getattr(self, "_overlays", []):
+            y = ov.get(key)
+            if y is None:
+                continue
+            lw = max(0.8, self._collect_style().line_width * 0.7)
+            line, = ax.plot(
+                ov["x"], y, '-', color=ov["color"], lw=lw,
+                alpha=0.55, zorder=1,
+                label=(f"{ov['label']}" if not twin else None),
+            )
+            if not twin:
+                handles.append(line)
+        return handles
+
     def _redraw_plots(self):
         if self.perf is None:
             return
@@ -2528,18 +2701,20 @@ class MainWindow(QtWidgets.QMainWindow):
         P = np.array([s.P_Pa / 1e6 for s in stations])
         T = np.array([s.T_K for s in stations])
 
+        ov_h = self._draw_overlays(ax1, "P")
         l1, = ax1.plot(x, P, 'o-' if style.show_markers else '-',
                        color='#cc785c', lw=style.line_width, ms=style.marker_size,
-                       label='P, МПа')
+                       label='P, МПа', zorder=3)
         ax1.set_xlabel("Координата x, м")
         ax1.set_ylabel("Давление P, МПа")
 
         ax2 = ax1.twinx()
+        self._draw_overlays(ax2, "T", twin=True)
         l2, = ax2.plot(x, T, 's--' if style.show_markers else '--',
                        color='#6ab0ff', lw=style.line_width, ms=style.marker_size,
-                       label='T, К')
+                       label='T, К', zorder=3)
         ax2.set_ylabel("Температура T, К")
-        ax2.legend(handles=[l1, l2], loc='best')
+        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
 
         style.title = "Давление и температура по длине сопла"
         style.xlabel = "Координата x, м"
@@ -2556,19 +2731,21 @@ class MainWindow(QtWidgets.QMainWindow):
         ax1 = c.fig.add_subplot(111)
         V = np.array([s.V_m_per_s for s in stations])
         M = np.array([s.M for s in stations])
+        ov_h = self._draw_overlays(ax1, "V")
         l1, = ax1.plot(x, V, 'o-' if style.show_markers else '-',
                        color='#82d27a', lw=style.line_width, ms=style.marker_size,
-                       label='V, м/с')
+                       label='V, м/с', zorder=3)
         ax1.set_xlabel("Координата x, м")
         ax1.set_ylabel("Скорость потока V, м/с")
         ax2 = ax1.twinx()
+        self._draw_overlays(ax2, "M", twin=True)
         l2, = ax2.plot(x, M, 'D--' if style.show_markers else '--',
                        color='#e6b800', lw=style.line_width, ms=style.marker_size,
-                       label='M')
+                       label='M', zorder=3)
         ax2.set_ylabel("Число Маха M")
         # горизонталь M=1
         ax2.axhline(1.0, color='#a8a29e', lw=0.8, ls=':')
-        ax2.legend(handles=[l1, l2], loc='best')
+        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
         style2 = self._collect_style()
         style2.title = "Скорость потока и число Маха"
         style2.xlabel = "Координата x, м"
@@ -2584,17 +2761,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ax1 = c.fig.add_subplot(111)
         rho = np.array([s.rho_kg_per_m3 for s in stations])
         gs = np.array([s.gamma_s for s in stations])
+        ov_h = self._draw_overlays(ax1, "rho")
         l1, = ax1.plot(x, rho, 'o-' if style.show_markers else '-',
                        color='#cc785c', lw=style.line_width, ms=style.marker_size,
-                       label='ρ, кг/м³')
+                       label='ρ, кг/м³', zorder=3)
         ax1.set_xlabel("Координата x, м")
         ax1.set_ylabel("Плотность ρ, кг/м³")
         ax2 = ax1.twinx()
+        self._draw_overlays(ax2, "gs", twin=True)
         l2, = ax2.plot(x, gs, '^--' if style.show_markers else '--',
                        color='#c084fc', lw=style.line_width, ms=style.marker_size,
-                       label='γₛ')
+                       label='γₛ', zorder=3)
         ax2.set_ylabel("Изэнтр. показатель γₛ")
-        ax2.legend(handles=[l1, l2], loc='best')
+        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
         style3 = self._collect_style()
         style3.title = "Плотность и изэнтропич. показатель"
         style3.xlabel = "Координата x, м"
@@ -3057,6 +3236,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'gasdynamics': {
                 'dim_mode': '2d' if self.rb_dim_2d.isChecked() else '1d',
                 'n_radial_2d': self.sp_n_radial_2d.value(),
+                'boundary_layer_2d': self.chk_bl_2d.isChecked(),
+                'bl_delta_frac_2d': self.sp_bl_delta_2d.value(),
             },
             'geometry_profile': {
                 'use_dobro': self.chk_use_dobro.isChecked(),
@@ -3151,6 +3332,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.rb_dim_1d.setChecked(True)
                 self.sp_n_radial_2d.setValue(int(gd.get('n_radial_2d', 21)))
+                self.chk_bl_2d.setChecked(bool(gd.get('boundary_layer_2d', True)))
+                self.sp_bl_delta_2d.setValue(float(gd.get('bl_delta_frac_2d', 0.12)))
                 self._on_dim_mode_changed()
             gp = cfg.get('geometry_profile')
             if isinstance(gp, dict):

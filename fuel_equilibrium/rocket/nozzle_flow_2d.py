@@ -119,8 +119,11 @@ def solve_nozzle_2d(
     *,
     n_radial: int = 21,
     method: str = "quasi2d_stub",
+    boundary_layer: bool = True,
+    bl_delta_frac: float = 0.12,
+    bl_recovery: float = 0.89,
 ) -> Nozzle2DResult:
-    """Двумерный (осесимметричный) расчёт сопла — ЗАГОТОВКА.
+    """Двумерный (осесимметричный) расчёт сопла (квази-2D).
 
     Параметры
     ---------
@@ -135,6 +138,15 @@ def solve_nozzle_2d(
         'quasi2d_stub' — приближённое «развёртывание» 1D-профиля в 2D-поле
         с поправкой на угол потока у стенки. Иные значения зарезервированы
         под полноценный MOC (``TODO(2D)``).
+    boundary_layer : bool
+        Учитывать вязкий пограничный слой у стенки (условие прилипания:
+        скорость → 0, температура → температуре восстановления).
+    bl_delta_frac : float
+        Максимальная относительная толщина пограничного слоя δ/R на срезе
+        (на горловине ~0, линейно растёт вниз по потоку).
+    bl_recovery : float
+        Коэффициент восстановления температуры r ≈ Pr^(1/3) ≈ 0.89
+        (турбулентный пограничный слой).
 
     Возвращает
     ----------
@@ -148,6 +160,12 @@ def solve_nozzle_2d(
 
     if method in ("quasi2d_stub", "quasi2d", "source_flow"):
         fields, meta = _quasi2d_fields(axial, x_grid, r_grid, wall_r)
+        if boundary_layer:
+            fields, bl_meta = _apply_boundary_layer(
+                fields, axial, x_grid, r_grid, wall_x, wall_r,
+                delta_frac=bl_delta_frac, recovery=bl_recovery,
+            )
+            meta.update(bl_meta)
     else:
         # TODO(2D): здесь подключается полноценный метод характеристик (MOC)
         #   1. Трансзвуковая стартовая линия у горловины (Sauer / Hall).
@@ -364,6 +382,108 @@ def _quasi2d_fields(
         "M_radial_spread_max": float(
             np.max(np.abs(M_field[-1, :] - M_field[0, :]))
         ),
+    }
+    return fields, meta
+
+
+def _apply_boundary_layer(
+    fields: Dict[str, Nozzle2DField],
+    axial: Dict[str, np.ndarray],
+    x_grid: np.ndarray,
+    r_grid: np.ndarray,
+    wall_x: np.ndarray,
+    wall_r: np.ndarray,
+    *,
+    delta_frac: float = 0.12,
+    recovery: float = 0.89,
+) -> Tuple[Dict[str, Nozzle2DField], Dict[str, Any]]:
+    """Накладывает вязкий пограничный слой у стенки на невязкое (core) поле.
+
+    Физическая модель пристеночного слоя
+    ------------------------------------
+    * Условие прилипания: скорость на стенке V_wall = 0, восстанавливается до
+      ядрового (невязкого) значения по степенному профилю турбулентного
+      пограничного слоя 1/7:
+            V/V_e = (y/δ)^(1/7),   y — расстояние от стенки, 0 ≤ y ≤ δ.
+    * Толщина δ(x) растёт вниз по потоку: на горловине ≈ 0, на срезе ≈
+      ``delta_frac``·R(x). Вне слоя (y > δ) поле — невязкое ядро.
+    * Температура: вязкая диссипация даёт у стенки температуру восстановления
+            T_aw = T_e·(1 + r·(γ-1)/2·M_e²),
+      где r — коэффициент восстановления (Pr^(1/3) ≈ 0.89). В слое статическая
+      температура растёт от ядровой к T_aw по профилю Кроко-Бузмана
+      (линейно по дефициту скорости как упрощение).
+    * Давление поперёк тонкого слоя считается постоянным (∂P/∂y ≈ 0).
+    * Число Маха пересчитывается: M = V / a, где a = sqrt(γ R T) с локальной T.
+
+    Геометрия сетки: строка index 0 — ось (r=0), строка -1 — стенка (r=R).
+    Поэтому y = R(x) − r монотонно убывает от оси к стенке; в слое (y ≤ δ)
+    параметры меняются по радиусу — пограничный слой ВИДЕН на поле.
+    """
+    n_r, n_x = x_grid.shape
+
+    V_core = fields["V_m_per_s"].values.copy()
+    T_core = fields["T_K"].values.copy()
+    P_core = fields["P_Pa"].values.copy()
+    M_core = fields["M"].values.copy()
+
+    gamma = np.tile(np.clip(axial["gamma"], 1.05, 1.67).reshape(1, -1), (n_r, 1))
+    Rg = np.tile(axial["R_specific"].reshape(1, -1), (n_r, 1))
+
+    # радиус стенки по столбцам и расстояние от стенки y = R - r
+    R_col = wall_r.reshape(1, -1)
+    y = R_col - r_grid                                   # (n_r, n_x), 0 у стенки
+    y = np.clip(y, 0.0, None)
+
+    # ── толщина пограничного слоя δ(x) ──
+    # нормированная осевая координата 0..1 (от входа к срезу)
+    if wall_x[-1] > wall_x[0]:
+        s = (wall_x - wall_x[0]) / (wall_x[-1] - wall_x[0])
+    else:
+        s = np.zeros_like(wall_x)
+    # δ растёт от ~0 у входа к delta_frac·R на срезе (степень 0.7).
+    delta = (delta_frac * R_col) * np.clip(s.reshape(1, -1), 0.0, 1.0) ** 0.7
+    delta = np.maximum(delta, 1e-9)
+
+    # положение внутри слоя: ζ = y/δ, в слое 0..1, в ядре >1
+    zeta = y / delta
+    in_bl = zeta < 1.0                                   # маска пограничного слоя
+
+    # ── профиль скорости 1/7 в слое, ядро вне слоя ──
+    with np.errstate(invalid="ignore"):
+        vel_ratio = np.where(in_bl, np.clip(zeta, 0.0, 1.0) ** (1.0 / 7.0), 1.0)
+    V_bl = V_core * vel_ratio
+
+    # ── температура: профиль Кроко-Бузмана (линейно по дефициту скорости) ──
+    M_e = M_core
+    T_aw = T_core * (1.0 + recovery * 0.5 * (gamma - 1.0) * M_e ** 2)
+    g_def = np.clip(1.0 - vel_ratio, 0.0, 1.0)
+    T_bl = np.where(in_bl, T_core + (T_aw - T_core) * g_def, T_core)
+
+    # ── давление поперёк тонкого слоя постоянно (ядровое) ──
+    P_bl = P_core
+
+    # ── число Маха в слое: M = V / a, a = sqrt(γ R T) ──
+    with np.errstate(invalid="ignore"):
+        a_bl = np.sqrt(np.clip(gamma * Rg * T_bl, 0.0, None))
+    M_bl = np.where(a_bl > 1e-6, V_bl / a_bl, M_core * vel_ratio)
+    M_bl = np.where(in_bl, M_bl, M_core)
+
+    # запись обратно (вне слоя значения совпадают с ядром)
+    fields["V_m_per_s"] = Nozzle2DField("Скорость", "м/с", V_bl)
+    fields["T_K"] = Nozzle2DField("Температура", "К", T_bl)
+    fields["P_Pa"] = Nozzle2DField("Давление", "Па", P_bl)
+    fields["M"] = Nozzle2DField("Число Маха", "-", M_bl)
+
+    # доля сечения, занятая пограничным слоем на срезе
+    bl_frac_exit = float(np.mean(in_bl[:, -1])) if n_x > 0 else 0.0
+
+    meta = {
+        "boundary_layer": True,
+        "bl_delta_frac": float(delta_frac),
+        "bl_recovery_factor": float(recovery),
+        "bl_profile": "turbulent_1_7_power + Crocco-Busemann T",
+        "bl_wall_velocity_max": float(np.max(np.abs(V_bl[-1, :]))),
+        "bl_fraction_at_exit": bl_frac_exit,
     }
     return fields, meta
 
