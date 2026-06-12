@@ -64,6 +64,7 @@ from ..rocket.nozzle_flow_2d import solve_nozzle_2d, Nozzle2DResult
 from ..io.reporting import print_nozzle_table
 from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
+from ..core.equilibrium_cache import clear_cache as clear_equilibrium_cache
 from ..io.iteration_logger import IterationLogger, NullLogger
 from .component_selector import ComponentSelectorDialog, ComponentListWidget, MixturePropellantWidget
 
@@ -2389,6 +2390,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
             db_path = find_thermo_db()
             self.species_db = parse_thermo_file(db_path)
+            # Сбрасываем кэш равновесных составов: термоданные могли измениться,
+            # старые результаты больше не валидны.
+            clear_equilibrium_cache()
             
             # Обновить mixture_widget с загруженной базой
             self.mixture_widget.species_db = self.species_db
