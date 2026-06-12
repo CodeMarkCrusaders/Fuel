@@ -68,10 +68,10 @@ def print_result(result: EquilibriumResult, species_db: Dict[str, Species]) -> N
     cond = result.get_condensed_species()
     if cond:
         print(f"\n  КОНДЕНСАТ:")
-        phases = {0: "газ", 1: "тв.", 2: "жидк."}
         for name, moles in cond:
-            idx = result.species_names.index(name)
-            print(f"  {name:<25} {moles:.6e}  {phases.get(result.phase[idx], '?')}")
+            # агрегатное состояние определяем по суффиксу имени вещества
+            state = "жидк." if name.strip().endswith("(L)") else "тв."
+            print(f"  {name:<25} {moles:.6e}  {state}")
 
     print("\n" + "=" * 70)
 
