@@ -18,7 +18,9 @@
 #   а масса сохраняется. Все «удельные» величины пересчитываются на 1 кг смеси.
 
 import math
+import os
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from scipy.optimize import brentq
@@ -534,6 +536,43 @@ def _build_segmented_pressure_grid(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Параллелизм газодинамического расчёта по сечениям
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Каждое промежуточное сечение считается независимо: своя SP-задача
+# (solve_equilibrium_SP) + сборка параметров (_make_station). Зависимостей
+# между сечениями нет — это «embarrassingly parallel» задача.
+#
+# Почему потоки (ThreadPoolExecutor), а не процессы:
+#   * тяжёлая часть каждой задачи — это (а) Fortran-ядро SLSQP в SciPy и
+#     (б) векторные операции NumPy/Numba; обе РЕЛИЗ�ят GIL на время счёта,
+#     поэтому потоки реально идут параллельно по ядрам;
+#   * процессы потребовали бы pickling базы видов и состава на каждую задачу
+#     (большой оверхед, ранее измеренный как 0.39x — замедление);
+#   * потоки разделяют общий species_list / elements без копирования.
+#
+# Число воркеров берём из переменной окружения FUEL_NOZZLE_WORKERS, иначе
+# по числу доступных CPU (ограничив сверху, чтобы не плодить лишние потоки
+# на коротких сетках).
+
+def _resolve_worker_count(n_tasks: int) -> int:
+    """Сколько потоков использовать для n_tasks независимых сечений."""
+    if n_tasks <= 1:
+        return 1
+    env = os.environ.get("FUEL_NOZZLE_WORKERS")
+    if env:
+        try:
+            w = int(env)
+            if w >= 1:
+                return min(w, n_tasks)
+        except ValueError:
+            pass
+    cpu = os.cpu_count() or 1
+    # один поток на задачу, но не больше числа CPU и не больше 8
+    return max(1, min(n_tasks, cpu, 8))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Основная функция: расчёт сопла «от Pc до Pe» с произвольным числом сечений
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -753,7 +792,14 @@ def solve_rocket_nozzle(
         P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
 
         flow_pressures = [*P_pre, *P_post]
-        for k, P_k in enumerate(flow_pressures, start=1):
+
+        def _compute_section(args):
+            """Считает одно сечение (SP-задача + сборка параметров).
+
+            Полностью независимо от других сечений — пригодно для
+            параллельного выполнения в пуле потоков.
+            """
+            k, P_k = args
             r_k = solve_equilibrium_SP(
                 species_list=species_list,
                 element_abundances=elements,
@@ -768,10 +814,33 @@ def solve_rocket_nozzle(
                 f'Section {k}', species_list, elements, r_k, float(P_k),
                 mass_total_g, H_chamber_per_kg,
             )
+            return k, P_k, st
+
+        tasks = list(enumerate(flow_pressures, start=1))
+        n_workers = _resolve_worker_count(len(tasks))
+
+        if n_workers > 1:
+            # параллельный расчёт сечений в пуле потоков (GIL освобождается
+            # внутри SLSQP/NumPy/Numba, поэтому потоки идут параллельно)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_compute_section, tasks))
+        else:
+            results = [_compute_section(t) for t in tasks]
+
+        # порядок сечений восстанавливаем по давлению (как и раньше),
+        # независимо от порядка завершения потоков
+        for k, P_k, st in results:
             if P_k > P_throat:
                 intermediate_pre_throat.append(st)
             else:
                 intermediate_post_throat.append(st)
+
+        intermediate_pre_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+        intermediate_post_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+
+        if logger.enabled:
+            logger.log(f'Газодинамика по сечениям: {len(tasks)} сечений, '
+                       f'{n_workers} поток(ов)')
 
     # ── 8) Ae/At — из сохранения массового расхода ────────────────────
     # m_dot = rho * V * A = const => A/At = (rho_t * V_t) / (rho * V)

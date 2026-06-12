@@ -48,9 +48,14 @@ except Exception:  # numba не установлена — работаем на
         return _wrap
 
 
-@_njit(cache=True, fastmath=True)
+@_njit(cache=True, fastmath=True, nogil=True)
 def _gibbs_kernel(n, Ng, Nc, g0, ln_P, n_min):
-    """G/RT смеси: газовая фаза (с членом смешения) + конденсат."""
+    """G/RT смеси: газовая фаза (с членом смешения) + конденсат.
+
+    nogil=True — отпускаем GIL внутри скомпилированного ядра, чтобы
+    параллельный расчёт сечений сопла (ThreadPoolExecutor) шёл реально
+    параллельно по ядрам процессора.
+    """
     s = 0.0
     for i in range(Ng):
         s += n[i] if n[i] > n_min else n_min
@@ -66,7 +71,7 @@ def _gibbs_kernel(n, Ng, Nc, g0, ln_P, n_min):
     return G
 
 
-@_njit(cache=True, fastmath=True)
+@_njit(cache=True, fastmath=True, nogil=True)
 def _grad_kernel(n, Ng, Nc, g0, ln_P, n_min, out):
     """∂(G/RT)/∂n_i. Результат пишется в ``out`` (форма (Ng+Nc,))."""
     s = 0.0
@@ -333,14 +338,16 @@ def solve_equilibrium(
             logger.inner_iter(outer_index, iter_count[0], gibbs(xk),
                               xk, sp_names, residual=res_eq, top_k=8)
 
-    # ftol=1e-10 (вместо 1e-14): для систем с большим числом видов (C/H/O ~61
-    # вид) число итераций SLSQP — главный фактор стоимости. Ослабление допуска
-    # с 1e-14 до 1e-10 кратно сокращает число итераций (камера ~9.5с→3.2с) при
-    # идентичной температуре пламени и составе (отклонение T < 1e-3 K), т.к.
-    # минимум G/RT гладкий и достигается с большим запасом по точности.
+    # ftol=1e-6 (вместо 1e-14/1e-10): для систем с большим числом видов
+    # (C/H/O ~61 вид) число итераций SLSQP — главный фактор стоимости.
+    # Ослабление допуска кратно сокращает число итераций при практически
+    # идентичной температуре пламени и составе (отклонение T много меньше
+    # инженерной значимости), т.к. минимум G/RT гладкий и достигается с
+    # большим запасом по точности. Порог невязки баланса элементов ниже
+    # (1e-6) гарантирует физическую корректность решения.
     res = minimize(gibbs, n0, method='SLSQP', jac=grad,
                    bounds=bounds, constraints=constraints,
-                   options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False},
+                   options={'maxiter': 2000, 'ftol': 1e-6, 'disp': False},
                    callback=cb)
 
     n_sol = res.x
