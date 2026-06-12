@@ -1643,14 +1643,40 @@ class MainWindow(QtWidgets.QMainWindow):
             "T, P и V пересчитываются из M по изэнтропическим соотношениям.\n"
             "Полный метод характеристик (MOC) — следующий шаг (TODO).\n"
             "Выберите режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)» и\n"
-            "выполните расчёт, чтобы построить поле течения."
+            "выполните расчёт, чтобы построить поле течения.\n"
+            "Интерактивно: панель сверху — приближение (лупа) / перемещение (рука) /\n"
+            "сброс (домик); наведите курсор на поле — значение в точке покажется ниже."
         )
         self.lbl_field_2d_info.setStyleSheet("color: #a8a29e; font-size: 10px;")
         self.lbl_field_2d_info.setWordWrap(True)
         v.addWidget(self.lbl_field_2d_info)
 
         self.canvas_field_2d = MplCanvas(width=7, height=4.5)
+        # Панель навигации matplotlib: масштабирование (zoom), панорамирование
+        # (pan), сброс вида (home), сохранение. Даёт интерактивное приближение.
+        self.toolbar_field_2d = NavigationToolbar(self.canvas_field_2d, w)
+        v.addWidget(self.toolbar_field_2d)
         v.addWidget(self.canvas_field_2d, 1)
+
+        # Строка считывания значения поля под курсором (x, r, величина).
+        self.lbl_field_2d_cursor = QtWidgets.QLabel("Наведите курсор на поле…")
+        self.lbl_field_2d_cursor.setStyleSheet(
+            "color: #e7e5e4; background: #2a2724; border: 1px solid #44403c;"
+            " border-radius: 4px; padding: 4px 8px; font-family: monospace;"
+        )
+        v.addWidget(self.lbl_field_2d_cursor)
+
+        # Подключаем обработчик движения мыши для считывания значения у курсора.
+        self.canvas_field_2d.mpl_connect(
+            "motion_notify_event", self._on_field_2d_hover
+        )
+        self.canvas_field_2d.mpl_connect(
+            "axes_leave_event", self._on_field_2d_leave
+        )
+
+        # Кэш данных текущего отрисованного поля (для интерполяции у курсора).
+        self._field_2d_plot_cache: Optional[dict] = None
+        self._field_2d_marker = None
 
         self._last_field_2d: Optional[Nozzle2DResult] = None
         return w
@@ -1685,6 +1711,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if c is None:
             return
         c.fig.clear()
+        self._field_2d_plot_cache = None
+        self._field_2d_marker = None
         res = self._last_field_2d
         if res is None:
             ax = c.fig.add_subplot(111)
@@ -1694,6 +1722,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.set_axis_off()
             c.fig.tight_layout()
             c.draw()
+            if hasattr(self, "lbl_field_2d_cursor"):
+                self.lbl_field_2d_cursor.setText("Нет данных 2D.")
             return
         idx = self.cb_field_2d.currentIndex()
         key, label = self._field_2d_keys.get(idx, ("M", "M"))
@@ -1706,8 +1736,33 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.text(0.5, 0.5, f"Поле '{key}' недоступно", ha='center', va='center')
             ax.set_axis_off()
         else:
-            pcm = ax.pcolormesh(res.x_grid, res.r_grid, vals, shading='auto', cmap='viridis')
-            ax.plot(res.wall_x, res.wall_r, '-', color='#cc785c', lw=1.8)
+            x_grid = np.asarray(res.x_grid, dtype=float)
+            r_grid = np.asarray(res.r_grid, dtype=float)
+            vals = np.asarray(vals, dtype=float)
+            wall_x = np.asarray(res.wall_x, dtype=float)
+            wall_r = np.asarray(res.wall_r, dtype=float)
+
+            # ── Маскируем значения ВНЕ профиля сопла ──────────────────────────
+            # Радиус стенки для каждого столбца сетки; узлы, где r чуть превышает
+            # стенку (из-за дискретизации), исключаются из заливки, чтобы цвет
+            # не выходил за границу контура.
+            wall_r_col = wall_r.reshape(1, -1)
+            outside = r_grid > (wall_r_col + 1e-12)
+            vals_masked = np.ma.array(vals, mask=~np.isfinite(vals) | outside)
+
+            # shading='gouraud' интерполирует цвет по УЗЛАМ сетки (а не по
+            # ячейкам), поэтому заливка не «вылезает» за крайние узлы у стенки —
+            # значения остаются строго внутри профиля.
+            try:
+                cmap = matplotlib.colormaps['viridis'].copy()
+            except Exception:  # старые версии matplotlib
+                cmap = matplotlib.cm.get_cmap('viridis').copy()
+            cmap.set_bad(color=(0, 0, 0, 0))  # маскированные ячейки прозрачны
+            pcm = ax.pcolormesh(
+                x_grid, r_grid, vals_masked,
+                shading='gouraud', cmap=cmap,
+            )
+            ax.plot(wall_x, wall_r, '-', color='#cc785c', lw=1.8)
             c.fig.colorbar(pcm, ax=ax, label=label)
             ax.set_xlabel("x, м")
             ax.set_ylabel("r, м")
@@ -1716,12 +1771,155 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 tag = " (квази-2D, source-flow)"
             ax.set_title(f"Поле течения 2D — {label}{tag}")
+            # Ограничиваем область отображения профилем (с небольшим полем).
+            # adjustable='box' сохраняет равный масштаб осей и НЕ переопределяет
+            # заданные пределы (в отличие от 'datalim'), поэтому вид остаётся
+            # привязан к контуру сопла.
             try:
-                ax.set_aspect('equal', adjustable='datalim')
+                xmin, xmax = float(wall_x.min()), float(wall_x.max())
+                rmax = float(wall_r.max())
+                pad = 0.03 * max(xmax - xmin, rmax, 1e-6)
+                ax.set_xlim(xmin - pad, xmax + pad)
+                ax.set_ylim(0.0, rmax + pad)
             except Exception:
                 pass
+            try:
+                ax.set_aspect('equal', adjustable='box')
+            except Exception:
+                pass
+
+            # Кэш для считывания значения под курсором (билинейная интерполяция).
+            self._field_2d_plot_cache = {
+                "ax": ax,
+                "x_grid": x_grid,
+                "r_grid": r_grid,
+                "vals": vals,
+                "wall_x": wall_x,
+                "wall_r": wall_r,
+                "label": label,
+                "key": key,
+            }
         c.fig.tight_layout()
         c.draw()
+        if hasattr(self, "lbl_field_2d_cursor"):
+            self.lbl_field_2d_cursor.setText("Наведите курсор на поле…")
+
+    # ── Интерактивное считывание значения поля под курсором ──────────────────
+    def _field_2d_value_at(self, x: float, r: float):
+        """Возвращает (значение, r_стенки) поля в точке (x, r) внутри профиля.
+
+        Использует билинейную интерполяцию по структурированной сетке (n_r, n_x),
+        где строки — радиальные узлы (0 — ось, -1 — стенка). Если точка вне
+        профиля (r > r_стенки) или вне диапазона x, возвращает (None, r_стенки).
+        """
+        cache = self._field_2d_plot_cache
+        if cache is None:
+            return None, None
+        x_grid = cache["x_grid"]
+        r_grid = cache["r_grid"]
+        vals = cache["vals"]
+        wall_x = cache["wall_x"]
+        wall_r = cache["wall_r"]
+
+        x_axis = x_grid[0, :]            # координаты x по столбцам (n_x,)
+        if x_axis.size < 2:
+            return None, None
+        # вне диапазона x
+        if x < x_axis.min() or x > x_axis.max():
+            wr = float(np.interp(x, wall_x, wall_r)) if wall_x.size else None
+            return None, wr
+
+        # радиус стенки в точке x (для проверки «внутри профиля»)
+        wr = float(np.interp(x, wall_x, wall_r))
+        if r < 0.0 or r > wr + 1e-12:
+            return None, wr
+
+        # индекс столбца j и доля tx между x_axis[j], x_axis[j+1]
+        j = int(np.clip(np.searchsorted(x_axis, x) - 1, 0, x_axis.size - 2))
+        x0, x1 = x_axis[j], x_axis[j + 1]
+        tx = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+        tx = float(np.clip(tx, 0.0, 1.0))
+
+        # радиальные координаты в этом столбце (могут отличаться по столбцам)
+        def _interp_col(col):
+            r_col = r_grid[:, col]
+            v_col = vals[:, col]
+            order = np.argsort(r_col)
+            return float(np.interp(r, r_col[order], v_col[order]))
+
+        v_left = _interp_col(j)
+        v_right = _interp_col(j + 1)
+        value = (1.0 - tx) * v_left + tx * v_right
+        if not np.isfinite(value):
+            return None, wr
+        return value, wr
+
+    def _on_field_2d_hover(self, event):
+        cache = getattr(self, "_field_2d_plot_cache", None)
+        lbl = getattr(self, "lbl_field_2d_cursor", None)
+        if lbl is None:
+            return
+        if cache is None or event.inaxes is not cache.get("ax"):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        x, r = float(event.xdata), float(event.ydata)
+        value, wr = self._field_2d_value_at(x, r)
+        c = self.canvas_field_2d
+
+        # удаляем прежний маркер
+        if self._field_2d_marker is not None:
+            try:
+                self._field_2d_marker.remove()
+            except Exception:
+                pass
+            self._field_2d_marker = None
+
+        if value is None:
+            extra = " (вне профиля)" if wr is not None and r > wr else ""
+            lbl.setText(f"x = {x:.4g} м,  r = {r:.4g} м{extra}")
+            c.draw_idle()
+            return
+
+        # форматирование значения в зависимости от величины поля
+        label = cache.get("label", "")
+        key = cache.get("key", "")
+        if key == "P_Pa":
+            vtxt = f"{value/1e6:.4g} МПа ({value:.4g} Па)"
+        elif key == "T_K":
+            vtxt = f"{value:.5g} К"
+        elif key == "V_m_per_s":
+            vtxt = f"{value:.5g} м/с"
+        elif key == "flow_angle_deg":
+            vtxt = f"{value:.4g}°"
+        else:
+            vtxt = f"{value:.5g}"
+        lbl.setText(f"x = {x:.4g} м,  r = {r:.4g} м    →    {label} = {vtxt}")
+
+        # маркер точки на поле
+        try:
+            (self._field_2d_marker,) = cache["ax"].plot(
+                [x], [r], marker='o', ms=6, mfc='none',
+                mec='#f5f5f4', mew=1.4, zorder=5,
+            )
+        except Exception:
+            self._field_2d_marker = None
+        c.draw_idle()
+
+    def _on_field_2d_leave(self, event):
+        lbl = getattr(self, "lbl_field_2d_cursor", None)
+        if self._field_2d_marker is not None:
+            try:
+                self._field_2d_marker.remove()
+            except Exception:
+                pass
+            self._field_2d_marker = None
+            try:
+                self.canvas_field_2d.draw_idle()
+            except Exception:
+                pass
+        if lbl is not None:
+            lbl.setText("Наведите курсор на поле…")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Вкладка «Геометрия сопла (Добровольский, гл. 2)»
