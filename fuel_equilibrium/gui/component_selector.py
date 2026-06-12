@@ -214,14 +214,15 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
         """Фильтровать компоненты по поиску и типу."""
         search_text = self.search_input.text().lower()
         
-        # Определить фильтр по типу
-        phase_filter = None
+        # Определить фильтр по агрегатному состоянию
+        # (по реальному состоянию вещества, а не по индексу фазы NASA-9)
+        state_filter = None
         if self.rb_gas.isChecked():
-            phase_filter = 0
+            state_filter = "gas"
         elif self.rb_liquid.isChecked():
-            phase_filter = 2
+            state_filter = "liquid"
         elif self.rb_solid.isChecked():
-            phase_filter = 1
+            state_filter = "solid"
         
         self.table.setRowCount(0)
         
@@ -238,8 +239,8 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
                 if search_text not in elements_str.lower():
                     continue
             
-            # Фильтр по типу
-            if phase_filter is not None and species.phase != phase_filter:
+            # Фильтр по агрегатному состоянию
+            if state_filter is not None and species.aggregate_state != state_filter:
                 continue
             
             # Добавить строку
@@ -261,9 +262,8 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
             mw_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table.setItem(row, 2, mw_item)
             
-            # Состояние
-            phase_names = {0: "газ", 1: "твёрдое", 2: "жидкость"}
-            phase_item = QtWidgets.QTableWidgetItem(phase_names.get(species.phase, "?"))
+            # Состояние (реальное агрегатное состояние по суффиксу имени)
+            phase_item = QtWidgets.QTableWidgetItem(species.aggregate_state_ru)
             phase_item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
             self.table.setItem(row, 3, phase_item)
     
@@ -284,7 +284,7 @@ class ComponentSelectorDialog(QtWidgets.QDialog):
 Молярная масса: {species.mol_weight:.4f} г/моль
 Теплота образования (298K): {species.hf298:.2f} Дж/моль
 Элементный состав: {', '.join(f"{el}:{cnt}" for el, cnt in species.elements.items())}
-Состояние: {['газ', 'твёрдое', 'жидкость'][species.phase]}
+Состояние: {species.aggregate_state_ru}
 Температурные интервалы: {species.n_intervals}
         """.strip()
         

@@ -26,7 +26,11 @@ class Species:
     n_intervals: int
     reference: str
     elements: Dict[str, float]  # {символ: кол-во атомов}
-    phase: int       # 0=газ, 1=тв., 2=жидк.
+    phase: int       # ИНДЕКС фазы из формата NASA-9 (столбцы 50-52):
+                     #   0      — газ
+                     #   1..5   — конденсированная фаза (НЕ код «тв./жидк.»!)
+                     # Истинное агрегатное состояние определяется суффиксом
+                     # имени вещества — см. свойство aggregate_state.
     mol_weight: float
     hf298: float     # теплота образования при 298.15 К, Дж/моль
                      # для реагентов с n_intervals=0 — это assigned-h при T_assigned
@@ -50,8 +54,52 @@ class Species:
         return self.n_intervals == 0 and self.T_assigned is not None
 
     @property
+    def aggregate_state(self) -> str:
+        """Истинное агрегатное состояние: 'gas' | 'liquid' | 'solid'.
+
+        В формате NASA-9 поле phase — это лишь индекс фазы (0=газ,
+        1..5=конденсат), который НЕ различает твёрдое и жидкое. Реальное
+        состояние конденсата зашито в суффиксе имени вещества:
+            (L)                         -> жидкость
+            (cr),(a),(b),(c),(s),(gr),  -> твёрдое (кристалл/аллотроп)
+            (an),(qz...),(I),(II)...    -> твёрдое
+        Газ определяется по phase == 0 (суффикс отсутствует либо (g)).
+        """
+        if self.is_gas:
+            return "gas"
+        suffix = self._name_suffix()
+        if suffix == "L":
+            return "liquid"
+        # всё прочее у конденсата — твёрдые кристаллические формы/аллотропы
+        return "solid"
+
+    def _name_suffix(self) -> str:
+        """Содержимое последних скобок в имени, напр. 'L', 'cr', 'a'.
+        Если скобок нет — возвращает пустую строку."""
+        name = self.name.strip()
+        if name.endswith(")"):
+            start = name.rfind("(")
+            if start != -1:
+                return name[start + 1:-1]
+        return ""
+
+    @property
+    def aggregate_state_ru(self) -> str:
+        """Агрегатное состояние по-русски для отображения."""
+        return {"gas": "газ", "liquid": "жидкость", "solid": "твёрдое"}[self.aggregate_state]
+
+    @property
+    def is_liquid(self) -> bool:
+        return self.aggregate_state == "liquid"
+
+    @property
+    def is_solid(self) -> bool:
+        return self.aggregate_state == "solid"
+
+    @property
     def phase_str(self):
-        return {0: "газ", 1: "тв.", 2: "жидк."}.get(self.phase, "?")
+        # короткая форма агрегатного состояния
+        return {"gas": "газ", "liquid": "жидк.", "solid": "тв."}[self.aggregate_state]
 
 
 def _parse_fortran_float(s: str) -> float:
