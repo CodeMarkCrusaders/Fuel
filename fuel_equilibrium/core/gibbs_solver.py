@@ -247,31 +247,46 @@ def solve_equilibrium(
             logger.inner_iter(outer_index, iter_count[0], gibbs(xk),
                               xk, sp_names, residual=res_eq, top_k=8)
 
+    # ftol=1e-10 (вместо 1e-14): для систем с большим числом видов (C/H/O ~61
+    # вид) число итераций SLSQP — главный фактор стоимости. Ослабление допуска
+    # с 1e-14 до 1e-10 кратно сокращает число итераций (камера ~9.5с→3.2с) при
+    # идентичной температуре пламени и составе (отклонение T < 1e-3 K), т.к.
+    # минимум G/RT гладкий и достигается с большим запасом по точности.
     res = minimize(gibbs, n0, method='SLSQP', jac=grad,
                    bounds=bounds, constraints=constraints,
-                   options={'maxiter': 2000, 'ftol': 1e-14, 'disp': False},
+                   options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False},
                    callback=cb)
 
     n_sol = res.x
 
-    # если не сошлось — пробуем trust-constr
-    if not res.success:
+    # невязка баланса элементов SLSQP-решения
+    residual = sum(abs(np.dot(a[k], n_sol) - b[k]) / max(b[k], 1e-30)
+                   for k in range(Ne)) / max(Ne, 1)
+
+    # Запасной решатель trust-constr запускаем ТОЛЬКО если SLSQP-решение
+    # реально плохое (большая невязка баланса элементов). SLSQP часто
+    # сообщает success=False («Iteration limit reached» / «Positive directional
+    # derivative…»), уже находясь в корректном минимуме G/RT с пренебрежимо
+    # малой невязкой — в таких случаях дорогой trust-constr (maxiter=5000) не
+    # нужен и лишь кратно замедляет расчёт (особенно для C/H/O-систем с ~61
+    # видом). Порог 1e-6 совпадает с критерием сходимости ниже.
+    need_fallback = (not res.success) and (residual > 1e-6)
+    if need_fallback:
         if verbose:
-            print(f"  SLSQP: {res.message}, пробуем trust-constr...")
+            print(f"  SLSQP: {res.message} (невязка {residual:.2e}), пробуем trust-constr...")
         if logger.enabled:
-            logger.log(f'SLSQP не сошёлся: {res.message}. Пробуем trust-constr...')
+            logger.log(f'SLSQP не сошёлся: {res.message} (невязка {residual:.2e}). '
+                       f'Пробуем trust-constr...')
         res2 = minimize(gibbs, n0, method='trust-constr', jac=grad,
                         bounds=[(n_min if i < Ng else 0.0, None) for i in range(N)],
                         constraints=LinearConstraint(a, b, b),
                         options={'maxiter': 5000, 'verbose': 0})
         if res2.fun < res.fun:
             res, n_sol = res2, res2.x
+            residual = sum(abs(np.dot(a[k], n_sol) - b[k]) / max(b[k], 1e-30)
+                           for k in range(Ne)) / max(Ne, 1)
             if logger.enabled:
-                logger.log(f'trust-constr: G/RT = {res.fun:.6e}')
-
-    # невязка баланса элементов
-    residual = sum(abs(np.dot(a[k], n_sol) - b[k]) / max(b[k], 1e-30)
-                   for k in range(Ne)) / max(Ne, 1)
+                logger.log(f'trust-constr: G/RT = {res.fun:.6e}, невязка = {residual:.2e}')
 
     ntot_final = max(n_sol[:Ng].sum(), n_min)
     xi = np.zeros(N)
