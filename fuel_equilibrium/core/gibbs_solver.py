@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from .nasa9_parser import Species
 from .thermo_calc import g_over_RT, h_over_RT, s_over_R, R_UNIVERSAL
 from ..io.iteration_logger import IterationLogger, NullLogger
+from .equilibrium_cache import get_global_cache
 
 
 P_REF = 1e5      # опорное давление, 1 бар
@@ -120,6 +121,7 @@ def solve_equilibrium(
     logger: Optional[IterationLogger] = None,
     outer_index: int = -1,
     n0_warm: Optional[np.ndarray] = None,
+    use_cache: bool = True,
 ) -> EquilibriumResult:
     """
     Находит равновесный состав минимизацией G/RT при заданных T и P.
@@ -130,9 +132,23 @@ def solve_equilibrium(
     Параметры:
         n0_warm — «тёплый старт», начальное приближение (для внешних итераций HP/SP).
         outer_index — номер внешнего шага для лога (если -1 — TP-задача без внешнего цикла).
+        use_cache — использовать глобальный кэш равновесных составов. Кэшируется
+                    только «холодный» старт (n0_warm is None); внутри HP/SP-циклов
+                    кэширование выполняется на верхнем уровне.
     """
     if logger is None:
         logger = NullLogger()
+
+    # ── кэш: только для холодного старта TP-задачи ─────────────────────
+    _cache = get_global_cache() if (use_cache and n0_warm is None) else None
+    _cache_key = None
+    if _cache is not None:
+        _cache_key = _cache.make_key(
+            'TP', species_list, element_abundances, T, P, include_condensed,
+        )
+        _cached = _cache.get(_cache_key)
+        if _cached is not None:
+            return _cached
 
     gas = [sp for sp in species_list if sp.is_gas]
     cond = [sp for sp in species_list if sp.is_condensed] if include_condensed else []
@@ -277,7 +293,7 @@ def solve_equilibrium(
     H_mix = mixture_enthalpy(all_sp, n_sol, T)
     S_mix = mixture_entropy(all_sp, n_sol, T, P)
 
-    return EquilibriumResult(
+    eq_result = EquilibriumResult(
         converged=converged,
         iterations=res.nit,
         T=T, P=P,
@@ -293,6 +309,11 @@ def solve_equilibrium(
         entropy=S_mix,
         problem_type='TP',
     )
+
+    if _cache is not None and _cache_key is not None:
+        _cache.put(_cache_key, eq_result)
+
+    return eq_result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -312,6 +333,7 @@ def solve_equilibrium_HP(
     logger: Optional[IterationLogger] = None,
     tol_H: float = 1e-3,        # отн. невязка по энтальпии
     max_outer: int = 60,
+    use_cache: bool = True,
 ) -> EquilibriumResult:
     """
     Находит равновесие при заданных H и P.
@@ -327,6 +349,17 @@ def solve_equilibrium_HP(
     """
     if logger is None:
         logger = NullLogger()
+
+    # ── кэш равновесного состава для HP-задачи ─────────────────────────
+    _cache = get_global_cache() if use_cache else None
+    _cache_key = None
+    if _cache is not None:
+        _cache_key = _cache.make_key(
+            'HP', species_list, element_abundances, H_target, P, include_condensed,
+        )
+        _cached = _cache.get(_cache_key)
+        if _cached is not None:
+            return _cached
 
     if logger.enabled:
         logger.section(f'HP-задача:  H = {H_target:.4f} Дж,  P = {P:.4f} Па')
@@ -419,6 +452,9 @@ def solve_equilibrium_HP(
         print(f"  HP {status}: T_final = {last_result.T:.2f} К, "
               f"H = {last_result.enthalpy:.4e} Дж (цель {H_target:.4e})")
 
+    if _cache is not None and _cache_key is not None:
+        _cache.put(_cache_key, last_result)
+
     return last_result
 
 
@@ -439,6 +475,7 @@ def solve_equilibrium_SP(
     logger: Optional[IterationLogger] = None,
     tol_S: float = 1e-4,
     max_outer: int = 60,
+    use_cache: bool = True,
 ) -> EquilibriumResult:
     """
     Находит равновесие при заданных S и P.
@@ -449,6 +486,17 @@ def solve_equilibrium_SP(
     """
     if logger is None:
         logger = NullLogger()
+
+    # ── кэш равновесного состава для SP-задачи ─────────────────────────
+    _cache = get_global_cache() if use_cache else None
+    _cache_key = None
+    if _cache is not None:
+        _cache_key = _cache.make_key(
+            'SP', species_list, element_abundances, S_target, P, include_condensed,
+        )
+        _cached = _cache.get(_cache_key)
+        if _cached is not None:
+            return _cached
 
     if logger.enabled:
         logger.section(f'SP-задача:  S = {S_target:.4f} Дж/К,  P = {P:.4f} Па')
@@ -532,5 +580,8 @@ def solve_equilibrium_SP(
         status = "сошлось ✓" if converged else "НЕ сошлось ✗"
         print(f"  SP {status}: T_final = {last_result.T:.2f} К, "
               f"S = {last_result.entropy:.4e} Дж/К (цель {S_target:.4e})")
+
+    if _cache is not None and _cache_key is not None:
+        _cache.put(_cache_key, last_result)
 
     return last_result
