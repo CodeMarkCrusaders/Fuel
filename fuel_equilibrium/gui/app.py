@@ -52,7 +52,7 @@ if _missing:
 # Импорт решателей (всё через пакет fuel_equilibrium)
 from ..rocket.nozzle_flow import (
     Propellant, StationResult, RocketPerformance,
-    solve_rocket_nozzle,
+    solve_rocket_nozzle, stoichiometric_OF,
 )
 from ..rocket.nozzle_geometry import (
     build_conical_nozzle, build_profiled_nozzle,
@@ -595,59 +595,161 @@ class NozzleSolverWorker(QThread):
         self.solver = solver
         self.species_db = species_db
 
+    def _solve_for_of(self, of_ratio: float):
+        """Один прогон решателя сопла при заданном массовом O/F (Km)."""
+        p = self.params
+        # Внутри окислителя/горючего «масса» задаёт долю компонента (0.001..1).
+        # Суммарное O/F (Km) задаётся отдельно и не зависит от этих долей.
+        ox_components = p['ox_components']  # List[Dict{'name', 'mass', 'T'}]
+        fu_components = p['fuel_components']
+        if not ox_components or not fu_components:
+            raise ValueError("Не заданы компоненты окислителя и/или горючего.")
+
+        of_ratio = max(float(of_ratio), 1e-9)
+
+        # Нормировка на 1 кг суммарной смеси по заданному O/F.
+        fuel_mass_kg = 1.0 / (1.0 + of_ratio)
+        oxidizer_mass_kg = of_ratio / (1.0 + of_ratio)
+
+        # На текущем этапе решатель принимает по одному «эквивалентному» компоненту
+        # окислителя и горючего; берем первый в каждом списке.
+        ox_comp = ox_components[0]
+        ox_T = ox_comp['T'] if ox_comp['T'] > 0 else None
+        ox = Propellant(name=ox_comp['name'], mass_kg=oxidizer_mass_kg, T_K=ox_T)
+
+        fu_comp = fu_components[0]
+        fu_T = fu_comp['T'] if fu_comp['T'] > 0 else None
+        fu = Propellant(name=fu_comp['name'], mass_kg=fuel_mass_kg, T_K=fu_T)
+
+        if self.solver == 'cea':
+            perf = solve_rocket_nozzle_cea(
+                oxidizer=ox, fuel=fu,
+                P_chamber=p['P_chamber'],
+                P_exit=p['P_exit'],
+                n_intermediate_stations=p.get('n_inter', 5),
+                section_density_subsonic=p.get('density_sub', 1.0),
+                section_density_critical=p.get('density_crit', 1.0),
+                section_density_supersonic=p.get('density_sup', 1.0),
+                include_condensed=p.get('include_condensed', False),
+                verbose=False,
+                progress_cb=lambda s: self.progress.emit(s),
+            )
+        else:
+            perf = solve_rocket_nozzle(
+                oxidizer=ox, fuel=fu,
+                P_chamber=p['P_chamber'],
+                P_exit=p['P_exit'],
+                species_db=self.species_db,
+                n_intermediate_stations=p.get('n_inter', 5),
+                section_density_subsonic=p.get('density_sub', 1.0),
+                section_density_critical=p.get('density_crit', 1.0),
+                section_density_supersonic=p.get('density_sup', 1.0),
+                include_condensed=p.get('include_condensed', True),
+                verbose=False,
+                logger=NullLogger(),
+            )
+        return perf
+
+    def _find_optimum_of(self):
+        """Поиск оптимального Km (массовое O/F), максимизирующего удельный импульс Isp.
+
+        Стратегия: грубое сканирование сетки (геометрическое распределение точек
+        вокруг стехиометрического Km0) + уточнение методом золотого сечения.
+        Возвращает (best_perf, best_of).
+        """
+        p = self.params
+
+        def isp_of(of_ratio):
+            perf = self._solve_for_of(of_ratio)
+            return perf, (perf.Isp_s if perf and perf.Isp_s is not None
+                          and math.isfinite(perf.Isp_s) else -1.0)
+
+        # Диапазон поиска: вокруг стехиометрии Km0, если она известна.
+        km0 = p.get('of_stoich', float('nan'))
+        if km0 is not None and math.isfinite(km0) and km0 > 0:
+            of_lo = 0.2 * km0
+            of_hi = 2.2 * km0
+        else:
+            of_lo, of_hi = 0.3, 20.0
+
+        # Грубое сканирование (геометрическая сетка из 9 точек).
+        n_grid = 9
+        grid = [of_lo * (of_hi / of_lo) ** (i / (n_grid - 1)) for i in range(n_grid)]
+        best_perf = None
+        best_of = None
+        best_isp = -1.0
+        cache = {}
+        for k, of in enumerate(grid):
+            self.progress.emit(f"Поиск оптимума Km: сетка {k + 1}/{n_grid} (Km={of:.3f})...")
+            try:
+                perf, isp = isp_of(of)
+            except Exception:
+                continue
+            cache[of] = (perf, isp)
+            if isp > best_isp:
+                best_isp, best_perf, best_of = isp, perf, of
+
+        if best_of is None:
+            # Сетка не дала валидных решений — fallback к Km0 или 1.0.
+            fallback_of = km0 if (km0 and math.isfinite(km0) and km0 > 0) else 1.0
+            return self._solve_for_of(fallback_of), fallback_of
+
+        # Уточнение методом золотого сечения вокруг лучшей точки сетки.
+        idx = grid.index(best_of)
+        a = grid[max(0, idx - 1)]
+        b = grid[min(n_grid - 1, idx + 1)]
+        gr = (math.sqrt(5.0) - 1.0) / 2.0  # ≈0.618
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+
+        def eval_of(of):
+            if of in cache:
+                return cache[of]
+            try:
+                perf, isp = isp_of(of)
+            except Exception:
+                perf, isp = None, -1.0
+            cache[of] = (perf, isp)
+            return perf, isp
+
+        pc, fc = eval_of(c)
+        pd, fd = eval_of(d)
+        for it in range(6):
+            self.progress.emit(f"Уточнение оптимума Km: итерация {it + 1}/6...")
+            if fc >= fd:
+                b, d, fd, pd = d, c, fc, pc
+                c = b - gr * (b - a)
+                pc, fc = eval_of(c)
+            else:
+                a, c, fc, pc = c, d, fd, pd
+                d = a + gr * (b - a)
+                pd, fd = eval_of(d)
+
+        # Выбор лучшего из всех просчитанных точек.
+        for of, (perf, isp) in cache.items():
+            if perf is not None and isp > best_isp:
+                best_isp, best_perf, best_of = isp, perf, of
+
+        self.progress.emit(f"Оптимум найден: Km = {best_of:.4f} (Isp = {best_isp:.2f} с).")
+        return best_perf, best_of
+
     def run(self):
         try:
             p = self.params
-            
-            # Внутри окислителя/горючего «масса» задаёт долю компонента (0.001..1).
-            # Суммарное O/F задаётся отдельно и не зависит от этих долей.
-            ox_components = p['ox_components']  # List[Dict{'name', 'mass', 'T'}]
-            fu_components = p['fuel_components']
-            of_ratio = max(float(p.get('of_ratio', 1.0)), 1e-9)
+            if not p.get('ox_components') or not p.get('fuel_components'):
+                raise ValueError("Не заданы компоненты окислителя и/или горючего.")
 
-            # Нормировка на 1 кг суммарной смеси по заданному O/F.
-            fuel_mass_kg = 1.0 / (1.0 + of_ratio)
-            oxidizer_mass_kg = of_ratio / (1.0 + of_ratio)
-
-            # На текущем этапе решатель принимает по одному «эквивалентному» компоненту
-            # окислителя и горючего; берем первый в каждом списке.
-            ox_comp = ox_components[0]
-            ox_T = ox_comp['T'] if ox_comp['T'] > 0 else None
-            ox = Propellant(name=ox_comp['name'], mass_kg=oxidizer_mass_kg, T_K=ox_T)
-
-            fu_comp = fu_components[0]
-            fu_T = fu_comp['T'] if fu_comp['T'] > 0 else None
-            fu = Propellant(name=fu_comp['name'], mass_kg=fuel_mass_kg, T_K=fu_T)
-
-            if self.solver == 'cea':
-                self.progress.emit("Запуск CEA-решателя (Cantera)...")
-                perf = solve_rocket_nozzle_cea(
-                    oxidizer=ox, fuel=fu,
-                    P_chamber=p['P_chamber'],
-                    P_exit=p['P_exit'],
-                    n_intermediate_stations=p.get('n_inter', 5),
-                    section_density_subsonic=p.get('density_sub', 1.0),
-                    section_density_critical=p.get('density_crit', 1.0),
-                    section_density_supersonic=p.get('density_sup', 1.0),
-                    include_condensed=p.get('include_condensed', False),
-                    verbose=False,
-                    progress_cb=lambda s: self.progress.emit(s),
-                )
+            if p.get('optimize_of'):
+                self.progress.emit("Поиск оптимального соотношения компонентов (max Isp)...")
+                perf, _best_of = self._find_optimum_of()
             else:
-                self.progress.emit("Запуск собственного решателя (Gibbs)...")
-                perf = solve_rocket_nozzle(
-                    oxidizer=ox, fuel=fu,
-                    P_chamber=p['P_chamber'],
-                    P_exit=p['P_exit'],
-                    species_db=self.species_db,
-                    n_intermediate_stations=p.get('n_inter', 5),
-                    section_density_subsonic=p.get('density_sub', 1.0),
-                    section_density_critical=p.get('density_crit', 1.0),
-                    section_density_supersonic=p.get('density_sup', 1.0),
-                    include_condensed=p.get('include_condensed', True),
-                    verbose=False,
-                    logger=NullLogger(),
-                )
+                of_ratio = float(p.get('of_ratio', 1.0))
+                if self.solver == 'cea':
+                    self.progress.emit("Запуск CEA-решателя (Cantera)...")
+                else:
+                    self.progress.emit("Запуск собственного решателя (Gibbs)...")
+                perf = self._solve_for_of(of_ratio)
+
             self.finished_ok.emit(perf)
         except Exception as e:
             tb = traceback.format_exc()
@@ -761,25 +863,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixture_widget = MixturePropellantWidget(species_db=None)
         self.mixture_widget.mixture_changed.connect(self._update_of_from_mixture)
         gb_fuel_layout.addWidget(self.mixture_widget)
-        
-        # Отношение O/F задаётся отдельно от внутритопливных долей компонентов.
-        self.sp_of_ratio = QtWidgets.QDoubleSpinBox()
-        self.sp_of_ratio.setRange(0.01, 1000.0)
-        self.sp_of_ratio.setDecimals(4)
-        self.sp_of_ratio.setValue(7.9370)
-        self.sp_of_ratio.setSingleStep(0.1)
-        self.sp_of_ratio.setToolTip(
-            "Массовое отношение окислителя к горючему (O/F).\n"
-            "Это значение задаётся отдельно от долей компонентов внутри\n"
-            "окислителя и горючего."
-        )
-        self.sp_of_ratio.valueChanged.connect(self._update_of_from_mixture)
 
-        self.lbl_of = QtWidgets.QLabel("O/F = 7.9370")
+        # ─── Соотношение компонентов топлива ───
+        # Три режима задания:
+        #   Km     — массовое отношение расхода окислителя к расходу горючего (O/F);
+        #   α      — отношение Km к стехиометрическому Km0 (α = Km/Km0);
+        #   Оптимум — Km подбирается автоматически по максимуму удельного импульса Isp.
+        self.cb_mix_mode = QtWidgets.QComboBox()
+        self.cb_mix_mode.addItems([
+            "Km (массовое O/F)",
+            "α (Km/Km0)",
+            "Оптимум (max Isp)",
+        ])
+        self.cb_mix_mode.setToolTip(
+            "Способ задания соотношения компонентов топлива:\n"
+            "  • Km — массовое отношение расхода окислителя к расходу горючего;\n"
+            "  • α — отношение Km к стехиометрическому Km0 (α = Km/Km0);\n"
+            "  • Оптимум — Km подбирается по максимуму удельного импульса Isp."
+        )
+        self.cb_mix_mode.currentIndexChanged.connect(self._on_mix_mode_changed)
+
+        # Поле значения — пустое по умолчанию (QLineEdit вместо QDoubleSpinBox).
+        self.ed_mix_value = QtWidgets.QLineEdit()
+        self.ed_mix_value.setPlaceholderText("Km (O/F)")
+        self.ed_mix_value.setValidator(
+            QtGui.QDoubleValidator(0.0, 1e6, 6, self.ed_mix_value)
+        )
+        self.ed_mix_value.setToolTip(
+            "Числовое значение соотношения компонентов согласно выбранному режиму.\n"
+            "В режиме «Оптимум» поле не используется."
+        )
+        self.ed_mix_value.textChanged.connect(self._update_of_from_mixture)
+
+        # Информационная метка: показывает Km0 / результирующий Km.
+        self.lbl_of = QtWidgets.QLabel("Km0 = —")
         self.lbl_of.setStyleSheet("color: #cc785c; font-weight: bold;")
+
         of_layout = QtWidgets.QHBoxLayout()
-        of_layout.addWidget(QtWidgets.QLabel("Заданное O/F:"))
-        of_layout.addWidget(self.sp_of_ratio)
+        of_layout.addWidget(QtWidgets.QLabel("Соотношение:"))
+        of_layout.addWidget(self.cb_mix_mode)
+        of_layout.addWidget(self.ed_mix_value)
         of_layout.addWidget(self.lbl_of)
         of_layout.addStretch()
         gb_fuel_layout.addLayout(of_layout)
@@ -793,30 +916,27 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.sec_fuel)
 
         # ─── Условия + газодинамические настройки по вкладкам ───
-        self.sp_Pc = QtWidgets.QDoubleSpinBox()
-        self.sp_Pc.setRange(0.000001, 1e6)
-        self.sp_Pc.setDecimals(6)
-        self.sp_Pc.setValue(10.0)
-        self.sp_Pc.setSingleStep(0.5)
+        # Давления — пустые поля по умолчанию (QLineEdit вместо QDoubleSpinBox).
+        self.ed_Pc = QtWidgets.QLineEdit()
+        self.ed_Pc.setPlaceholderText("давление в камере")
+        self.ed_Pc.setValidator(QtGui.QDoubleValidator(1e-9, 1e9, 6, self.ed_Pc))
         # контейнер со списком единиц
         w_Pc = QtWidgets.QWidget()
         h_Pc = QtWidgets.QHBoxLayout(w_Pc)
         h_Pc.setContentsMargins(0, 0, 0, 0)
-        h_Pc.addWidget(self.sp_Pc)
+        h_Pc.addWidget(self.ed_Pc)
         self.cb_Pc_unit = QtWidgets.QComboBox()
         self.cb_Pc_unit.addItems(["Па", "кПа", "МПа", "бар", "атм"])
         self.cb_Pc_unit.setCurrentText("МПа")
         h_Pc.addWidget(self.cb_Pc_unit)
 
-        self.sp_Pe = QtWidgets.QDoubleSpinBox()
-        self.sp_Pe.setRange(0.0000001, 1e6)
-        self.sp_Pe.setDecimals(6)
-        self.sp_Pe.setValue(0.1013)
-        self.sp_Pe.setSingleStep(0.01)
+        self.ed_Pe = QtWidgets.QLineEdit()
+        self.ed_Pe.setPlaceholderText("давление на срезе")
+        self.ed_Pe.setValidator(QtGui.QDoubleValidator(1e-9, 1e9, 6, self.ed_Pe))
         w_Pe = QtWidgets.QWidget()
         h_Pe = QtWidgets.QHBoxLayout(w_Pe)
         h_Pe.setContentsMargins(0, 0, 0, 0)
-        h_Pe.addWidget(self.sp_Pe)
+        h_Pe.addWidget(self.ed_Pe)
         self.cb_Pe_unit = QtWidgets.QComboBox()
         self.cb_Pe_unit.addItems(["Па", "кПа", "МПа", "бар", "атм"])
         self.cb_Pe_unit.setCurrentText("МПа")
@@ -2276,13 +2396,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mixture_widget.oxidizer_list.species_db = self.species_db
             self.mixture_widget.fuel_list.species_db = self.species_db
             
-            # Инициализировать стандартной смесью (внутренние доли 1.0/1.0,
-            # массовое O/F задаётся отдельно через self.sp_of_ratio).
+            # Инициализировать стандартной смесью (внутренние доли 1.0/1.0).
+            # По стандарту поле соотношения остаётся пустым — пользователь
+            # задаёт Km/α сам либо выбирает режим «Оптимум».
             self.mixture_widget.set_mixture({
                 'ox_components': [{'name': 'O2(L)', 'mass': 1.000, 'T': 0}],
                 'fuel_components': [{'name': 'H2(L)', 'mass': 1.000, 'T': 0}],
             })
-            self.sp_of_ratio.setValue(7.9370)
             self._update_of_from_mixture()
             
             self.statusBar().showMessage(
@@ -2295,13 +2415,114 @@ class MainWindow(QtWidgets.QMainWindow):
         """(Устарело) Обновить O/F (заменено на _update_of_from_mixture)."""
         pass
 
-    def _update_of_from_mixture(self):
-        """Обновить подпись O/F (задаётся отдельным полем)."""
-        of = self.sp_of_ratio.value()
+    @staticmethod
+    def _get_float_field(widget) -> Optional[float]:
+        """Прочитать число из QLineEdit. Возвращает None, если пусто/некорректно/≤0."""
+        try:
+            txt = widget.text().strip().replace(',', '.')
+        except Exception:
+            return None
+        if not txt:
+            return None
+        try:
+            val = float(txt)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(val) or val <= 0:
+            return None
+        return val
+
+    def _mix_mode(self) -> str:
+        """Текущий режим задания соотношения: 'km' | 'alpha' | 'optimum'."""
+        idx = self.cb_mix_mode.currentIndex()
+        return {0: 'km', 1: 'alpha', 2: 'optimum'}.get(idx, 'km')
+
+    def _get_mix_value(self) -> Optional[float]:
+        """Числовое значение поля соотношения (Km или α), либо None."""
+        return self._get_float_field(self.ed_mix_value)
+
+    def _compute_km0(self) -> float:
+        """Стехиометрическое соотношение Km0 для текущей смеси.
+
+        Возвращает NaN, если база веществ не загружена либо компоненты не заданы.
+        """
+        if not self.species_db:
+            return float('nan')
         mixture = self.mixture_widget.get_mixture()
-        ox_parts = sum(c['mass'] for c in mixture['ox_components'])
-        fu_parts = sum(c['mass'] for c in mixture['fuel_components'])
-        self.lbl_of.setText(f"O/F = {of:.4f}  (доли: OX={ox_parts:.3f}, FUEL={fu_parts:.3f})")
+        ox_names = [c['name'] for c in mixture.get('ox_components', []) if c.get('name')]
+        fu_names = [c['name'] for c in mixture.get('fuel_components', []) if c.get('name')]
+        if not ox_names or not fu_names:
+            return float('nan')
+        try:
+            oxidizers = [self.species_db[n] for n in ox_names if n in self.species_db]
+            fuels = [self.species_db[n] for n in fu_names if n in self.species_db]
+            if not oxidizers or not fuels:
+                return float('nan')
+            return stoichiometric_OF(oxidizers, fuels)
+        except Exception:
+            return float('nan')
+
+    def _on_mix_mode_changed(self):
+        """Реакция на смену режима соотношения компонентов."""
+        mode = self._mix_mode()
+        if mode == 'optimum':
+            self.ed_mix_value.setEnabled(False)
+            self.ed_mix_value.setPlaceholderText("подбирается автоматически")
+        else:
+            self.ed_mix_value.setEnabled(True)
+            self.ed_mix_value.setPlaceholderText(
+                "Km (O/F)" if mode == 'km' else "α (Km/Km0)"
+            )
+        self._update_of_from_mixture()
+
+    def _update_of_from_mixture(self):
+        """Обновить информационную подпись (Km0 / результирующий Km / α)."""
+        mode = self._mix_mode()
+        km0 = self._compute_km0()
+        km0_str = f"{km0:.4f}" if math.isfinite(km0) else "—"
+
+        if mode == 'optimum':
+            self.lbl_of.setText(f"Km0 = {km0_str}  (Km → max Isp)")
+            return
+
+        val = self._get_mix_value()
+        if mode == 'km':
+            if val is None:
+                self.lbl_of.setText(f"Km0 = {km0_str}")
+            elif math.isfinite(km0) and km0 > 0:
+                self.lbl_of.setText(
+                    f"Km = {val:.4f}, α = {val / km0:.4f}  (Km0 = {km0_str})"
+                )
+            else:
+                self.lbl_of.setText(f"Km = {val:.4f}  (Km0 = {km0_str})")
+        else:  # alpha
+            if val is None:
+                self.lbl_of.setText(f"Km0 = {km0_str}")
+            elif math.isfinite(km0) and km0 > 0:
+                self.lbl_of.setText(
+                    f"α = {val:.4f}, Km = {val * km0:.4f}  (Km0 = {km0_str})"
+                )
+            else:
+                self.lbl_of.setText(f"α = {val:.4f}  (Km0 = —, нужна база веществ)")
+
+    def _resolve_of_ratio(self) -> Optional[float]:
+        """Итоговое массовое O/F (Km) для расчёта.
+
+        Возвращает None в режиме «Оптимум» либо если значение не задано.
+        """
+        mode = self._mix_mode()
+        if mode == 'optimum':
+            return None
+        val = self._get_mix_value()
+        if val is None:
+            return None
+        if mode == 'km':
+            return val
+        # alpha-режим: Km = α · Km0
+        km0 = self._compute_km0()
+        if not (math.isfinite(km0) and km0 > 0):
+            return None
+        return val * km0
 
     def _open_component_selector(self):
         """(Устарено) Открыть диалог выбора компонентов."""
@@ -2374,12 +2595,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 return val * 101325.0
             return val
 
+        # ─── Валидация обязательных (пустых по умолчанию) полей ───
+        mix_mode = self._mix_mode()
+        optimize_of = (mix_mode == 'optimum')
+        of_ratio = self._resolve_of_ratio()  # None в режиме «Оптимум» или если пусто
+
+        P_chamber = self._get_float_field(self.ed_Pc)
+        P_exit = self._get_float_field(self.ed_Pe)
+
+        missing = []
+        if P_chamber is None:
+            missing.append("давление в камере (Pк)")
+        if P_exit is None:
+            missing.append("давление на срезе (Pс)")
+        if not optimize_of and of_ratio is None:
+            if mix_mode == 'km':
+                missing.append("соотношение компонентов Km")
+            else:  # alpha
+                km0 = self._compute_km0()
+                if not (math.isfinite(km0) and km0 > 0):
+                    missing.append("α (требуется загруженная база для расчёта Km0)")
+                else:
+                    missing.append("соотношение компонентов α")
+
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self, "Заполните поля",
+                "Не заданы обязательные параметры:\n  • " + "\n  • ".join(missing)
+            )
+            return
+
         params = {
             'ox_components': mixture['ox_components'],
             'fuel_components': mixture['fuel_components'],
-            'of_ratio': self.sp_of_ratio.value(),
-            'P_chamber': pv_to_pa(self.sp_Pc.value(), self.cb_Pc_unit.currentText()),
-            'P_exit': pv_to_pa(self.sp_Pe.value(), self.cb_Pe_unit.currentText()),
+            'of_ratio': of_ratio if of_ratio is not None else 1.0,
+            'optimize_of': optimize_of,
+            'of_stoich': self._compute_km0(),
+            'P_chamber': pv_to_pa(P_chamber, self.cb_Pc_unit.currentText()),
+            'P_exit': pv_to_pa(P_exit, self.cb_Pe_unit.currentText()),
             'n_inter': self.sp_n_inter.value(),
             'density_sub': self.sp_density_sub.value(),
             'density_crit': self.sp_density_crit.value(),
@@ -3076,7 +3329,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ox_desc, fu_desc = self._get_mixture_summary()
                 w.writerow([f'# Окислитель: {ox_desc}'])
                 w.writerow([f'# Горючее: {fu_desc}'])
-                w.writerow([f'# Pc = {self.sp_Pc.value()} МПа, Pe = {self.sp_Pe.value()} МПа, O/F(set) = {self.sp_of_ratio.value():.4f}'])
+                w.writerow([f'# Pc = {self.perf.stations[0].P_Pa / 1e6:.4f} МПа, '
+                            f'Pe = {self.perf.stations[-1].P_Pa / 1e6:.4f} МПа, '
+                            f'Km = {self.perf.O_F:.4f}'])
                 w.writerow([f'# O/F = {self.perf.O_F:.4f}, '
                             f'alpha = {self.perf.alpha:.4f}, '
                             f'Isp = {self.perf.Isp_s:.4f} c, '
@@ -3186,7 +3441,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f.write(f"# Amesim XY export from {APP_NAME}\n")
                 ox_desc, fu_desc = self._get_mixture_summary()
                 f.write(f"# {ox_desc} / {fu_desc},  "
-                        f"Pc={self.sp_Pc.value()} MPa, Pe={self.sp_Pe.value()} MPa\n")
+                        f"Pc={self.perf.stations[0].P_Pa / 1e6:.4f} MPa, "
+                        f"Pe={self.perf.stations[-1].P_Pa / 1e6:.4f} MPa\n")
                 f.write(f"# O/F = {self.perf.O_F:.4f},  Isp = {self.perf.Isp_s:.4f} s,  "
                         f"C* = {self.perf.Cstar_m_per_s:.4f} m/s\n")
                 f.write(f"# Table format: XY\n")
@@ -3221,9 +3477,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cfg = {
             'mixture': self.mixture_widget.get_mixture(),
-            'of_ratio': self.sp_of_ratio.value(),
-            'Pc_MPa': self.sp_Pc.value(),
-            'Pe_MPa': self.sp_Pe.value(),
+            'mix_mode': self._mix_mode(),
+            'mix_value': self.ed_mix_value.text().strip(),
+            'Pc_field': self.ed_Pc.text().strip(),
+            'Pe_field': self.ed_Pe.text().strip(),
+            'Pc_unit': self.cb_Pc_unit.currentText(),
+            'Pe_unit': self.cb_Pe_unit.currentText(),
             'n_inter': self.sp_n_inter.value(),
             'density_sub': self.sp_density_sub.value(),
             'density_crit': self.sp_density_crit.value(),
@@ -3310,9 +3569,40 @@ class MainWindow(QtWidgets.QMainWindow):
                         'T': cfg.get('fu_T', 0.0),
                     }],
                 })
-            self.sp_of_ratio.setValue(cfg.get('of_ratio', 7.9370))
-            self.sp_Pc.setValue(cfg.get('Pc_MPa', 10.0))
-            self.sp_Pe.setValue(cfg.get('Pe_MPa', 0.1013))
+            # ─── Соотношение компонентов (режим + значение) ───
+            mode_map = {'km': 0, 'alpha': 1, 'optimum': 2}
+            self.cb_mix_mode.setCurrentIndex(
+                mode_map.get(cfg.get('mix_mode', 'km'), 0)
+            )
+            # Обратная совместимость со старым форматом ('of_ratio').
+            if 'mix_value' in cfg:
+                self.ed_mix_value.setText(str(cfg.get('mix_value', '')))
+            elif 'of_ratio' in cfg:
+                self.cb_mix_mode.setCurrentIndex(0)  # старый формат = Km
+                self.ed_mix_value.setText(f"{cfg.get('of_ratio'):.4f}")
+            else:
+                self.ed_mix_value.clear()
+
+            # ─── Давления (поле + единица) ───
+            if 'Pc_field' in cfg:
+                self.ed_Pc.setText(str(cfg.get('Pc_field', '')))
+                self.cb_Pc_unit.setCurrentText(cfg.get('Pc_unit', 'МПа'))
+            elif 'Pc_MPa' in cfg:
+                self.ed_Pc.setText(f"{cfg.get('Pc_MPa'):.6f}")
+                self.cb_Pc_unit.setCurrentText('МПа')
+            else:
+                self.ed_Pc.clear()
+
+            if 'Pe_field' in cfg:
+                self.ed_Pe.setText(str(cfg.get('Pe_field', '')))
+                self.cb_Pe_unit.setCurrentText(cfg.get('Pe_unit', 'МПа'))
+            elif 'Pe_MPa' in cfg:
+                self.ed_Pe.setText(f"{cfg.get('Pe_MPa'):.6f}")
+                self.cb_Pe_unit.setCurrentText('МПа')
+            else:
+                self.ed_Pe.clear()
+
+            self._on_mix_mode_changed()
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
             self.sp_density_sub.setValue(cfg.get('density_sub', 1.0))
             self.sp_density_crit.setValue(cfg.get('density_crit', 1.0))
