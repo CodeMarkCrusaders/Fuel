@@ -61,6 +61,9 @@ from ..rocket.nozzle_geometry import (
     build_rpa_parabolic_nozzle, rao_reference_length_15deg, estimate_bell_angles,
 )
 from ..rocket.nozzle_flow_2d import solve_nozzle_2d, Nozzle2DResult
+from ..rocket.analytic_sizing import (
+    AnalyticSizingInput, AnalyticSizingResult, compute_analytic_sizing,
+)
 from ..io.reporting import print_nozzle_table
 from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
@@ -840,6 +843,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs_geometry.addTab(self.tab_geometry, "Контур сопла (Size & Geometry)")
         self.tabs.addTab(self.tabs_geometry, "Геометрия")
 
+        # ═══ Группа 4: Аналитический (инженерный) расчёт — АЛЬТЕРНАТИВА ═══
+        # Инженерная методика РПА/Добровольского: по тяге и термодинамическим
+        # данным напрямую определяются C*, расходы, площади и геометрия камеры.
+        self.tabs_analytic = QtWidgets.QTabWidget()
+        self.tabs_analytic.setObjectName("subtabs")
+        self.tab_analytic = self._build_analytic_tab()
+        self.tabs_analytic.addTab(self.tab_analytic, "Профиль сопла по тяге (РПА)")
+        self.tabs.addTab(self.tabs_analytic, "Аналитический расчёт")
+
         # По умолчанию слайдер выставлен так, чтобы панель настроек слева была
         # полностью видна (не обрезалась справа), а результаты занимали остаток.
         splitter.setStretchFactor(0, 0)
@@ -1134,6 +1146,29 @@ class MainWindow(QtWidgets.QMainWindow):
         gb_geom = QtWidgets.QGroupBox("Геометрия сопла (для оси X)")
         form4 = QtWidgets.QFormLayout(gb_geom)
         form4.setSpacing(6)
+
+        # Размер камеры сгорания можно задать ОДНИМ из двух способов
+        # (взаимоисключающе, как в RPA):
+        #   • Длина камеры L_к (м) — напрямую;
+        #   • Характеристическая длина L* = V_к / A_кр (м) — объёмная мера,
+        #     из неё длина камеры выводится по площади горловины и камеры.
+        w_mode = QtWidgets.QWidget()
+        h_mode = QtWidgets.QHBoxLayout(w_mode)
+        h_mode.setContentsMargins(0, 0, 0, 0)
+        self.rb_chamber_len = QtWidgets.QRadioButton("Длина камеры")
+        self.rb_chamber_lstar = QtWidgets.QRadioButton("Характеристическая L*")
+        self.rb_chamber_len.setChecked(True)
+        self.rb_chamber_len.setToolTip(
+            "Задать размер камеры напрямую длиной L_к (м)."
+        )
+        self.rb_chamber_lstar.setToolTip(
+            "Задать размер камеры характеристической длиной L* = V_к / A_кр (м).\n"
+            "Длина камеры вычисляется по L*, площади горловины и площади камеры."
+        )
+        h_mode.addWidget(self.rb_chamber_len)
+        h_mode.addWidget(self.rb_chamber_lstar)
+        form4.addRow("Размер камеры:", w_mode)
+
         self.sp_L_chamber = QtWidgets.QDoubleSpinBox()
         self.sp_L_chamber.setRange(0.000, 1000.0)
         self.sp_L_chamber.setDecimals(4)
@@ -1147,6 +1182,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_L_chamber_unit.addItems(["м", "см", "мм"])
         self.cb_L_chamber_unit.setCurrentText("м")
         h_L_ch.addWidget(self.cb_L_chamber_unit)
+
+        # Характеристическая длина L* (альтернатива длине камеры)
+        self.sp_L_star = QtWidgets.QDoubleSpinBox()
+        self.sp_L_star.setRange(0.000, 1000.0)
+        self.sp_L_star.setDecimals(4)
+        self.sp_L_star.setValue(1.000)   # типичная L* для O2/CH4 ~0.8…1.2 м
+        self.sp_L_star.setSingleStep(0.05)
+        w_L_star = QtWidgets.QWidget()
+        h_L_star = QtWidgets.QHBoxLayout(w_L_star)
+        h_L_star.setContentsMargins(0, 0, 0, 0)
+        h_L_star.addWidget(self.sp_L_star)
+        self.cb_L_star_unit = QtWidgets.QComboBox()
+        self.cb_L_star_unit.addItems(["м", "см", "мм"])
+        self.cb_L_star_unit.setCurrentText("м")
+        h_L_star.addWidget(self.cb_L_star_unit)
 
         self.sp_L_conv = QtWidgets.QDoubleSpinBox()
         self.sp_L_conv.setRange(0.000, 1000.0)
@@ -1176,10 +1226,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_L_div_unit.setCurrentText("м")
         h_L_di.addWidget(self.cb_L_div_unit)
 
-        form4.addRow("Длина камеры:", w_L_ch)
+        self.lbl_L_chamber = QtWidgets.QLabel("Длина камеры:")
+        self.lbl_L_star = QtWidgets.QLabel("Характеристическая L*:")
+        form4.addRow(self.lbl_L_chamber, w_L_ch)
+        form4.addRow(self.lbl_L_star, w_L_star)
         form4.addRow("Конфузор:", w_L_co)
         form4.addRow("Дивергент:", w_L_di)
+
+        # Взаимоисключающее переключение «Длина камеры» / «L*»:
+        # активным остаётся только один ввод, второй — заблокирован.
+        self.rb_chamber_len.toggled.connect(self._on_chamber_size_mode_changed)
+        self.rb_chamber_lstar.toggled.connect(self._on_chamber_size_mode_changed)
+        self._on_chamber_size_mode_changed()
+
         self.form_input_geom.addWidget(gb_geom)
+
+        # ─── Потери / реализуемые КПД (Estimated delivered performance) ───
+        # Аналог панели RPA «Estimated delivered performance»:
+        #   • Reaction efficiency  η_р  — КПД процессов в камере сгорания
+        #     (неполнота сгорания, неравномерность смешения и т.п.);
+        #   • Nozzle efficiency    η_с  — КПД сопла (потери на трение,
+        #     рассеивание, неравновесность и т.п.);
+        #   • Overall efficiency   η_общ = η_р · η_с — суммарный КПД, на который
+        #     домножается идеальный (равновесный) удельный импульс/тяга.
+        gb_loss = QtWidgets.QGroupBox("Потери (реализуемые КПД)")
+        form_loss = QtWidgets.QFormLayout(gb_loss)
+        form_loss.setSpacing(6)
+
+        self.sp_eff_reaction = QtWidgets.QDoubleSpinBox()
+        self.sp_eff_reaction.setRange(0.0, 1.0)
+        self.sp_eff_reaction.setDecimals(4)
+        self.sp_eff_reaction.setSingleStep(0.001)
+        self.sp_eff_reaction.setValue(1.0)
+        self.sp_eff_reaction.setToolTip(
+            "КПД реакции (камеры сгорания) η_р: 0…1.\n"
+            "Учитывает неполноту/неравномерность сгорания.\n"
+            "1.0 — идеальный равновесный процесс."
+        )
+
+        self.sp_eff_nozzle = QtWidgets.QDoubleSpinBox()
+        self.sp_eff_nozzle.setRange(0.0, 1.0)
+        self.sp_eff_nozzle.setDecimals(4)
+        self.sp_eff_nozzle.setSingleStep(0.001)
+        self.sp_eff_nozzle.setValue(1.0)
+        self.sp_eff_nozzle.setToolTip(
+            "КПД сопла η_с: 0…1.\n"
+            "Учитывает потери на трение, рассеивание, неравновесность.\n"
+            "1.0 — идеальное изэнтропическое расширение."
+        )
+
+        # Суммарный КПД — вычисляемое поле (только чтение)
+        self.sp_eff_overall = QtWidgets.QDoubleSpinBox()
+        self.sp_eff_overall.setRange(0.0, 1.0)
+        self.sp_eff_overall.setDecimals(4)
+        self.sp_eff_overall.setValue(1.0)
+        self.sp_eff_overall.setReadOnly(True)
+        self.sp_eff_overall.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.sp_eff_overall.setToolTip(
+            "Суммарный КПД η_общ = η_р · η_с (вычисляется автоматически).\n"
+            "На него домножаются идеальные Isp / C* / тяга."
+        )
+
+        form_loss.addRow("КПД реакции η_р:", self.sp_eff_reaction)
+        form_loss.addRow("КПД сопла η_с:", self.sp_eff_nozzle)
+        form_loss.addRow("Суммарный η_общ:", self.sp_eff_overall)
+
+        self.sp_eff_reaction.valueChanged.connect(self._update_overall_efficiency)
+        self.sp_eff_nozzle.valueChanged.connect(self._update_overall_efficiency)
+        self._update_overall_efficiency()
+
+        self.form_input_geom.addWidget(gb_loss)
 
         # ─── Профиль по Добровольскому (выбор типа + ручной ввод геометрии) ───
         gb_prof = QtWidgets.QGroupBox("Профиль сопла (Добровольский, гл. 2)")
@@ -1612,6 +1728,366 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Вкладка «Аналитический расчёт профиля сопла» — АЛЬТЕРНАТИВА
+    # (инженерная методика РПА/Добровольского: по тяге и термоданным)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_analytic_tab(self) -> QtWidgets.QWidget:
+        """Альтернативный (инженерный) расчёт профиля сопла по заданной тяге.
+
+        В отличие от основного термодинамического (равновесного) расчёта здесь
+        размеры двигателя определяются «обратной» инженерной методикой:
+        задаются тяга в пустоте, давления, соотношение компонентов и
+        термодинамические показатели (Iуд, k, Rг, Tк) — и последовательно
+        вычисляются C*, расходы, площади критики/среза и геометрия камеры.
+        """
+        w = QtWidgets.QWidget()
+        root = QtWidgets.QHBoxLayout(w)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # ── Левая колонка: исходные данные ──
+        params = QtWidgets.QWidget()
+        pv = QtWidgets.QVBoxLayout(params)
+        pv.setContentsMargins(4, 4, 4, 4)
+        pv.setSpacing(10)
+        params.setMinimumWidth(360)
+        params.setMaximumWidth(440)
+
+        intro = QtWidgets.QLabel(
+            "Инженерная методика РПА / Добровольского.\n"
+            "Альтернатива термодинамическому расчёту: размеры двигателя\n"
+            "определяются по заданной тяге и термодинамическим данным."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#9aa0a6; font-size:9pt;")
+        pv.addWidget(intro)
+
+        # ── Группа: тяга и давления ──
+        gb_load = QtWidgets.QGroupBox("Тяга и давления")
+        fl = QtWidgets.QFormLayout(gb_load)
+        fl.setSpacing(6)
+
+        self.sp_an_thrust = QtWidgets.QDoubleSpinBox()
+        self.sp_an_thrust.setRange(1.0, 1.0e9)
+        self.sp_an_thrust.setDecimals(1)
+        self.sp_an_thrust.setValue(7_770_000.0)
+        self.sp_an_thrust.setSingleStep(10_000.0)
+        self.sp_an_thrust.setToolTip("Pн — тяга двигателя в пустоте, Н")
+
+        self.sp_an_pk = QtWidgets.QDoubleSpinBox()
+        self.sp_an_pk.setRange(0.001, 100.0)
+        self.sp_an_pk.setDecimals(4)
+        self.sp_an_pk.setValue(7.0)
+        self.sp_an_pk.setSingleStep(0.1)
+        self.sp_an_pk.setToolTip("pкс — давление в камере сгорания, МПа")
+
+        self.sp_an_pa = QtWidgets.QDoubleSpinBox()
+        self.sp_an_pa.setRange(0.00001, 10.0)
+        self.sp_an_pa.setDecimals(5)
+        self.sp_an_pa.setValue(0.0486)
+        self.sp_an_pa.setSingleStep(0.001)
+        self.sp_an_pa.setToolTip("pa — давление на срезе сопла, МПа")
+
+        fl.addRow("Pн (тяга в пустоте), Н:", self.sp_an_thrust)
+        fl.addRow("pк (камера), МПа:", self.sp_an_pk)
+        fl.addRow("pa (срез), МПа:", self.sp_an_pa)
+        pv.addWidget(gb_load)
+
+        # ── Группа: компоненты и термодинамика ──
+        gb_td = QtWidgets.QGroupBox("Термодинамические данные")
+        ft = QtWidgets.QFormLayout(gb_td)
+        ft.setSpacing(6)
+
+        self.sp_an_Km = QtWidgets.QDoubleSpinBox()
+        self.sp_an_Km.setRange(0.01, 100.0)
+        self.sp_an_Km.setDecimals(4)
+        self.sp_an_Km.setValue(2.27)
+        self.sp_an_Km.setSingleStep(0.05)
+        self.sp_an_Km.setToolTip("Km — действительное массовое соотношение окислитель/горючее")
+
+        self.sp_an_isp = QtWidgets.QDoubleSpinBox()
+        self.sp_an_isp.setRange(1.0, 100_000.0)
+        self.sp_an_isp.setDecimals(4)
+        self.sp_an_isp.setValue(3349.4838)
+        self.sp_an_isp.setSingleStep(10.0)
+        self.sp_an_isp.setToolTip("Iуд — удельный импульс в пустоте (из термодинам. расчёта), м/с")
+
+        self.sp_an_k = QtWidgets.QDoubleSpinBox()
+        self.sp_an_k.setRange(1.001, 2.0)
+        self.sp_an_k.setDecimals(4)
+        self.sp_an_k.setValue(1.1343)
+        self.sp_an_k.setSingleStep(0.01)
+        self.sp_an_k.setToolTip("k — показатель адиабаты (в камере и на срезе)")
+
+        self.sp_an_Rg = QtWidgets.QDoubleSpinBox()
+        self.sp_an_Rg.setRange(1.0, 5000.0)
+        self.sp_an_Rg.setDecimals(3)
+        self.sp_an_Rg.setValue(346.2)
+        self.sp_an_Rg.setSingleStep(1.0)
+        self.sp_an_Rg.setToolTip("Rг — газовая постоянная в камере, Дж/(кг·К)")
+
+        self.sp_an_Tk = QtWidgets.QDoubleSpinBox()
+        self.sp_an_Tk.setRange(100.0, 10_000.0)
+        self.sp_an_Tk.setDecimals(2)
+        self.sp_an_Tk.setValue(3692.99)
+        self.sp_an_Tk.setSingleStep(10.0)
+        self.sp_an_Tk.setToolTip("Tк — температура в камере сгорания, К")
+
+        self.sp_an_alpha = QtWidgets.QDoubleSpinBox()
+        self.sp_an_alpha.setRange(0.0, 100.0)
+        self.sp_an_alpha.setDecimals(3)
+        self.sp_an_alpha.setValue(0.81)
+        self.sp_an_alpha.setSingleStep(0.01)
+        self.sp_an_alpha.setToolTip("α — коэффициент избытка окислителя (справочно)")
+
+        ft.addRow("Km (O/F массовое):", self.sp_an_Km)
+        ft.addRow("Iуд (пустота), м/с:", self.sp_an_isp)
+        ft.addRow("k (адиабата):", self.sp_an_k)
+        ft.addRow("Rг, Дж/(кг·К):", self.sp_an_Rg)
+        ft.addRow("Tк (камера), К:", self.sp_an_Tk)
+        ft.addRow("α (справочно):", self.sp_an_alpha)
+        pv.addWidget(gb_td)
+
+        # ── Группа: коэффициенты потерь и геометрия камеры ──
+        gb_loss = QtWidgets.QGroupBox("Потери и геометрия камеры")
+        fll = QtWidgets.QFormLayout(gb_loss)
+        fll.setSpacing(6)
+
+        self.sp_an_phik = QtWidgets.QDoubleSpinBox()
+        self.sp_an_phik.setRange(0.5, 1.0)
+        self.sp_an_phik.setDecimals(4)
+        self.sp_an_phik.setValue(0.99)
+        self.sp_an_phik.setSingleStep(0.001)
+        self.sp_an_phik.setToolTip("φк — коэффициент потерь в камере сгорания")
+
+        self.sp_an_phic = QtWidgets.QDoubleSpinBox()
+        self.sp_an_phic.setRange(0.5, 1.0)
+        self.sp_an_phic.setDecimals(4)
+        self.sp_an_phic.setValue(0.98)
+        self.sp_an_phic.setSingleStep(0.001)
+        self.sp_an_phic.setToolTip("φс — коэффициент потерь в сопле")
+
+        self.sp_an_winj = QtWidgets.QDoubleSpinBox()
+        self.sp_an_winj.setRange(1.0, 200.0)
+        self.sp_an_winj.setDecimals(1)
+        self.sp_an_winj.setValue(30.0)
+        self.sp_an_winj.setSingleStep(1.0)
+        self.sp_an_winj.setToolTip("Wср — средняя осевая скорость впрыска компонентов, м/с (20…40)")
+
+        self.sp_an_rho = QtWidgets.QDoubleSpinBox()
+        self.sp_an_rho.setRange(0.5, 10.0)
+        self.sp_an_rho.setDecimals(2)
+        self.sp_an_rho.setValue(2.0)
+        self.sp_an_rho.setSingleStep(0.5)
+        self.sp_an_rho.setToolTip("ρ — относительный радиус скругления входа")
+
+        fll.addRow("φк (камера):", self.sp_an_phik)
+        fll.addRow("φс (сопло):", self.sp_an_phic)
+        fll.addRow("Wср (впрыск), м/с:", self.sp_an_winj)
+        fll.addRow("ρ (скругление):", self.sp_an_rho)
+        pv.addWidget(gb_loss)
+
+        # ── Кнопки ──
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_an_compute = QtWidgets.QPushButton("Рассчитать")
+        self.btn_an_compute.clicked.connect(self._on_analytic_compute)
+        self.btn_an_from_main = QtWidgets.QPushButton("Из основного расчёта")
+        self.btn_an_from_main.setToolTip(
+            "Подставить Iуд, k, Rг, Tк, давления и Km из последнего\n"
+            "термодинамического (равновесного) расчёта."
+        )
+        self.btn_an_from_main.clicked.connect(self._on_analytic_pull_from_main)
+        btn_row.addWidget(self.btn_an_compute)
+        btn_row.addWidget(self.btn_an_from_main)
+        pv.addLayout(btn_row)
+        pv.addStretch(1)
+
+        root.addWidget(params)
+
+        # ── Правая колонка: результаты ──
+        self.txt_analytic = QtWidgets.QPlainTextEdit()
+        self.txt_analytic.setReadOnly(True)
+        self.txt_analytic.setStyleSheet(
+            "QPlainTextEdit { font-family: 'Consolas','DejaVu Sans Mono',monospace; "
+            "font-size: 10.5pt; }"
+        )
+        self.txt_analytic.setPlainText(
+            "Задайте исходные данные слева и нажмите «Рассчитать».\n\n"
+            "Кнопка «Из основного расчёта» подставит термодинамические\n"
+            "показатели (Iуд, k, Rг, Tк) и режим из последнего равновесного расчёта."
+        )
+        root.addWidget(self.txt_analytic, 1)
+        return w
+
+    def _on_analytic_pull_from_main(self):
+        """Подставить параметры из последнего термодинамического расчёта."""
+        perf = getattr(self, "perf", None)
+        if perf is None:
+            QtWidgets.QMessageBox.information(
+                self, "Нет данных",
+                "Сначала выполните основной (термодинамический) расчёт —\n"
+                "затем его результаты можно подставить сюда."
+            )
+            return
+        try:
+            g0 = 9.80665
+            # Удельный импульс в пустоте: RocketPerformance.Isp_vac_s [с] → м/с
+            isp_vac_s = getattr(perf, "Isp_vac_s", None)
+            if isp_vac_s:
+                self.sp_an_isp.setValue(float(isp_vac_s) * g0)
+            # Соотношение компонентов
+            of = getattr(perf, "O_F", None)
+            if of:
+                self.sp_an_Km.setValue(float(of))
+            # Параметры камеры берём из первого сечения (Injector / камера)
+            stations = getattr(perf, "stations", None) or []
+            chamber = None
+            for st in stations:
+                lbl = (getattr(st, "label", "") or "").lower()
+                if "inject" in lbl or "chamber" in lbl or "камер" in lbl:
+                    chamber = st
+                    break
+            if chamber is None and stations:
+                chamber = stations[0]
+            if chamber is not None:
+                k = getattr(chamber, "gamma_eq", None) or getattr(chamber, "gamma_s", None)
+                if k:
+                    self.sp_an_k.setValue(float(k))
+                Rg = getattr(chamber, "R_specific_J_per_kgK", None)
+                if Rg:
+                    self.sp_an_Rg.setValue(float(Rg))
+                Tk = getattr(chamber, "T_K", None)
+                if Tk:
+                    self.sp_an_Tk.setValue(float(Tk))
+                Pc = getattr(chamber, "P_Pa", None)
+                if Pc:
+                    self.sp_an_pk.setValue(float(Pc) / 1e6)
+            # Давление на срезе — из последнего сверхзвукового сечения
+            if stations:
+                Pe = getattr(stations[-1], "P_Pa", None)
+                if Pe:
+                    self.sp_an_pa.setValue(float(Pe) / 1e6)
+            # α — справочно
+            alpha = getattr(perf, "alpha", None)
+            if alpha:
+                self.sp_an_alpha.setValue(float(alpha))
+            QtWidgets.QMessageBox.information(
+                self, "Готово",
+                "Параметры подставлены из последнего термодинамического расчёта.\n"
+                "Проверьте Iуд, k, Rг, Tк и давления перед расчётом."
+            )
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "Ошибка", f"Не удалось подставить параметры:\n{exc}"
+            )
+
+    def _on_analytic_compute(self):
+        """Выполнить аналитический расчёт профиля сопла и вывести результат."""
+        try:
+            inp = AnalyticSizingInput(
+                thrust_vac_N=float(self.sp_an_thrust.value()),
+                p_chamber_Pa=float(self.sp_an_pk.value()) * 1e6,
+                p_exit_Pa=float(self.sp_an_pa.value()) * 1e6,
+                Km=float(self.sp_an_Km.value()),
+                Isp_vac_m_s=float(self.sp_an_isp.value()),
+                k_adiabatic=float(self.sp_an_k.value()),
+                R_gas_J_kgK=float(self.sp_an_Rg.value()),
+                T_chamber_K=float(self.sp_an_Tk.value()),
+                phi_k=float(self.sp_an_phik.value()),
+                phi_c=float(self.sp_an_phic.value()),
+                alpha=float(self.sp_an_alpha.value()),
+                W_inj_mean_m_s=float(self.sp_an_winj.value()),
+                rho_curvature=float(self.sp_an_rho.value()),
+            )
+            res = compute_analytic_sizing(inp)
+            self.txt_analytic.setPlainText(self._format_analytic_result(inp, res))
+            self._last_analytic_result = res
+        except Exception as exc:  # noqa: BLE001
+            self.txt_analytic.setPlainText(
+                f"Ошибка расчёта:\n{exc}\n\n{traceback.format_exc()}"
+            )
+
+    @staticmethod
+    def _format_analytic_result(inp: "AnalyticSizingInput",
+                                r: "AnalyticSizingResult") -> str:
+        """Текстовый отчёт по аналитическому расчёту профиля сопла."""
+        def fnum(x, d=4):
+            return f"{x:.{d}f}"
+        L = []
+        L.append("═" * 64)
+        L.append("  АНАЛИТИЧЕСКИЙ РАСЧЁТ ПРОФИЛЯ СОПЛА (РПА / Добровольский)")
+        L.append("  Альтернатива термодинамическому (равновесному) расчёту")
+        L.append("═" * 64)
+        L.append("")
+        L.append("ИСХОДНЫЕ ДАННЫЕ")
+        L.append("─" * 64)
+        L.append(f"  Тяга в пустоте Pн ........... {inp.thrust_vac_N:,.1f} Н")
+        L.append(f"  Давление в камере pк ........ {inp.p_chamber_Pa/1e6:.4f} МПа")
+        L.append(f"  Давление на срезе pa ........ {inp.p_exit_Pa/1e6:.5f} МПа")
+        L.append(f"  Соотношение компонентов Km .. {inp.Km:.4f}")
+        L.append(f"  Удельный импульс Iуд ........ {inp.Isp_vac_m_s:.4f} м/с")
+        L.append(f"  Показатель адиабаты k ....... {inp.k_adiabatic:.4f}")
+        L.append(f"  Газовая постоянная Rг ....... {inp.R_gas_J_kgK:.3f} Дж/(кг·К)")
+        L.append(f"  Температура в камере Tк ..... {inp.T_chamber_K:.2f} К")
+        L.append(f"  φк = {inp.phi_k:.4f}   φс = {inp.phi_c:.4f}")
+        L.append("")
+        L.append("1. ЭНЕРГЕТИЧЕСКИЕ ПОКАЗАТЕЛИ КАМЕРЫ")
+        L.append("─" * 64)
+        L.append(f"  φуд = φк·φс ................. {fnum(r.phi_ud)}")
+        L.append(f"  Характеристическая ск. C* .. {fnum(r.Cstar_m_s, 2)} м/с")
+        L.append(f"  Ожидаемая C*ож = C*·φк ...... {fnum(r.Cstar_exp_m_s, 2)} м/с")
+        L.append(f"  Ожидаемый Iуд.ож = Iуд·φуд .. {fnum(r.Isp_exp_m_s, 2)} м/с")
+        L.append(f"  Коэф. тяги Kпт = Iуд.ож/C* .. {fnum(r.Kp_thrust)}")
+        L.append(f"  Ожидаемый Kп.ож = Kпт·φс .... {fnum(r.Kp_thrust_exp)}")
+        L.append("")
+        L.append("2. РАСХОДЫ ТОПЛИВА")
+        L.append("─" * 64)
+        L.append(f"  Суммарный расход ṁ .......... {fnum(r.mdot_total_kg_s, 2)} кг/с")
+        L.append(f"  Расход горючего ṁг .......... {fnum(r.mdot_fuel_kg_s, 2)} кг/с")
+        L.append(f"  Расход окислителя ṁо ........ {fnum(r.mdot_ox_kg_s, 2)} кг/с")
+        L.append("")
+        L.append("3. ПЛОЩАДИ И ДИАМЕТРЫ (критика / срез)")
+        L.append("─" * 64)
+        L.append(f"  Относит. площадь среза F̄a .. {fnum(r.Fa_rel, 4)}")
+        L.append(f"  Относит. диаметр среза D̄a .. {fnum(r.D_exit_rel, 4)}")
+        L.append(f"  λ (приведённая ск.) ......... {fnum(r.lambda_chamber, 4)}")
+        L.append(f"  εк0 = 1/f(λ) ................ {fnum(r.eps_k0, 4)}")
+        L.append(f"  δк (потери на впрыск) ....... {fnum(r.delta_k, 4)}")
+        L.append(f"  εк = εк0/δк ................. {fnum(r.eps_k, 4)}")
+        L.append(f"  Fкр (1-е приб.) ............. {fnum(r.F_throat_1_m2, 4)} м²")
+        L.append(f"  Dкр (1-е приб.) ............. {fnum(r.D_throat_1_m, 4)} м")
+        L.append(f"  F̄к1 (отн. камера, 1 приб.) . {fnum(r.F_chamber_rel_1, 4)}")
+        L.append(f"  Fкр (2-е приб., итог) ....... {fnum(r.F_throat_m2, 4)} м²")
+        L.append(f"  Dкр (2-е приб., итог) ....... {fnum(r.D_throat_m, 4)} м")
+        L.append(f"  Площадь среза Fa ............ {fnum(r.F_exit_m2, 4)} м²")
+        L.append(f"  Диаметр среза Da ............ {fnum(r.D_exit_m, 4)} м")
+        L.append("")
+        L.append("4. ГЕОМЕТРИЯ КАМЕРЫ СГОРАНИЯ")
+        L.append("─" * 64)
+        L.append(f"  Приведённая длина Lпр ....... {fnum(r.L_reduced_m, 4)} м")
+        L.append(f"  Условная длина Lк ........... {fnum(r.L_conditional_m, 4)} м")
+        L.append(f"  Объём камеры Vк ............. {fnum(r.V_chamber_m3, 4)} м³")
+        L.append(f"  Относит. площадь камеры F̄к2  {fnum(r.F_chamber_rel_2, 4)}")
+        L.append(f"  Диаметр камеры Dк ........... {fnum(r.D_chamber_m, 4)} м")
+        L.append(f"  Радиус скругления R1 ........ {fnum(r.R1_m, 4)} м")
+        L.append(f"  Радиус скругления R2 ........ {fnum(r.R2_m, 4)} м")
+        L.append(f"  Длина входной части Lвх ..... {fnum(r.L_inlet_m, 4)} м")
+        L.append(f"  Объём входной части ΔVвх .... {fnum(r.dV_inlet_m3, 4)} м³")
+        L.append(f"  Длина цил. участка Lц ....... {fnum(r.L_cyl_m, 4)} м")
+        L.append("")
+        L.append("─" * 64)
+        notes = r.notes or {}
+        if notes.get("method"):
+            L.append(f"Метод: {notes['method']}")
+        if notes.get("throat_formula"):
+            L.append(f"Формула критики: {notes['throat_formula']}")
+        L.append(
+            "Примечание: абсолютные площади/объёмы зависят от эмпирических\n"
+            "констант методики; энергетика, расходы и εк-цепочка совпадают\n"
+            "с эталоном в пределах < 1–3 %."
+        )
+        return "\n".join(L)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Вкладка «Поле течения (2D)» — заготовка квази-2D расчёта
     # ─────────────────────────────────────────────────────────────────────────
     def _build_field_2d_tab(self) -> QtWidgets.QWidget:
@@ -1620,7 +2096,25 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setContentsMargins(8, 8, 8, 8)
 
         ctrl = QtWidgets.QHBoxLayout()
-        ctrl.addWidget(QtWidgets.QLabel("Поле:"))
+        # Выбор режима отображения: 2D-поле или детальные газодинамические
+        # функции по длине сопла (доступны и при 1D-расчёте).
+        ctrl.addWidget(QtWidgets.QLabel("Вид:"))
+        self.cb_field_2d_mode = QtWidgets.QComboBox()
+        self.cb_field_2d_mode.addItems([
+            "Газодинамические функции (1D)",
+            "Поле течения (2D)",
+        ])
+        self.cb_field_2d_mode.setToolTip(
+            "«Газодинамические функции (1D)» — детальные интерактивные графики\n"
+            "τ(λ), π(λ), ε(λ), q(λ), y(λ), λ(x) по длине сопла (по 1D-расчёту).\n"
+            "«Поле течения (2D)» — цветовое поле параметра по сечению (нужен 2D-расчёт)."
+        )
+        self.cb_field_2d_mode.currentIndexChanged.connect(self._on_field_2d_mode_changed)
+        ctrl.addWidget(self.cb_field_2d_mode)
+
+        ctrl.addSpacing(16)
+        self.lbl_field_2d_field = QtWidgets.QLabel("Поле:")
+        ctrl.addWidget(self.lbl_field_2d_field)
         self.cb_field_2d = QtWidgets.QComboBox()
         self.cb_field_2d.addItems([
             "M (число Маха)", "P (давление)", "T (температура)",
@@ -1636,16 +2130,13 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addLayout(ctrl)
 
         self.lbl_field_2d_info = QtWidgets.QLabel(
-            "Двумерный (осесимметричный) расчёт: квази-2D модель.\n"
-            "Параметры (M, P, T, V) меняются по ДВУМ координатам — вдоль оси x\n"
-            "и по радиусу r. Радиальное распределение числа Маха строится по\n"
-            "источниковому (source-flow) приближению расходящегося потока, а\n"
-            "T, P и V пересчитываются из M по изэнтропическим соотношениям.\n"
-            "Полный метод характеристик (MOC) — следующий шаг (TODO).\n"
-            "Выберите режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)» и\n"
-            "выполните расчёт, чтобы построить поле течения.\n"
+            "«Газодинамические функции (1D)» строятся всегда по результатам 1D-расчёта:\n"
+            "τ(λ)=T/T₀, π(λ)=P/P₀, ε(λ)=ρ/ρ₀, расходная q(λ), удельный импульс y(λ)\n"
+            "и скоростной коэффициент λ(x) по длине сопла.\n"
+            "«Поле течения (2D)» — цветовое поле параметра по сечению (квази-2D, нужен\n"
+            "режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)»).\n"
             "Интерактивно: панель сверху — приближение (лупа) / перемещение (рука) /\n"
-            "сброс (домик); наведите курсор на поле — значение в точке покажется ниже."
+            "сброс (домик); наведите курсор — значение в точке покажется ниже."
         )
         self.lbl_field_2d_info.setStyleSheet("color: #a8a29e; font-size: 10px;")
         self.lbl_field_2d_info.setWordWrap(True)
@@ -1679,6 +2170,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._field_2d_marker = None
 
         self._last_field_2d: Optional[Nozzle2DResult] = None
+
+        # Стартовый режим — «Газодинамические функции (1D)»: селектор поля (M/P/T/V)
+        # скрываем, т.к. он актуален только для 2D-поля.
+        if hasattr(self, "cb_field_2d"):
+            self.cb_field_2d.setVisible(False)
+        if hasattr(self, "lbl_field_2d_field"):
+            self.lbl_field_2d_field.setVisible(False)
         return w
 
     def _update_field_2d_from_perf(self):
@@ -1704,6 +2202,24 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"2D-расчёт пропущен: {e}", 5000)
             self._last_field_2d = None
+        # Если 2D-поле успешно посчитано — автоматически переключаемся на его
+        # отображение; иначе остаёмся на газодинамических функциях (1D).
+        if (self._last_field_2d is not None and hasattr(self, "cb_field_2d_mode")
+                and self.cb_field_2d_mode.currentIndex() != 1):
+            # currentIndexChanged сам вызовет перерисовку
+            self.cb_field_2d_mode.setCurrentIndex(1)
+            return
+        self._render_field_2d()
+
+    def _on_field_2d_mode_changed(self, *args):
+        """Переключение режима «функции 1D» / «поле 2D»: показать нужные элементы."""
+        is_2d = (hasattr(self, "cb_field_2d_mode")
+                 and self.cb_field_2d_mode.currentIndex() == 1)
+        # Селектор поля (M/P/T/V) актуален только для 2D-режима.
+        if hasattr(self, "cb_field_2d"):
+            self.cb_field_2d.setVisible(is_2d)
+        if hasattr(self, "lbl_field_2d_field"):
+            self.lbl_field_2d_field.setVisible(is_2d)
         self._render_field_2d()
 
     def _render_field_2d(self):
@@ -1713,11 +2229,22 @@ class MainWindow(QtWidgets.QMainWindow):
         c.fig.clear()
         self._field_2d_plot_cache = None
         self._field_2d_marker = None
+
+        # ── Режим «Газодинамические функции (1D)» ──────────────────────────────
+        # Доступен всегда при наличии 1D-расчёта (self.perf), даже если 2D-поле
+        # не считалось. Строит детальные интерактивные графики τ, π, ε, q, y, λ.
+        mode_2d = (hasattr(self, "cb_field_2d_mode")
+                   and self.cb_field_2d_mode.currentIndex() == 1)
+        if not mode_2d:
+            self._render_gasdynamic_functions_1d(c)
+            return
+
         res = self._last_field_2d
         if res is None:
             ax = c.fig.add_subplot(111)
             ax.text(0.5, 0.5,
-                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт.",
+                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт,\n"
+                    "либо переключите «Вид» на «Газодинамические функции (1D)».",
                     ha='center', va='center', fontsize=11, color='#888')
             ax.set_axis_off()
             c.fig.tight_layout()
@@ -1804,6 +2331,160 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "lbl_field_2d_cursor"):
             self.lbl_field_2d_cursor.setText("Наведите курсор на поле…")
 
+    # ── Детальные газодинамические функции по длине сопла (по 1D-расчёту) ─────
+    def _render_gasdynamic_functions_1d(self, c):
+        """Строит 6 интерактивных графиков газодинамических функций по длине сопла.
+
+        Источник данных — результаты 1D-расчёта (self.perf.stations). Графики:
+          τ(λ) = T/T₀        — функция температуры
+          π(λ) = P/P₀        — функция давления
+          ε(λ) = ρ/ρ₀        — функция плотности
+          q(λ)               — приведённый расход (нормирован на максимум = 1 в горловине)
+          y(λ)               — функция удельного импульса = (1+λ²)/(2λ) · q-подобная
+          λ(x)               — скоростной коэффициент по длине
+
+        Все функции строятся от координаты x вдоль оси сопла (мм), плюс тонкой
+        синей линией показан контур сопла r(x) (в относительном масштабе) для
+        привязки к геометрии — как на эталонных графиках.
+        """
+        perf = getattr(self, "perf", None)
+        if perf is None or not getattr(perf, "stations", None):
+            ax = c.fig.add_subplot(111)
+            ax.text(0.5, 0.5,
+                    "Нет данных 1D.\nВыполните газодинамический расчёт, чтобы\n"
+                    "построить газодинамические функции по длине сопла.",
+                    ha='center', va='center', fontsize=11, color='#888')
+            ax.set_axis_off()
+            c.fig.tight_layout()
+            c.draw()
+            if hasattr(self, "lbl_field_2d_cursor"):
+                self.lbl_field_2d_cursor.setText("Нет данных 1D.")
+            return
+
+        stations = perf.stations
+
+        # Координата по длине сопла (м) для каждого сечения
+        def _len_to_m(v, unit):
+            return {'м': v, 'см': v * 0.01, 'мм': v * 0.001}.get(unit, v)
+        try:
+            x_m = np.asarray(build_nozzle_geometry(
+                stations,
+                L_chamber=self._chamber_length_m(),
+                L_conv=_len_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
+                L_div=_len_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            ), dtype=float)
+        except Exception:
+            x_m = np.arange(len(stations), dtype=float)
+        x_mm = x_m * 1000.0
+
+        # Параметры по сечениям
+        P = np.array([float(s.P_Pa) for s in stations])
+        T = np.array([float(s.T_K) for s in stations])
+        rho = np.array([float(getattr(s, "rho_kg_per_m3", 0.0)) for s in stations])
+        V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in stations])
+        a = np.array([float(getattr(s, "a_m_per_s", 0.0)) for s in stations])
+        gam = np.array([float(getattr(s, "gamma_s", 0.0) or 1.2) for s in stations])
+        Ae_At = np.array([float(getattr(s, "Ae_At", 1.0)) for s in stations])
+
+        # Параметры торможения (камера = первое сечение)
+        T0 = T[0] if T.size and T[0] > 0 else (np.nanmax(T) if T.size else 1.0)
+        P0 = P[0] if P.size and P[0] > 0 else (np.nanmax(P) if P.size else 1.0)
+        rho0 = rho[0] if rho.size and rho[0] > 0 else (np.nanmax(rho) if rho.size else 1.0)
+        k0 = float(gam[0]) if gam.size and gam[0] > 1.0 else 1.2
+
+        # Скоростной коэффициент λ = V / a_кр, где a_кр = sqrt(2k/(k+1)·R·T₀).
+        # Удобно: a_кр = a₀·sqrt(2/(k+1)), где a₀ = sqrt(k·R·T₀). Берём a по камере.
+        a0 = a[0] if a.size and a[0] > 0 else (np.nanmax(a) if a.size else 1.0)
+        a_cr = a0 * math.sqrt(2.0 / (k0 + 1.0)) if a0 > 0 else 1.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            lam = np.where(a_cr > 0, V / a_cr, 0.0)
+            tau = np.where(T0 > 0, T / T0, 0.0)        # τ(λ)
+            pi = np.where(P0 > 0, P / P0, 0.0)          # π(λ)
+            eps = np.where(rho0 > 0, rho / rho0, 0.0)   # ε(λ)
+
+        # Расходная функция q(λ) = λ·((k+1)/2)^(1/(k-1))·(1-(k-1)/(k+1)·λ²)^(1/(k-1))
+        def _q_of_lambda(lm, k):
+            k = max(k, 1.0001)
+            base = 1.0 - (k - 1.0) / (k + 1.0) * lm * lm
+            base = np.clip(base, 0.0, None)
+            return (lm * ((k + 1.0) / 2.0) ** (1.0 / (k - 1.0))
+                    * base ** (1.0 / (k - 1.0)))
+        q = _q_of_lambda(lam, k0)
+
+        # Функция удельного импульса y(λ) = (1+λ²)/(2λ)·q(λ) (нормирована к max=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            y = np.where(lam > 1e-9, (1.0 + lam * lam) / (2.0 * lam) * q, 0.0)
+        if np.nanmax(np.abs(y)) > 0:
+            y = y / np.nanmax(y)
+
+        # Контур сопла r(x) — для привязки графиков к геометрии (тонкая синяя линия)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            r_rel = np.sqrt(np.clip(Ae_At, 0.0, None))   # ~ радиус (At=1)
+        # нормируем r к диапазону [0.1..0.8] для наложения как референс
+        if np.nanmax(r_rel) > np.nanmin(r_rel):
+            r_norm = 0.1 + 0.7 * (r_rel - np.nanmin(r_rel)) / (np.nanmax(r_rel) - np.nanmin(r_rel))
+        else:
+            r_norm = np.full_like(r_rel, 0.3)
+
+        # Найдём положение горловины (минимум Ae_At) для вертикальной линии x=0-эквив.
+        try:
+            i_thr = int(np.nanargmin(Ae_At))
+            x_throat_mm = float(x_mm[i_thr])
+        except Exception:
+            x_throat_mm = 0.0
+
+        panels = [
+            ("Функция температуры τ(λ)",   tau, "τ(λ) = T/T0",  "#e03131"),
+            ("Функция давления π(λ)",       pi,  "π(λ) = P/P0",  "#1c3fce"),
+            ("Функция плотности ε(λ)",      eps, "ε(λ) = ρ/ρ0",  "#7b2cbf"),
+            ("Расходная функция q(λ)",      q,   "q(λ)",          "#2b8a3e"),
+            ("Функция удельного импульса y(λ)", y, "y(λ)",        "#f59f00"),
+            ("Скоростной коэффициент λ(x)", lam, "λ",             "#9c2a2a"),
+        ]
+
+        # Сортируем по x для корректных линий
+        order = np.argsort(x_mm)
+        xs = x_mm[order]
+        r_ref = r_norm[order]
+
+        axes_cache = []
+        for idx, (title, data, ylab, color) in enumerate(panels):
+            ax = c.fig.add_subplot(3, 2, idx + 1)
+            ys = np.asarray(data, dtype=float)[order]
+            # Контур-референс (тонкая синяя линия) в масштабе текущей оси
+            ymin = np.nanmin(ys) if np.isfinite(np.nanmin(ys)) else 0.0
+            ymax = np.nanmax(ys) if np.isfinite(np.nanmax(ys)) else 1.0
+            if ymax <= ymin:
+                ymax = ymin + 1.0
+            r_scaled = ymin + (ymax - ymin) * r_ref
+            ax.plot(xs, r_scaled, '-', color='#6ab0ff', lw=0.9, alpha=0.8, zorder=1)
+            # Основная кривая функции
+            ax.plot(xs, ys, '-', color=color, lw=2.4, zorder=3)
+            # Вертикальная линия горловины
+            ax.axvline(x_throat_mm, color='#555', ls=':', lw=1.0, zorder=2)
+            if idx == 3:  # q(λ) — горизонталь q=1 (максимум в горловине)
+                ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
+            if idx == 5:  # λ(x) — горизонталь λ=1 (звуковая линия)
+                ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Координата вдоль оси сопла X, мм", fontsize=8)
+            ax.set_ylabel(ylab, color=color, fontsize=9)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.25)
+            axes_cache.append((ax, xs, ys, title, ylab))
+
+        c.fig.suptitle("Газодинамические функции по длине сопла (1D)",
+                       fontsize=11, y=0.995)
+        c.fig.tight_layout(rect=(0, 0, 1, 0.98))
+        c.draw()
+
+        # Кэш для считывания значений под курсором (мультипанельный режим)
+        self._field_2d_plot_cache = {"gdf_axes": axes_cache, "mode": "gdf_1d"}
+        if hasattr(self, "lbl_field_2d_cursor"):
+            self.lbl_field_2d_cursor.setText(
+                "Наведите курсор на график — координата X и значение функции покажутся ниже."
+            )
+
     # ── Интерактивное считывание значения поля под курсором ──────────────────
     def _field_2d_value_at(self, x: float, r: float):
         """Возвращает (значение, r_стенки) поля в точке (x, r) внутри профиля.
@@ -1859,7 +2540,27 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl = getattr(self, "lbl_field_2d_cursor", None)
         if lbl is None:
             return
-        if cache is None or event.inaxes is not cache.get("ax"):
+        if cache is None:
+            return
+
+        # ── Режим газодинамических функций (мультипанель 3×2) ──────────────────
+        if cache.get("mode") == "gdf_1d":
+            if event.inaxes is None or event.xdata is None:
+                return
+            x_cur = float(event.xdata)
+            for ax, xs, ys, title, ylab in cache.get("gdf_axes", []):
+                if event.inaxes is ax:
+                    try:
+                        val = float(np.interp(x_cur, xs, ys))
+                    except Exception:
+                        val = float("nan")
+                    lbl.setText(
+                        f"{title}:   X = {x_cur:.1f} мм    →    {ylab} = {val:.5g}"
+                    )
+                    return
+            return
+
+        if event.inaxes is not cache.get("ax"):
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -2265,6 +2966,79 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_bl_2d.setEnabled(is_2d)
         if hasattr(self, "sp_bl_delta_2d"):
             self.sp_bl_delta_2d.setEnabled(is_2d and self.chk_bl_2d.isChecked())
+
+    def _on_chamber_size_mode_changed(self, *args):
+        """Взаимоисключающее переключение «Длина камеры» / «L*».
+
+        Активным оставляем только выбранный способ задания размера камеры,
+        второй ввод блокируется (и визуально приглушается), чтобы исключить
+        двусмысленный одновременный ввод длины и характеристической длины.
+        """
+        use_len = (getattr(self, "rb_chamber_len", None) is not None
+                   and self.rb_chamber_len.isChecked())
+        # Длина камеры
+        for wdg in (getattr(self, "sp_L_chamber", None),
+                    getattr(self, "cb_L_chamber_unit", None),
+                    getattr(self, "lbl_L_chamber", None)):
+            if wdg is not None:
+                wdg.setEnabled(use_len)
+        # Характеристическая длина L*
+        for wdg in (getattr(self, "sp_L_star", None),
+                    getattr(self, "cb_L_star_unit", None),
+                    getattr(self, "lbl_L_star", None)):
+            if wdg is not None:
+                wdg.setEnabled(not use_len)
+
+    def _update_overall_efficiency(self, *args):
+        """Пересчёт суммарного КПД η_общ = η_р · η_с (поле только для чтения)."""
+        try:
+            eta_r = float(self.sp_eff_reaction.value())
+            eta_n = float(self.sp_eff_nozzle.value())
+        except Exception:
+            return
+        if hasattr(self, "sp_eff_overall"):
+            self.sp_eff_overall.setValue(eta_r * eta_n)
+
+    def _chamber_length_m(self) -> float:
+        """Длина цилиндрической части камеры в метрах.
+
+        Если выбран ввод «Длина камеры» — берём её напрямую.
+        Если выбран ввод «Характеристическая L*» — выводим длину камеры из
+        характеристической длины:
+
+            L* = V_к / A_кр   (определение характеристической длины),
+
+        для цилиндрической камеры объёмом V_к = A_к · L_к:
+
+            L_к = L* · A_кр / A_к = L* · (R_кр / R_к)² = L* / (R_к/R_кр)².
+
+        Отношение R_к/R_кр берём из поля «R_камеры / R_кр» панели профиля
+        (sp_calc_Rcham); при недоступности — нейтральное 1.0.
+        """
+        def _len_to_m(v, unit):
+            if unit == 'см':
+                return v * 0.01
+            if unit == 'мм':
+                return v * 0.001
+            return v
+
+        use_lstar = (getattr(self, "rb_chamber_lstar", None) is not None
+                     and self.rb_chamber_lstar.isChecked())
+        if not use_lstar:
+            return _len_to_m(self.sp_L_chamber.value(),
+                             self.cb_L_chamber_unit.currentText())
+
+        L_star = _len_to_m(self.sp_L_star.value(),
+                           self.cb_L_star_unit.currentText())
+        rcham_ratio = 1.0
+        sp = getattr(self, "sp_calc_Rcham", None)
+        if sp is not None:
+            try:
+                rcham_ratio = float(sp.value())
+            except Exception:
+                rcham_ratio = 1.0
+        rcham_ratio = max(rcham_ratio, 1.0)
+        return L_star / (rcham_ratio * rcham_ratio)
 
     def _on_calc_geom_type_changed(self, *args):
         """Включает/выключает поля под выбранный тип сопла в панели расчёта."""
@@ -2963,6 +3737,26 @@ class MainWindow(QtWidgets.QMainWindow):
         s.append(f"  CF (коэф. тяги):          {perf.CF:8.4f}")
         s.append(f"  Ve (скорость на срезе):   {perf.stations[-1].V_m_per_s:8.4f} м/с")
         s.append("")
+
+        # ── Реализуемые характеристики с учётом потерь (КПД) ──
+        # η_р действует на C* (камера), η_с — на C_F (сопло), η_общ — на Isp.
+        eta_r = float(getattr(self, "sp_eff_reaction", None).value()
+                      if getattr(self, "sp_eff_reaction", None) is not None else 1.0)
+        eta_n = float(getattr(self, "sp_eff_nozzle", None).value()
+                      if getattr(self, "sp_eff_nozzle", None) is not None else 1.0)
+        eta_o = eta_r * eta_n
+        if eta_o < 1.0 - 1e-9:
+            s.append("─" * 70)
+            s.append("  Реализуемые характеристики с учётом потерь:")
+            s.append(f"  (η_реакц={eta_r:.4f}, η_сопла={eta_n:.4f}, η_общ={eta_o:.4f})")
+            s.append("─" * 70)
+            s.append(f"  Isp_дел (срез,  P_amb=0):  {perf.Isp_s*eta_o:8.4f} с")
+            s.append(f"  Isp_дел (вакуум):          {perf.Isp_vac_s*eta_o:8.4f} с")
+            s.append(f"  C*_дел:                    {perf.Cstar_m_per_s*eta_r:8.4f} м/с")
+            s.append(f"  CF_дел:                    {perf.CF*eta_n:8.4f}")
+            s.append(f"  Ve_дел:                    {perf.stations[-1].V_m_per_s*eta_o:8.4f} м/с")
+            s.append("")
+
         s.append("═" * 70)
         s.append("  ПАРАМЕТРЫ В КАМЕРЕ И НА СРЕЗЕ")
         s.append("═" * 70)
@@ -3048,7 +3842,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return v
         return build_nozzle_geometry(
             stations,
-            L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
+            L_chamber=self._chamber_length_m(),
             L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
             L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
         )
@@ -3144,7 +3938,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         x = build_nozzle_geometry(
             stations,
-            L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
+            L_chamber=self._chamber_length_m(),
             L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
             L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
         )
@@ -3414,7 +4208,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         x_all = build_nozzle_geometry(
             all_stations,
-            L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
+            L_chamber=self._chamber_length_m(),
             L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
             L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
         )
@@ -3518,7 +4312,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         x = build_nozzle_geometry(
             stations,
-            L_chamber=length_to_m(self.sp_L_chamber.value(), self.cb_L_chamber_unit.currentText()),
+            L_chamber=self._chamber_length_m(),
             L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
             L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
         )
@@ -3616,7 +4410,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stations = self.perf.stations
         x = build_nozzle_geometry(
             stations,
-            L_chamber=self.sp_L_chamber.value(),
+            L_chamber=self._chamber_length_m(),
             L_conv=self.sp_L_conv.value(),
             L_div=self.sp_L_div.value(),
         )
@@ -3694,6 +4488,14 @@ class MainWindow(QtWidgets.QMainWindow):
             'L_chamber': self.sp_L_chamber.value(),
             'L_conv': self.sp_L_conv.value(),
             'L_div': self.sp_L_div.value(),
+            'chamber_size_mode': ('lstar' if self.rb_chamber_lstar.isChecked()
+                                  else 'length'),
+            'L_star': self.sp_L_star.value(),
+            'L_star_unit': self.cb_L_star_unit.currentText(),
+            'losses': {
+                'reaction_eff': self.sp_eff_reaction.value(),
+                'nozzle_eff': self.sp_eff_nozzle.value(),
+            },
             'gasdynamics': {
                 'dim_mode': '2d' if self.rb_dim_2d.isChecked() else '1d',
                 'n_radial_2d': self.sp_n_radial_2d.value(),
@@ -3817,6 +4619,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sp_L_chamber.setValue(cfg.get('L_chamber', 0.1))
             self.sp_L_conv.setValue(cfg.get('L_conv', 0.05))
             self.sp_L_div.setValue(cfg.get('L_div', 0.2))
+            # Характеристическая длина L* и режим задания размера камеры
+            self.sp_L_star.setValue(float(cfg.get('L_star', 1.0)))
+            self.cb_L_star_unit.setCurrentText(cfg.get('L_star_unit', 'м'))
+            if cfg.get('chamber_size_mode') == 'lstar':
+                self.rb_chamber_lstar.setChecked(True)
+            else:
+                self.rb_chamber_len.setChecked(True)
+            self._on_chamber_size_mode_changed()
+            # Потери (КПД)
+            losses = cfg.get('losses')
+            if isinstance(losses, dict):
+                self.sp_eff_reaction.setValue(float(losses.get('reaction_eff', 1.0)))
+                self.sp_eff_nozzle.setValue(float(losses.get('nozzle_eff', 1.0)))
             gd = cfg.get('gasdynamics')
             if isinstance(gd, dict):
                 if gd.get('dim_mode') == '2d':
