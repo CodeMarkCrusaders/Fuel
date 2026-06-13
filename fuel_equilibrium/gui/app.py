@@ -2371,48 +2371,6 @@ class MainWindow(QtWidgets.QMainWindow):
         a0 = float(getattr(all_stations[0], "a_m_per_s", 0.0)) or max(
             (float(getattr(s, "a_m_per_s", 0.0)) for s in all_stations), default=1.0)
 
-        # ── Координата x для ВСЕХ сечений (м) ────────────────────────────────
-        try:
-            L_conv_auto, L_div_auto = self._auto_conv_div_lengths()
-            x_all = np.asarray(build_nozzle_geometry(
-                all_stations,
-                L_chamber=self._chamber_length_m(),
-                L_conv=L_conv_auto,
-                L_div=L_div_auto,
-            ), dtype=float)
-        except Exception:
-            x_all = np.arange(len(all_stations), dtype=float)
-
-        # ── Берём ВСЕ сечения, начиная с x = 0 (начало камеры сгорания) ──────
-        # Газодинамические параметры считаются от 0 (вход камеры). Чтобы кривые
-        # не вырождались в «полочку» (мало точек на участке камеры с V≈0), ниже
-        # узловые значения сгущаются и интерполируются физически — по λ.
-        stations = list(all_stations)
-        x_m = np.asarray(x_all, dtype=float)
-        x_m = x_m - float(np.nanmin(x_m))   # x = 0 в начале камеры сгорания
-        x_mm = x_m * 1000.0
-
-        # Параметры торможения по всем сечениям
-        P = np.array([float(s.P_Pa) for s in stations])
-        T = np.array([float(s.T_K) for s in stations])
-        rho = np.array([float(getattr(s, "rho_kg_per_m3", 0.0)) for s in stations])
-        V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in stations])
-        a = np.array([float(getattr(s, "a_m_per_s", 0.0)) for s in stations])
-        Ae_At = np.array([float(getattr(s, "Ae_At", 1.0)) for s in stations])
-
-        # Реальный контур сопла r(x) (нормирован на R_throat = 1) для профиля
-        try:
-            r_contour = np.asarray(nozzle_radius(stations), dtype=float)
-        except Exception:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                r_contour = np.sqrt(np.clip(Ae_At, 1e-9, None))
-
-        # Скоростной коэффициент в узловых сечениях λ = V / a_кр,
-        # где a_кр = a₀·sqrt(2/(k+1)). В камере (Injector) λ≈0.
-        a_cr = a0 * math.sqrt(2.0 / (k0 + 1.0)) if a0 > 0 else 1.0
-        with np.errstate(divide='ignore', invalid='ignore'):
-            lam_nodes = np.where(a_cr > 0, V / a_cr, 0.0)
-
         # ── Газодинамические функции от λ (изэнтропические соотношения) ───────
         # Считаем τ, π, ε, q, y АНАЛИТИЧЕСКИ из λ — это гарантирует гладкие,
         # физически согласованные кривые от начала камеры (λ→0 ⇒ τ,π,ε→1, q→0).
@@ -2439,27 +2397,112 @@ class MainWindow(QtWidgets.QMainWindow):
                               0.0)
             return yy
 
-        # ── Сгущаем сетку по x, чтобы убрать «полочку» в камере ───────────────
-        # λ(x) гладко интерполируется на частую сетку (монотонно по участкам),
-        # затем все функции пересчитываются из λ — кривые получаются плавными,
-        # начинаясь от значений торможения в начале камеры (x = 0).
-        order0 = np.argsort(x_mm)
-        x_sorted = x_mm[order0]
-        lam_sorted = lam_nodes[order0]
-        # убираем дубли по x для интерполяции
-        x_u, iu = np.unique(x_sorted, return_index=True)
-        lam_u = lam_sorted[iu]
-        if x_u.size >= 2:
-            xs = np.linspace(float(x_u[0]), float(x_u[-1]), 240)
+        # q(λ) для обращения «площадь → λ»: q(λ) = A_кр/A = (R_кр/R)².
+        def _lambda_from_area_ratio(area_ratio, k, supersonic):
+            """Решает q(λ)=1/area_ratio относительно λ (бисекция).
+
+            area_ratio = A/A_кр ≥ 1. supersonic=False → дозвуковая ветвь
+            (0<λ<1), True → сверхзвуковая (1<λ<λ_max).
+            """
+            k = max(k, 1.0001)
+            target = 1.0 / max(area_ratio, 1.0)   # q ∈ (0..1]
+            lam_max = math.sqrt((k + 1.0) / (k - 1.0))
+            if supersonic:
+                lo, hi = 1.0, lam_max - 1e-6
+            else:
+                lo, hi = 1e-6, 1.0
+            ql = float(_q_of_lambda(np.array([lo]), k)[0])
+            qh = float(_q_of_lambda(np.array([hi]), k)[0])
+            # q монотонна на каждой ветви: дозв. растёт, сверхзв. убывает
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                qm = float(_q_of_lambda(np.array([mid]), k)[0])
+                if (qm < target) == (ql < target):
+                    lo, ql = mid, qm
+                else:
+                    hi, qh = mid, qm
+            return 0.5 * (lo + hi)
+
+        # ── Реальный профиль сопла из геометрии (как на вкладке «Профиль») ────
+        # Используем тот же контур, что и «Профилированное/Коническое» сопло,
+        # вместо приближения √(Ae/At). λ(x) восстанавливается из A(x)/A_кр.
+        geom = None
+        try:
+            geom = self._build_calc_geometry(perf)
+        except Exception:
+            geom = None
+
+        if geom is not None and getattr(geom, "points", None):
+            gx, gr = geom.as_xy_arrays()             # м, м (реальный контур)
+            gx = np.asarray(gx, dtype=float)
+            gr = np.asarray(gr, dtype=float)
+            R_throat_m = float(getattr(geom, "R_throat_m", np.nanmin(gr)) or np.nanmin(gr))
+            R_throat_m = max(R_throat_m, 1e-6)
+            x_throat_m = float(getattr(geom, "length_subsonic_m", gx[int(np.nanargmin(gr))]))
+            # сгущаем по x и убираем дубли
+            x_u, iu = np.unique(gx, return_index=True)
+            r_u = gr[iu]
+            xs_m = np.linspace(float(x_u[0]), float(x_u[-1]), 280)
             try:
                 from scipy.interpolate import PchipInterpolator  # type: ignore
-                lam = PchipInterpolator(x_u, lam_u)(xs)
+                r_xs_m = PchipInterpolator(x_u, r_u)(xs_m)
             except Exception:
-                lam = np.interp(xs, x_u, lam_u)
+                r_xs_m = np.interp(xs_m, x_u, r_u)
+            xs = xs_m * 1000.0                        # мм для оси графиков
+            r_profile_mm = r_xs_m * 1000.0
+            x_throat_mm = x_throat_m * 1000.0
+            # λ(x) из площади: A/A_кр=(r/R_кр)², ветвь по положению относ. горловины
+            area_ratio = np.clip((r_xs_m / R_throat_m) ** 2, 1.0, None)
+            lam = np.empty_like(xs_m)
+            for i in range(xs_m.size):
+                supersonic = xs_m[i] > x_throat_m
+                lam[i] = _lambda_from_area_ratio(float(area_ratio[i]), k0, supersonic)
+            lam = np.clip(lam, 0.0, None)
         else:
-            xs = x_sorted
-            lam = lam_sorted
-        lam = np.clip(lam, 0.0, None)
+            # ── Запасной вариант: контур и λ из сечений солвера ───────────────
+            L_conv_auto, L_div_auto = self._auto_conv_div_lengths()
+            try:
+                x_all = np.asarray(build_nozzle_geometry(
+                    all_stations, L_chamber=self._chamber_length_m(),
+                    L_conv=L_conv_auto, L_div=L_div_auto), dtype=float)
+            except Exception:
+                x_all = np.arange(len(all_stations), dtype=float)
+            x_m = x_all - float(np.nanmin(x_all))
+            x_mm_nodes = x_m * 1000.0
+            V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in all_stations])
+            a_cr = a0 * math.sqrt(2.0 / (k0 + 1.0)) if a0 > 0 else 1.0
+            lam_nodes = np.where(a_cr > 0, V / a_cr, 0.0)
+            try:
+                r_nodes = np.asarray(nozzle_radius(all_stations), dtype=float)
+            except Exception:
+                Ae_At = np.array([float(getattr(s, "Ae_At", 1.0)) for s in all_stations])
+                r_nodes = np.sqrt(np.clip(Ae_At, 1e-9, None))
+            try:
+                R_throat_m = self._length_to_m(self.sp_calc_Rthroat.value(),
+                                               self.cb_calc_Rthroat_unit.currentText())
+            except Exception:
+                R_throat_m = 0.05
+            R_throat_mm = max(R_throat_m, 1e-4) * 1000.0
+            o0 = np.argsort(x_mm_nodes)
+            x_u, iu = np.unique(x_mm_nodes[o0], return_index=True)
+            lam_u = lam_nodes[o0][iu]
+            r_u = (r_nodes[o0][iu]) * R_throat_mm
+            if x_u.size >= 2:
+                xs = np.linspace(float(x_u[0]), float(x_u[-1]), 240)
+                try:
+                    from scipy.interpolate import PchipInterpolator  # type: ignore
+                    lam = PchipInterpolator(x_u, lam_u)(xs)
+                    r_profile_mm = PchipInterpolator(x_u, r_u)(xs)
+                except Exception:
+                    lam = np.interp(xs, x_u, lam_u)
+                    r_profile_mm = np.interp(xs, x_u, r_u)
+            else:
+                xs = x_u
+                lam = lam_u
+                r_profile_mm = r_u
+            lam = np.clip(lam, 0.0, None)
+            i_thr = int(np.nanargmin(r_profile_mm)) if r_profile_mm.size else 0
+            x_throat_mm = float(xs[i_thr]) if xs.size else 0.0
 
         tau = _tau_of_lambda(lam, k0)
         pi = _pi_of_lambda(lam, k0)
@@ -2471,43 +2514,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # На сгущённой сетке порядок уже прямой
         order = np.arange(xs.size)
-
-        # ── Реальный контур сопла r(x) (в мм) для отдельного графика профиля ──
-        # r_contour нормирован на R_throat = 1. Переводим в физический радиус (мм)
-        # и интерполируем на сгущённую сетку xs (как у функций).
-        try:
-            R_throat_m = self._length_to_m(
-                self.sp_calc_Rthroat.value(),
-                self.cb_calc_Rthroat_unit.currentText())
-        except Exception:
-            R_throat_m = 0.05
-        R_throat_mm = max(R_throat_m, 1e-4) * 1000.0
-        r_nodes_mm = np.asarray(r_contour, dtype=float) * R_throat_mm
-        r_nodes_mm = np.where(np.isfinite(r_nodes_mm), r_nodes_mm, R_throat_mm)
-        # интерполяция контура на сгущённую сетку (по тем же узлам x_mm)
-        r_node_sorted = r_nodes_mm[order0]
-        r_u = r_node_sorted[iu]
-        if x_u.size >= 2:
-            try:
-                from scipy.interpolate import PchipInterpolator  # type: ignore
-                r_profile_mm = PchipInterpolator(x_u, r_u)(xs)
-            except Exception:
-                r_profile_mm = np.interp(xs, x_u, r_u)
-        else:
-            r_profile_mm = np.full_like(xs, R_throat_mm)
-        r_profile_mm = np.where(np.isfinite(r_profile_mm), r_profile_mm, R_throat_mm)
+        r_profile_mm = np.asarray(r_profile_mm, dtype=float)
+        r_profile_mm = np.where(np.isfinite(r_profile_mm), r_profile_mm,
+                                float(np.nanmedian(r_profile_mm)) if r_profile_mm.size else 1.0)
         # нормированная форма стенки [0..1] для ненавязчивого силуэта в панелях
         r_wall_max = float(np.nanmax(r_profile_mm)) if r_profile_mm.size else 1.0
         if not (r_wall_max > 0):
             r_wall_max = 1.0
         r_shape = r_profile_mm / r_wall_max
-
-        # Положение горловины (минимум контура r) — вертикальная линия-отметка
-        try:
-            i_thr = int(np.nanargmin(r_profile_mm))
-            x_throat_mm = float(xs[i_thr])
-        except Exception:
-            x_throat_mm = 0.0
+        # x_throat_mm уже определён выше (length_subsonic_m из геометрии либо
+        # минимум контура в запасном варианте).
 
         # Кривые уже гладкие (аналитика из λ на частой сетке) — без доп. фильтра.
         def _smooth(arr):
