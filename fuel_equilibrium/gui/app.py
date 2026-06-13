@@ -1198,40 +1198,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_L_star_unit.setCurrentText("м")
         h_L_star.addWidget(self.cb_L_star_unit)
 
+        # Длины конфузора и дивергента БОЛЬШЕ НЕ ВВОДЯТСЯ вручную — они
+        # вычисляются автоматически из геометрии (см. _auto_conv_div_lengths).
+        # Спинбоксы оставлены скрытыми только для совместимости с сохранёнными
+        # конфигурациями (загрузка/сохранение значений), в UI не отображаются.
         self.sp_L_conv = QtWidgets.QDoubleSpinBox()
         self.sp_L_conv.setRange(0.000, 1000.0)
         self.sp_L_conv.setDecimals(4)
         self.sp_L_conv.setValue(0.050)
-        self.sp_L_conv.setSingleStep(0.01)
-        w_L_co = QtWidgets.QWidget()
-        h_L_co = QtWidgets.QHBoxLayout(w_L_co)
-        h_L_co.setContentsMargins(0,0,0,0)
-        h_L_co.addWidget(self.sp_L_conv)
+        self.sp_L_conv.setVisible(False)
         self.cb_L_conv_unit = QtWidgets.QComboBox()
         self.cb_L_conv_unit.addItems(["м", "см", "мм"])
         self.cb_L_conv_unit.setCurrentText("м")
-        h_L_co.addWidget(self.cb_L_conv_unit)
+        self.cb_L_conv_unit.setVisible(False)
 
         self.sp_L_div = QtWidgets.QDoubleSpinBox()
         self.sp_L_div.setRange(0.000, 1000.0)
         self.sp_L_div.setDecimals(4)
         self.sp_L_div.setValue(0.200)
-        self.sp_L_div.setSingleStep(0.01)
-        w_L_di = QtWidgets.QWidget()
-        h_L_di = QtWidgets.QHBoxLayout(w_L_di)
-        h_L_di.setContentsMargins(0,0,0,0)
-        h_L_di.addWidget(self.sp_L_div)
+        self.sp_L_div.setVisible(False)
         self.cb_L_div_unit = QtWidgets.QComboBox()
         self.cb_L_div_unit.addItems(["м", "см", "мм"])
         self.cb_L_div_unit.setCurrentText("м")
-        h_L_di.addWidget(self.cb_L_div_unit)
+        self.cb_L_div_unit.setVisible(False)
 
         self.lbl_L_chamber = QtWidgets.QLabel("Длина камеры:")
         self.lbl_L_star = QtWidgets.QLabel("Характеристическая L*:")
         form4.addRow(self.lbl_L_chamber, w_L_ch)
         form4.addRow(self.lbl_L_star, w_L_star)
-        form4.addRow("Конфузор:", w_L_co)
-        form4.addRow("Дивергент:", w_L_di)
 
         # Взаимоисключающее переключение «Длина камеры» / «L*»:
         # активным остаётся только один ввод, второй — заблокирован.
@@ -2347,6 +2341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         синей линией показан контур сопла r(x) (в относительном масштабе) для
         привязки к геометрии — как на эталонных графиках.
         """
+        c.fig.clear()  # на случай прямого вызова (минуя _render_field_2d)
         perf = getattr(self, "perf", None)
         if perf is None or not getattr(perf, "stations", None):
             ax = c.fig.add_subplot(111)
@@ -2361,93 +2356,184 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lbl_field_2d_cursor.setText("Нет данных 1D.")
             return
 
-        stations = perf.stations
+        all_stations = perf.stations
 
-        # Координата по длине сопла (м) для каждого сечения
-        def _len_to_m(v, unit):
-            return {'м': v, 'см': v * 0.01, 'мм': v * 0.001}.get(unit, v)
+        # Параметры торможения (камера = первое сечение) — для нормировки τ, π, ε
+        # и расчёта λ. Берём ДО фильтрации, т.к. это полные (stagnation) величины.
+        T0 = float(getattr(all_stations[0], "T_K", 0.0)) or max(
+            (float(getattr(s, "T_K", 0.0)) for s in all_stations), default=1.0)
+        P0 = float(getattr(all_stations[0], "P_Pa", 0.0)) or max(
+            (float(getattr(s, "P_Pa", 0.0)) for s in all_stations), default=1.0)
+        rho0 = float(getattr(all_stations[0], "rho_kg_per_m3", 0.0)) or max(
+            (float(getattr(s, "rho_kg_per_m3", 0.0)) for s in all_stations), default=1.0)
+        gam0 = float(getattr(all_stations[0], "gamma_s", 0.0) or 0.0)
+        k0 = gam0 if gam0 > 1.0 else 1.2
+        a0 = float(getattr(all_stations[0], "a_m_per_s", 0.0)) or max(
+            (float(getattr(s, "a_m_per_s", 0.0)) for s in all_stations), default=1.0)
+
+        # ── Координата x для ВСЕХ сечений (м) ────────────────────────────────
         try:
-            x_m = np.asarray(build_nozzle_geometry(
-                stations,
+            L_conv_auto, L_div_auto = self._auto_conv_div_lengths()
+            x_all = np.asarray(build_nozzle_geometry(
+                all_stations,
                 L_chamber=self._chamber_length_m(),
-                L_conv=_len_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
-                L_div=_len_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+                L_conv=L_conv_auto,
+                L_div=L_div_auto,
             ), dtype=float)
         except Exception:
-            x_m = np.arange(len(stations), dtype=float)
+            x_all = np.arange(len(all_stations), dtype=float)
+
+        # ── Берём ВСЕ сечения, начиная с x = 0 (начало камеры сгорания) ──────
+        # Газодинамические параметры считаются от 0 (вход камеры). Чтобы кривые
+        # не вырождались в «полочку» (мало точек на участке камеры с V≈0), ниже
+        # узловые значения сгущаются и интерполируются физически — по λ.
+        stations = list(all_stations)
+        x_m = np.asarray(x_all, dtype=float)
+        x_m = x_m - float(np.nanmin(x_m))   # x = 0 в начале камеры сгорания
         x_mm = x_m * 1000.0
 
-        # Параметры по сечениям
+        # Параметры торможения по всем сечениям
         P = np.array([float(s.P_Pa) for s in stations])
         T = np.array([float(s.T_K) for s in stations])
         rho = np.array([float(getattr(s, "rho_kg_per_m3", 0.0)) for s in stations])
         V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in stations])
         a = np.array([float(getattr(s, "a_m_per_s", 0.0)) for s in stations])
-        gam = np.array([float(getattr(s, "gamma_s", 0.0) or 1.2) for s in stations])
         Ae_At = np.array([float(getattr(s, "Ae_At", 1.0)) for s in stations])
 
-        # Параметры торможения (камера = первое сечение)
-        T0 = T[0] if T.size and T[0] > 0 else (np.nanmax(T) if T.size else 1.0)
-        P0 = P[0] if P.size and P[0] > 0 else (np.nanmax(P) if P.size else 1.0)
-        rho0 = rho[0] if rho.size and rho[0] > 0 else (np.nanmax(rho) if rho.size else 1.0)
-        k0 = float(gam[0]) if gam.size and gam[0] > 1.0 else 1.2
+        # Реальный контур сопла r(x) (нормирован на R_throat = 1) для профиля
+        try:
+            r_contour = np.asarray(nozzle_radius(stations), dtype=float)
+        except Exception:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                r_contour = np.sqrt(np.clip(Ae_At, 1e-9, None))
 
-        # Скоростной коэффициент λ = V / a_кр, где a_кр = sqrt(2k/(k+1)·R·T₀).
-        # Удобно: a_кр = a₀·sqrt(2/(k+1)), где a₀ = sqrt(k·R·T₀). Берём a по камере.
-        a0 = a[0] if a.size and a[0] > 0 else (np.nanmax(a) if a.size else 1.0)
+        # Скоростной коэффициент в узловых сечениях λ = V / a_кр,
+        # где a_кр = a₀·sqrt(2/(k+1)). В камере (Injector) λ≈0.
         a_cr = a0 * math.sqrt(2.0 / (k0 + 1.0)) if a0 > 0 else 1.0
         with np.errstate(divide='ignore', invalid='ignore'):
-            lam = np.where(a_cr > 0, V / a_cr, 0.0)
-            tau = np.where(T0 > 0, T / T0, 0.0)        # τ(λ)
-            pi = np.where(P0 > 0, P / P0, 0.0)          # π(λ)
-            eps = np.where(rho0 > 0, rho / rho0, 0.0)   # ε(λ)
+            lam_nodes = np.where(a_cr > 0, V / a_cr, 0.0)
 
-        # Расходная функция q(λ) = λ·((k+1)/2)^(1/(k-1))·(1-(k-1)/(k+1)·λ²)^(1/(k-1))
+        # ── Газодинамические функции от λ (изэнтропические соотношения) ───────
+        # Считаем τ, π, ε, q, y АНАЛИТИЧЕСКИ из λ — это гарантирует гладкие,
+        # физически согласованные кривые от начала камеры (λ→0 ⇒ τ,π,ε→1, q→0).
+        def _tau_of_lambda(lm, k):
+            k = max(k, 1.0001)
+            return 1.0 - (k - 1.0) / (k + 1.0) * lm * lm        # T/T0
+        def _pi_of_lambda(lm, k):
+            k = max(k, 1.0001)
+            base = np.clip(_tau_of_lambda(lm, k), 0.0, None)
+            return base ** (k / (k - 1.0))                       # P/P0
+        def _eps_of_lambda(lm, k):
+            k = max(k, 1.0001)
+            base = np.clip(_tau_of_lambda(lm, k), 0.0, None)
+            return base ** (1.0 / (k - 1.0))                     # ρ/ρ0
         def _q_of_lambda(lm, k):
             k = max(k, 1.0001)
-            base = 1.0 - (k - 1.0) / (k + 1.0) * lm * lm
-            base = np.clip(base, 0.0, None)
+            base = np.clip(1.0 - (k - 1.0) / (k + 1.0) * lm * lm, 0.0, None)
             return (lm * ((k + 1.0) / 2.0) ** (1.0 / (k - 1.0))
                     * base ** (1.0 / (k - 1.0)))
-        q = _q_of_lambda(lam, k0)
+        def _y_of_lambda(lm, k):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                yy = np.where(lm > 1e-9,
+                              (1.0 + lm * lm) / (2.0 * lm) * _q_of_lambda(lm, k),
+                              0.0)
+            return yy
 
-        # Функция удельного импульса y(λ) = (1+λ²)/(2λ)·q(λ) (нормирована к max=1)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            y = np.where(lam > 1e-9, (1.0 + lam * lam) / (2.0 * lam) * q, 0.0)
+        # ── Сгущаем сетку по x, чтобы убрать «полочку» в камере ───────────────
+        # λ(x) гладко интерполируется на частую сетку (монотонно по участкам),
+        # затем все функции пересчитываются из λ — кривые получаются плавными,
+        # начинаясь от значений торможения в начале камеры (x = 0).
+        order0 = np.argsort(x_mm)
+        x_sorted = x_mm[order0]
+        lam_sorted = lam_nodes[order0]
+        # убираем дубли по x для интерполяции
+        x_u, iu = np.unique(x_sorted, return_index=True)
+        lam_u = lam_sorted[iu]
+        if x_u.size >= 2:
+            xs = np.linspace(float(x_u[0]), float(x_u[-1]), 240)
+            try:
+                from scipy.interpolate import PchipInterpolator  # type: ignore
+                lam = PchipInterpolator(x_u, lam_u)(xs)
+            except Exception:
+                lam = np.interp(xs, x_u, lam_u)
+        else:
+            xs = x_sorted
+            lam = lam_sorted
+        lam = np.clip(lam, 0.0, None)
+
+        tau = _tau_of_lambda(lam, k0)
+        pi = _pi_of_lambda(lam, k0)
+        eps = _eps_of_lambda(lam, k0)
+        q = _q_of_lambda(lam, k0)
+        y = _y_of_lambda(lam, k0)
         if np.nanmax(np.abs(y)) > 0:
             y = y / np.nanmax(y)
 
-        # Сортируем всё по координате x (для корректных линий и интерполяции)
-        order = np.argsort(x_mm)
-        xs = x_mm[order]
+        # На сгущённой сетке порядок уже прямой
+        order = np.arange(xs.size)
 
-        # ── Контур сопла r(x) для фоновой силуэтной заливки ──────────────────
-        # r ∝ √(Ae/At): корректная форма стенки (камера → горловина → срез).
-        with np.errstate(divide='ignore', invalid='ignore'):
-            r_wall = np.sqrt(np.clip(Ae_At, 1e-9, None))[order]
-        r_wall_max = float(np.nanmax(r_wall)) if r_wall.size else 1.0
+        # ── Реальный контур сопла r(x) (в мм) для отдельного графика профиля ──
+        # r_contour нормирован на R_throat = 1. Переводим в физический радиус (мм)
+        # и интерполируем на сгущённую сетку xs (как у функций).
+        try:
+            R_throat_m = self._length_to_m(
+                self.sp_calc_Rthroat.value(),
+                self.cb_calc_Rthroat_unit.currentText())
+        except Exception:
+            R_throat_m = 0.05
+        R_throat_mm = max(R_throat_m, 1e-4) * 1000.0
+        r_nodes_mm = np.asarray(r_contour, dtype=float) * R_throat_mm
+        r_nodes_mm = np.where(np.isfinite(r_nodes_mm), r_nodes_mm, R_throat_mm)
+        # интерполяция контура на сгущённую сетку (по тем же узлам x_mm)
+        r_node_sorted = r_nodes_mm[order0]
+        r_u = r_node_sorted[iu]
+        if x_u.size >= 2:
+            try:
+                from scipy.interpolate import PchipInterpolator  # type: ignore
+                r_profile_mm = PchipInterpolator(x_u, r_u)(xs)
+            except Exception:
+                r_profile_mm = np.interp(xs, x_u, r_u)
+        else:
+            r_profile_mm = np.full_like(xs, R_throat_mm)
+        r_profile_mm = np.where(np.isfinite(r_profile_mm), r_profile_mm, R_throat_mm)
+        # нормированная форма стенки [0..1] для ненавязчивого силуэта в панелях
+        r_wall_max = float(np.nanmax(r_profile_mm)) if r_profile_mm.size else 1.0
         if not (r_wall_max > 0):
             r_wall_max = 1.0
-        # нормированная форма стенки [0..1] для рисования силуэта в каждой панели
-        r_shape = r_wall / r_wall_max
+        r_shape = r_profile_mm / r_wall_max
 
-        # Положение горловины (минимум Ae_At) — вертикальная линия-отметка
+        # Положение горловины (минимум контура r) — вертикальная линия-отметка
         try:
-            i_thr = int(np.nanargmin(Ae_At))
-            x_throat_mm = float(x_mm[i_thr])
+            i_thr = int(np.nanargmin(r_profile_mm))
+            x_throat_mm = float(xs[i_thr])
         except Exception:
             x_throat_mm = 0.0
 
-        # ── Лёгкое сглаживание кривых для подавления численного шума решателя ──
-        # Скользящее среднее по 3 точкам (края оставляем как есть). Применяем
-        # только к гладким по физике функциям; форму не искажает на «полочках».
+        # Кривые уже гладкие (аналитика из λ на частой сетке) — без доп. фильтра.
         def _smooth(arr):
-            a = np.asarray(arr, dtype=float)[order]
-            if a.size < 5:
-                return a
-            out = a.copy()
-            out[1:-1] = (a[:-2] + 2.0 * a[1:-1] + a[2:]) / 4.0
-            return out
+            return np.asarray(arr, dtype=float)
+
+        # ── Панель 1 (на всю ширину сверху): профиль сопла r(x) ──────────────
+        # GridSpec: верхняя строка — профиль сопла, ниже 3×2 функции.
+        gs = c.fig.add_gridspec(
+            4, 2, height_ratios=[0.9, 1.0, 1.0, 1.0],
+            left=0.08, right=0.97, top=0.93, bottom=0.06,
+            hspace=0.55, wspace=0.25,
+        )
+        ax_prof = c.fig.add_subplot(gs[0, :])
+        ax_prof.fill_between(xs, -r_profile_mm, r_profile_mm,
+                             color='#6ab0ff', alpha=0.20, lw=0, zorder=0)
+        ax_prof.plot(xs, r_profile_mm, '-', color='#1c3fce', lw=2.0, zorder=3)
+        ax_prof.plot(xs, -r_profile_mm, '-', color='#1c3fce', lw=2.0, zorder=3)
+        ax_prof.axhline(0.0, color='#888', ls='-', lw=0.6, zorder=1)
+        ax_prof.axvline(x_throat_mm, color='#555', ls=':', lw=1.0, zorder=2)
+        ax_prof.set_title("Профиль сопла r(x)", fontsize=10)
+        ax_prof.set_xlabel("Координата вдоль оси сопла X, мм", fontsize=8)
+        ax_prof.set_ylabel("r, мм", fontsize=9)
+        ax_prof.tick_params(labelsize=7)
+        ax_prof.grid(True, alpha=0.25)
+        ax_prof.set_aspect('auto')
+        axes_cache = [(ax_prof, xs, r_profile_mm, "Профиль сопла r(x)", "r, мм")]
 
         panels = [
             ("Функция температуры τ(λ)",   _smooth(tau), "τ(λ) = T/T0",  "#e03131"),
@@ -2458,9 +2544,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Скоростной коэффициент λ(x)", _smooth(lam), "λ",             "#9c2a2a"),
         ]
 
-        axes_cache = []
         for idx, (title, ys, ylab, color) in enumerate(panels):
-            ax = c.fig.add_subplot(3, 2, idx + 1)
+            row = 1 + idx // 2
+            col = idx % 2
+            ax = c.fig.add_subplot(gs[row, col])
             ys = np.asarray(ys, dtype=float)
             # ── Силуэт контура сопла (фон): полупрозрачная заливка r(x) ──
             ymin = np.nanmin(ys) if np.isfinite(np.nanmin(ys)) else 0.0
@@ -2469,14 +2556,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 ymax = ymin + 1.0
             pad = 0.08 * (ymax - ymin)
             y_lo, y_hi = ymin - pad, ymax + pad
-            # стенка занимает нижние ~35% высоты панели — как ненавязчивый силуэт
-            wall_top = y_lo + 0.35 * (y_hi - y_lo) * r_shape
+            # стенка занимает нижние ~30% высоты панели — как ненавязчивый силуэт
+            wall_top = y_lo + 0.30 * (y_hi - y_lo) * r_shape
             ax.fill_between(xs, y_lo, wall_top, color='#6ab0ff',
-                            alpha=0.12, lw=0, zorder=0)
-            ax.plot(xs, wall_top, '-', color='#6ab0ff', lw=0.8,
-                    alpha=0.55, zorder=1)
+                            alpha=0.10, lw=0, zorder=0)
+            ax.plot(xs, wall_top, '-', color='#6ab0ff', lw=0.7,
+                    alpha=0.45, zorder=1)
             # Основная кривая функции
-            ax.plot(xs, ys, '-', color=color, lw=2.4, zorder=3)
+            ax.plot(xs, ys, '-', color=color, lw=2.2, zorder=3)
             # Вертикальная линия горловины
             ax.axvline(x_throat_mm, color='#555', ls=':', lw=1.0, zorder=2)
             if idx == 3:  # q(λ) — горизонталь q=1 (максимум в горловине)
@@ -2492,8 +2579,7 @@ class MainWindow(QtWidgets.QMainWindow):
             axes_cache.append((ax, xs, ys, title, ylab))
 
         c.fig.suptitle("Газодинамические функции по длине сопла (1D)",
-                       fontsize=11, y=0.995)
-        c.fig.tight_layout(rect=(0, 0, 1, 0.98))
+                       fontsize=11, y=0.985)
         c.draw()
 
         # Кэш для считывания значений под курсором (мультипанельный режим)
@@ -3057,6 +3143,69 @@ class MainWindow(QtWidgets.QMainWindow):
                 rcham_ratio = 1.0
         rcham_ratio = max(rcham_ratio, 1.0)
         return L_star / (rcham_ratio * rcham_ratio)
+
+    def _auto_conv_div_lengths(self) -> tuple:
+        """Автоматически вычисляет длины конфузора и дивергента (в метрах).
+
+        Раньше эти величины задавались вручную (поля «Конфузор»/«Дивергент»).
+        Теперь они выводятся из геометрии сопла:
+
+          • Конфузор (дозвук): конус от радиуса камеры R_к к радиусу горловины
+            R_кр с полууглом θ_вх →  L_conv = (R_к − R_кр) / tg θ_вх.
+          • Дивергент (сверхзвук): конус от R_кр к радиусу среза R_a с полууглом
+            θ_a →  L_div = (R_a − R_кр) / tg θ_a, где R_a = R_кр·√(F_a/F_кр).
+
+        Радиус горловины и отношение R_к/R_кр берутся из панели профиля
+        (sp_calc_Rthroat, sp_calc_Rcham), полуугол входа — из sp_calc_theta_in,
+        полуугол среза — из sp_calc_theta_exit (или 15° по умолчанию). Степень
+        расширения F_a/F_кр — из результата расчёта (self.perf), иначе ~6.
+        """
+        # Радиус горловины (м)
+        try:
+            R_throat = self._length_to_m(
+                self.sp_calc_Rthroat.value(),
+                self.cb_calc_Rthroat_unit.currentText(),
+            )
+        except Exception:
+            R_throat = 0.05
+        R_throat = max(R_throat, 1e-4)
+
+        # Отношение радиусов камеры и горловины
+        try:
+            rcham_ratio = max(float(self.sp_calc_Rcham.value()), 1.05)
+        except Exception:
+            rcham_ratio = 3.0
+        R_cham = rcham_ratio * R_throat
+
+        # Степень расширения F_a/F_кр (из расчёта, иначе оценка)
+        area_ratio = 6.0
+        perf = getattr(self, "perf", None)
+        if perf is not None and getattr(perf, "stations", None):
+            try:
+                ar = float(perf.stations[-1].Ae_At)
+                if math.isfinite(ar) and ar > 1.0:
+                    area_ratio = ar
+            except Exception:
+                pass
+        R_exit = R_throat * math.sqrt(area_ratio)
+
+        # Полуугол входа (дозвуковой конус)
+        try:
+            theta_in = math.radians(max(5.0, float(self.sp_calc_theta_in.value())))
+        except Exception:
+            theta_in = math.radians(30.0)
+        # Полуугол среза (сверхзвуковой конус)
+        theta_exit = math.radians(15.0)
+        sp_te = getattr(self, "sp_calc_theta_exit", None)
+        if sp_te is not None:
+            try:
+                theta_exit = math.radians(max(3.0, float(sp_te.value())))
+            except Exception:
+                pass
+
+        L_conv = (R_cham - R_throat) / math.tan(theta_in) if theta_in > 0 else 0.0
+        L_div = (R_exit - R_throat) / math.tan(theta_exit) if theta_exit > 0 else 0.0
+        return max(L_conv, 1e-4), max(L_div, 1e-4)
 
     def _on_calc_geom_type_changed(self, *args):
         """Включает/выключает поля под выбранный тип сопла в панели расчёта."""
@@ -3861,8 +4010,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return build_nozzle_geometry(
             stations,
             L_chamber=self._chamber_length_m(),
-            L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
-            L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
         )
 
     def _snapshot_curves(self, perf):
@@ -3957,8 +4106,8 @@ class MainWindow(QtWidgets.QMainWindow):
         x = build_nozzle_geometry(
             stations,
             L_chamber=self._chamber_length_m(),
-            L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
-            L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
         )
 
         # ─── Плот 1: P, T ───
@@ -4227,8 +4376,8 @@ class MainWindow(QtWidgets.QMainWindow):
         x_all = build_nozzle_geometry(
             all_stations,
             L_chamber=self._chamber_length_m(),
-            L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
-            L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
         )
         comp_idx = self._get_composition_station_indices(all_stations)
         stations = [all_stations[i] for i in comp_idx]
@@ -4331,8 +4480,8 @@ class MainWindow(QtWidgets.QMainWindow):
         x = build_nozzle_geometry(
             stations,
             L_chamber=self._chamber_length_m(),
-            L_conv=length_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
-            L_div=length_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
         )
 
         try:
@@ -4429,8 +4578,8 @@ class MainWindow(QtWidgets.QMainWindow):
         x = build_nozzle_geometry(
             stations,
             L_chamber=self._chamber_length_m(),
-            L_conv=self.sp_L_conv.value(),
-            L_div=self.sp_L_div.value(),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
         )
 
         # Сигналы для экспорта (порядок = порядок столбцов в .data)
