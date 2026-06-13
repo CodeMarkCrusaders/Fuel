@@ -2096,7 +2096,25 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setContentsMargins(8, 8, 8, 8)
 
         ctrl = QtWidgets.QHBoxLayout()
-        ctrl.addWidget(QtWidgets.QLabel("Поле:"))
+        # Выбор режима отображения: 2D-поле или детальные газодинамические
+        # функции по длине сопла (доступны и при 1D-расчёте).
+        ctrl.addWidget(QtWidgets.QLabel("Вид:"))
+        self.cb_field_2d_mode = QtWidgets.QComboBox()
+        self.cb_field_2d_mode.addItems([
+            "Газодинамические функции (1D)",
+            "Поле течения (2D)",
+        ])
+        self.cb_field_2d_mode.setToolTip(
+            "«Газодинамические функции (1D)» — детальные интерактивные графики\n"
+            "τ(λ), π(λ), ε(λ), q(λ), y(λ), λ(x) по длине сопла (по 1D-расчёту).\n"
+            "«Поле течения (2D)» — цветовое поле параметра по сечению (нужен 2D-расчёт)."
+        )
+        self.cb_field_2d_mode.currentIndexChanged.connect(self._on_field_2d_mode_changed)
+        ctrl.addWidget(self.cb_field_2d_mode)
+
+        ctrl.addSpacing(16)
+        self.lbl_field_2d_field = QtWidgets.QLabel("Поле:")
+        ctrl.addWidget(self.lbl_field_2d_field)
         self.cb_field_2d = QtWidgets.QComboBox()
         self.cb_field_2d.addItems([
             "M (число Маха)", "P (давление)", "T (температура)",
@@ -2112,16 +2130,13 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addLayout(ctrl)
 
         self.lbl_field_2d_info = QtWidgets.QLabel(
-            "Двумерный (осесимметричный) расчёт: квази-2D модель.\n"
-            "Параметры (M, P, T, V) меняются по ДВУМ координатам — вдоль оси x\n"
-            "и по радиусу r. Радиальное распределение числа Маха строится по\n"
-            "источниковому (source-flow) приближению расходящегося потока, а\n"
-            "T, P и V пересчитываются из M по изэнтропическим соотношениям.\n"
-            "Полный метод характеристик (MOC) — следующий шаг (TODO).\n"
-            "Выберите режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)» и\n"
-            "выполните расчёт, чтобы построить поле течения.\n"
+            "«Газодинамические функции (1D)» строятся всегда по результатам 1D-расчёта:\n"
+            "τ(λ)=T/T₀, π(λ)=P/P₀, ε(λ)=ρ/ρ₀, расходная q(λ), удельный импульс y(λ)\n"
+            "и скоростной коэффициент λ(x) по длине сопла.\n"
+            "«Поле течения (2D)» — цветовое поле параметра по сечению (квази-2D, нужен\n"
+            "режим «Двумерный (2D)» во вкладке «Газодинамика (1D/2D)»).\n"
             "Интерактивно: панель сверху — приближение (лупа) / перемещение (рука) /\n"
-            "сброс (домик); наведите курсор на поле — значение в точке покажется ниже."
+            "сброс (домик); наведите курсор — значение в точке покажется ниже."
         )
         self.lbl_field_2d_info.setStyleSheet("color: #a8a29e; font-size: 10px;")
         self.lbl_field_2d_info.setWordWrap(True)
@@ -2155,6 +2170,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._field_2d_marker = None
 
         self._last_field_2d: Optional[Nozzle2DResult] = None
+
+        # Стартовый режим — «Газодинамические функции (1D)»: селектор поля (M/P/T/V)
+        # скрываем, т.к. он актуален только для 2D-поля.
+        if hasattr(self, "cb_field_2d"):
+            self.cb_field_2d.setVisible(False)
+        if hasattr(self, "lbl_field_2d_field"):
+            self.lbl_field_2d_field.setVisible(False)
         return w
 
     def _update_field_2d_from_perf(self):
@@ -2180,6 +2202,24 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"2D-расчёт пропущен: {e}", 5000)
             self._last_field_2d = None
+        # Если 2D-поле успешно посчитано — автоматически переключаемся на его
+        # отображение; иначе остаёмся на газодинамических функциях (1D).
+        if (self._last_field_2d is not None and hasattr(self, "cb_field_2d_mode")
+                and self.cb_field_2d_mode.currentIndex() != 1):
+            # currentIndexChanged сам вызовет перерисовку
+            self.cb_field_2d_mode.setCurrentIndex(1)
+            return
+        self._render_field_2d()
+
+    def _on_field_2d_mode_changed(self, *args):
+        """Переключение режима «функции 1D» / «поле 2D»: показать нужные элементы."""
+        is_2d = (hasattr(self, "cb_field_2d_mode")
+                 and self.cb_field_2d_mode.currentIndex() == 1)
+        # Селектор поля (M/P/T/V) актуален только для 2D-режима.
+        if hasattr(self, "cb_field_2d"):
+            self.cb_field_2d.setVisible(is_2d)
+        if hasattr(self, "lbl_field_2d_field"):
+            self.lbl_field_2d_field.setVisible(is_2d)
         self._render_field_2d()
 
     def _render_field_2d(self):
@@ -2189,11 +2229,22 @@ class MainWindow(QtWidgets.QMainWindow):
         c.fig.clear()
         self._field_2d_plot_cache = None
         self._field_2d_marker = None
+
+        # ── Режим «Газодинамические функции (1D)» ──────────────────────────────
+        # Доступен всегда при наличии 1D-расчёта (self.perf), даже если 2D-поле
+        # не считалось. Строит детальные интерактивные графики τ, π, ε, q, y, λ.
+        mode_2d = (hasattr(self, "cb_field_2d_mode")
+                   and self.cb_field_2d_mode.currentIndex() == 1)
+        if not mode_2d:
+            self._render_gasdynamic_functions_1d(c)
+            return
+
         res = self._last_field_2d
         if res is None:
             ax = c.fig.add_subplot(111)
             ax.text(0.5, 0.5,
-                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт.",
+                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт,\n"
+                    "либо переключите «Вид» на «Газодинамические функции (1D)».",
                     ha='center', va='center', fontsize=11, color='#888')
             ax.set_axis_off()
             c.fig.tight_layout()
@@ -2280,6 +2331,160 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "lbl_field_2d_cursor"):
             self.lbl_field_2d_cursor.setText("Наведите курсор на поле…")
 
+    # ── Детальные газодинамические функции по длине сопла (по 1D-расчёту) ─────
+    def _render_gasdynamic_functions_1d(self, c):
+        """Строит 6 интерактивных графиков газодинамических функций по длине сопла.
+
+        Источник данных — результаты 1D-расчёта (self.perf.stations). Графики:
+          τ(λ) = T/T₀        — функция температуры
+          π(λ) = P/P₀        — функция давления
+          ε(λ) = ρ/ρ₀        — функция плотности
+          q(λ)               — приведённый расход (нормирован на максимум = 1 в горловине)
+          y(λ)               — функция удельного импульса = (1+λ²)/(2λ) · q-подобная
+          λ(x)               — скоростной коэффициент по длине
+
+        Все функции строятся от координаты x вдоль оси сопла (мм), плюс тонкой
+        синей линией показан контур сопла r(x) (в относительном масштабе) для
+        привязки к геометрии — как на эталонных графиках.
+        """
+        perf = getattr(self, "perf", None)
+        if perf is None or not getattr(perf, "stations", None):
+            ax = c.fig.add_subplot(111)
+            ax.text(0.5, 0.5,
+                    "Нет данных 1D.\nВыполните газодинамический расчёт, чтобы\n"
+                    "построить газодинамические функции по длине сопла.",
+                    ha='center', va='center', fontsize=11, color='#888')
+            ax.set_axis_off()
+            c.fig.tight_layout()
+            c.draw()
+            if hasattr(self, "lbl_field_2d_cursor"):
+                self.lbl_field_2d_cursor.setText("Нет данных 1D.")
+            return
+
+        stations = perf.stations
+
+        # Координата по длине сопла (м) для каждого сечения
+        def _len_to_m(v, unit):
+            return {'м': v, 'см': v * 0.01, 'мм': v * 0.001}.get(unit, v)
+        try:
+            x_m = np.asarray(build_nozzle_geometry(
+                stations,
+                L_chamber=self._chamber_length_m(),
+                L_conv=_len_to_m(self.sp_L_conv.value(), self.cb_L_conv_unit.currentText()),
+                L_div=_len_to_m(self.sp_L_div.value(), self.cb_L_div_unit.currentText()),
+            ), dtype=float)
+        except Exception:
+            x_m = np.arange(len(stations), dtype=float)
+        x_mm = x_m * 1000.0
+
+        # Параметры по сечениям
+        P = np.array([float(s.P_Pa) for s in stations])
+        T = np.array([float(s.T_K) for s in stations])
+        rho = np.array([float(getattr(s, "rho_kg_per_m3", 0.0)) for s in stations])
+        V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in stations])
+        a = np.array([float(getattr(s, "a_m_per_s", 0.0)) for s in stations])
+        gam = np.array([float(getattr(s, "gamma_s", 0.0) or 1.2) for s in stations])
+        Ae_At = np.array([float(getattr(s, "Ae_At", 1.0)) for s in stations])
+
+        # Параметры торможения (камера = первое сечение)
+        T0 = T[0] if T.size and T[0] > 0 else (np.nanmax(T) if T.size else 1.0)
+        P0 = P[0] if P.size and P[0] > 0 else (np.nanmax(P) if P.size else 1.0)
+        rho0 = rho[0] if rho.size and rho[0] > 0 else (np.nanmax(rho) if rho.size else 1.0)
+        k0 = float(gam[0]) if gam.size and gam[0] > 1.0 else 1.2
+
+        # Скоростной коэффициент λ = V / a_кр, где a_кр = sqrt(2k/(k+1)·R·T₀).
+        # Удобно: a_кр = a₀·sqrt(2/(k+1)), где a₀ = sqrt(k·R·T₀). Берём a по камере.
+        a0 = a[0] if a.size and a[0] > 0 else (np.nanmax(a) if a.size else 1.0)
+        a_cr = a0 * math.sqrt(2.0 / (k0 + 1.0)) if a0 > 0 else 1.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            lam = np.where(a_cr > 0, V / a_cr, 0.0)
+            tau = np.where(T0 > 0, T / T0, 0.0)        # τ(λ)
+            pi = np.where(P0 > 0, P / P0, 0.0)          # π(λ)
+            eps = np.where(rho0 > 0, rho / rho0, 0.0)   # ε(λ)
+
+        # Расходная функция q(λ) = λ·((k+1)/2)^(1/(k-1))·(1-(k-1)/(k+1)·λ²)^(1/(k-1))
+        def _q_of_lambda(lm, k):
+            k = max(k, 1.0001)
+            base = 1.0 - (k - 1.0) / (k + 1.0) * lm * lm
+            base = np.clip(base, 0.0, None)
+            return (lm * ((k + 1.0) / 2.0) ** (1.0 / (k - 1.0))
+                    * base ** (1.0 / (k - 1.0)))
+        q = _q_of_lambda(lam, k0)
+
+        # Функция удельного импульса y(λ) = (1+λ²)/(2λ)·q(λ) (нормирована к max=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            y = np.where(lam > 1e-9, (1.0 + lam * lam) / (2.0 * lam) * q, 0.0)
+        if np.nanmax(np.abs(y)) > 0:
+            y = y / np.nanmax(y)
+
+        # Контур сопла r(x) — для привязки графиков к геометрии (тонкая синяя линия)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            r_rel = np.sqrt(np.clip(Ae_At, 0.0, None))   # ~ радиус (At=1)
+        # нормируем r к диапазону [0.1..0.8] для наложения как референс
+        if np.nanmax(r_rel) > np.nanmin(r_rel):
+            r_norm = 0.1 + 0.7 * (r_rel - np.nanmin(r_rel)) / (np.nanmax(r_rel) - np.nanmin(r_rel))
+        else:
+            r_norm = np.full_like(r_rel, 0.3)
+
+        # Найдём положение горловины (минимум Ae_At) для вертикальной линии x=0-эквив.
+        try:
+            i_thr = int(np.nanargmin(Ae_At))
+            x_throat_mm = float(x_mm[i_thr])
+        except Exception:
+            x_throat_mm = 0.0
+
+        panels = [
+            ("Функция температуры τ(λ)",   tau, "τ(λ) = T/T0",  "#e03131"),
+            ("Функция давления π(λ)",       pi,  "π(λ) = P/P0",  "#1c3fce"),
+            ("Функция плотности ε(λ)",      eps, "ε(λ) = ρ/ρ0",  "#7b2cbf"),
+            ("Расходная функция q(λ)",      q,   "q(λ)",          "#2b8a3e"),
+            ("Функция удельного импульса y(λ)", y, "y(λ)",        "#f59f00"),
+            ("Скоростной коэффициент λ(x)", lam, "λ",             "#9c2a2a"),
+        ]
+
+        # Сортируем по x для корректных линий
+        order = np.argsort(x_mm)
+        xs = x_mm[order]
+        r_ref = r_norm[order]
+
+        axes_cache = []
+        for idx, (title, data, ylab, color) in enumerate(panels):
+            ax = c.fig.add_subplot(3, 2, idx + 1)
+            ys = np.asarray(data, dtype=float)[order]
+            # Контур-референс (тонкая синяя линия) в масштабе текущей оси
+            ymin = np.nanmin(ys) if np.isfinite(np.nanmin(ys)) else 0.0
+            ymax = np.nanmax(ys) if np.isfinite(np.nanmax(ys)) else 1.0
+            if ymax <= ymin:
+                ymax = ymin + 1.0
+            r_scaled = ymin + (ymax - ymin) * r_ref
+            ax.plot(xs, r_scaled, '-', color='#6ab0ff', lw=0.9, alpha=0.8, zorder=1)
+            # Основная кривая функции
+            ax.plot(xs, ys, '-', color=color, lw=2.4, zorder=3)
+            # Вертикальная линия горловины
+            ax.axvline(x_throat_mm, color='#555', ls=':', lw=1.0, zorder=2)
+            if idx == 3:  # q(λ) — горизонталь q=1 (максимум в горловине)
+                ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
+            if idx == 5:  # λ(x) — горизонталь λ=1 (звуковая линия)
+                ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Координата вдоль оси сопла X, мм", fontsize=8)
+            ax.set_ylabel(ylab, color=color, fontsize=9)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.25)
+            axes_cache.append((ax, xs, ys, title, ylab))
+
+        c.fig.suptitle("Газодинамические функции по длине сопла (1D)",
+                       fontsize=11, y=0.995)
+        c.fig.tight_layout(rect=(0, 0, 1, 0.98))
+        c.draw()
+
+        # Кэш для считывания значений под курсором (мультипанельный режим)
+        self._field_2d_plot_cache = {"gdf_axes": axes_cache, "mode": "gdf_1d"}
+        if hasattr(self, "lbl_field_2d_cursor"):
+            self.lbl_field_2d_cursor.setText(
+                "Наведите курсор на график — координата X и значение функции покажутся ниже."
+            )
+
     # ── Интерактивное считывание значения поля под курсором ──────────────────
     def _field_2d_value_at(self, x: float, r: float):
         """Возвращает (значение, r_стенки) поля в точке (x, r) внутри профиля.
@@ -2335,7 +2540,27 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl = getattr(self, "lbl_field_2d_cursor", None)
         if lbl is None:
             return
-        if cache is None or event.inaxes is not cache.get("ax"):
+        if cache is None:
+            return
+
+        # ── Режим газодинамических функций (мультипанель 3×2) ──────────────────
+        if cache.get("mode") == "gdf_1d":
+            if event.inaxes is None or event.xdata is None:
+                return
+            x_cur = float(event.xdata)
+            for ax, xs, ys, title, ylab in cache.get("gdf_axes", []):
+                if event.inaxes is ax:
+                    try:
+                        val = float(np.interp(x_cur, xs, ys))
+                    except Exception:
+                        val = float("nan")
+                    lbl.setText(
+                        f"{title}:   X = {x_cur:.1f} мм    →    {ylab} = {val:.5g}"
+                    )
+                    return
+            return
+
+        if event.inaxes is not cache.get("ax"):
             return
         if event.xdata is None or event.ydata is None:
             return
