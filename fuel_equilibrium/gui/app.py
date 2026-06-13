@@ -2417,47 +2417,64 @@ class MainWindow(QtWidgets.QMainWindow):
         if np.nanmax(np.abs(y)) > 0:
             y = y / np.nanmax(y)
 
-        # Контур сопла r(x) — для привязки графиков к геометрии (тонкая синяя линия)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            r_rel = np.sqrt(np.clip(Ae_At, 0.0, None))   # ~ радиус (At=1)
-        # нормируем r к диапазону [0.1..0.8] для наложения как референс
-        if np.nanmax(r_rel) > np.nanmin(r_rel):
-            r_norm = 0.1 + 0.7 * (r_rel - np.nanmin(r_rel)) / (np.nanmax(r_rel) - np.nanmin(r_rel))
-        else:
-            r_norm = np.full_like(r_rel, 0.3)
+        # Сортируем всё по координате x (для корректных линий и интерполяции)
+        order = np.argsort(x_mm)
+        xs = x_mm[order]
 
-        # Найдём положение горловины (минимум Ae_At) для вертикальной линии x=0-эквив.
+        # ── Контур сопла r(x) для фоновой силуэтной заливки ──────────────────
+        # r ∝ √(Ae/At): корректная форма стенки (камера → горловина → срез).
+        with np.errstate(divide='ignore', invalid='ignore'):
+            r_wall = np.sqrt(np.clip(Ae_At, 1e-9, None))[order]
+        r_wall_max = float(np.nanmax(r_wall)) if r_wall.size else 1.0
+        if not (r_wall_max > 0):
+            r_wall_max = 1.0
+        # нормированная форма стенки [0..1] для рисования силуэта в каждой панели
+        r_shape = r_wall / r_wall_max
+
+        # Положение горловины (минимум Ae_At) — вертикальная линия-отметка
         try:
             i_thr = int(np.nanargmin(Ae_At))
             x_throat_mm = float(x_mm[i_thr])
         except Exception:
             x_throat_mm = 0.0
 
+        # ── Лёгкое сглаживание кривых для подавления численного шума решателя ──
+        # Скользящее среднее по 3 точкам (края оставляем как есть). Применяем
+        # только к гладким по физике функциям; форму не искажает на «полочках».
+        def _smooth(arr):
+            a = np.asarray(arr, dtype=float)[order]
+            if a.size < 5:
+                return a
+            out = a.copy()
+            out[1:-1] = (a[:-2] + 2.0 * a[1:-1] + a[2:]) / 4.0
+            return out
+
         panels = [
-            ("Функция температуры τ(λ)",   tau, "τ(λ) = T/T0",  "#e03131"),
-            ("Функция давления π(λ)",       pi,  "π(λ) = P/P0",  "#1c3fce"),
-            ("Функция плотности ε(λ)",      eps, "ε(λ) = ρ/ρ0",  "#7b2cbf"),
-            ("Расходная функция q(λ)",      q,   "q(λ)",          "#2b8a3e"),
-            ("Функция удельного импульса y(λ)", y, "y(λ)",        "#f59f00"),
-            ("Скоростной коэффициент λ(x)", lam, "λ",             "#9c2a2a"),
+            ("Функция температуры τ(λ)",   _smooth(tau), "τ(λ) = T/T0",  "#e03131"),
+            ("Функция давления π(λ)",       _smooth(pi),  "π(λ) = P/P0",  "#1c3fce"),
+            ("Функция плотности ε(λ)",      _smooth(eps), "ε(λ) = ρ/ρ0",  "#7b2cbf"),
+            ("Расходная функция q(λ)",      _smooth(q),   "q(λ)",          "#2b8a3e"),
+            ("Функция удельного импульса y(λ)", _smooth(y), "y(λ)",        "#f59f00"),
+            ("Скоростной коэффициент λ(x)", _smooth(lam), "λ",             "#9c2a2a"),
         ]
 
-        # Сортируем по x для корректных линий
-        order = np.argsort(x_mm)
-        xs = x_mm[order]
-        r_ref = r_norm[order]
-
         axes_cache = []
-        for idx, (title, data, ylab, color) in enumerate(panels):
+        for idx, (title, ys, ylab, color) in enumerate(panels):
             ax = c.fig.add_subplot(3, 2, idx + 1)
-            ys = np.asarray(data, dtype=float)[order]
-            # Контур-референс (тонкая синяя линия) в масштабе текущей оси
+            ys = np.asarray(ys, dtype=float)
+            # ── Силуэт контура сопла (фон): полупрозрачная заливка r(x) ──
             ymin = np.nanmin(ys) if np.isfinite(np.nanmin(ys)) else 0.0
             ymax = np.nanmax(ys) if np.isfinite(np.nanmax(ys)) else 1.0
             if ymax <= ymin:
                 ymax = ymin + 1.0
-            r_scaled = ymin + (ymax - ymin) * r_ref
-            ax.plot(xs, r_scaled, '-', color='#6ab0ff', lw=0.9, alpha=0.8, zorder=1)
+            pad = 0.08 * (ymax - ymin)
+            y_lo, y_hi = ymin - pad, ymax + pad
+            # стенка занимает нижние ~35% высоты панели — как ненавязчивый силуэт
+            wall_top = y_lo + 0.35 * (y_hi - y_lo) * r_shape
+            ax.fill_between(xs, y_lo, wall_top, color='#6ab0ff',
+                            alpha=0.12, lw=0, zorder=0)
+            ax.plot(xs, wall_top, '-', color='#6ab0ff', lw=0.8,
+                    alpha=0.55, zorder=1)
             # Основная кривая функции
             ax.plot(xs, ys, '-', color=color, lw=2.4, zorder=3)
             # Вертикальная линия горловины
@@ -2466,6 +2483,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
             if idx == 5:  # λ(x) — горизонталь λ=1 (звуковая линия)
                 ax.axhline(1.0, color='#aaa', ls='--', lw=0.8, zorder=2)
+            ax.set_ylim(y_lo, y_hi)
             ax.set_title(title, fontsize=10)
             ax.set_xlabel("Координата вдоль оси сопла X, мм", fontsize=8)
             ax.set_ylabel(ylab, color=color, fontsize=9)
