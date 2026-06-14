@@ -1542,20 +1542,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_subtabs = QtWidgets.QTabWidget()
         self.plot_subtabs.setObjectName("subtabs")
 
-        # Подвкладка 1: графики 1D (сетка 2x2)
+        # ── Подвкладка 1: графики 1D ───────────────────────────────────────
+        # Один холст, на котором отображаются ВЫБРАННЫЕ пользователем величины
+        # (каждая — своим подграфиком). Все значения берутся из единого
+        # источника ``_section_series`` (расчёт в одном месте). Сверху — панель
+        # выбора параметров и сохранения; ниже — стандартная панель matplotlib,
+        # позволяющая сохранять текущий рисунок отдельно.
         plot_widget = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(plot_widget)
-        grid.setSpacing(4)
+        pv = QtWidgets.QVBoxLayout(plot_widget)
+        pv.setContentsMargins(4, 4, 4, 4)
+        pv.setSpacing(4)
 
+        # Каталог доступных для отображения величин:
+        # (ключ из _section_series, подпись, единицы, цвет, признак log).
+        self.PLOT_PARAM_DEFS = [
+            ("P",   "Давление P",            "МПа",    "#cc785c", False),
+            ("T",   "Температура T",         "К",      "#6ab0ff", False),
+            ("V",   "Скорость потока V",     "м/с",    "#82d27a", False),
+            ("M",   "Число Маха M",          "",       "#e6b800", False),
+            ("rho", "Плотность ρ",           "кг/м³",  "#cc785c", False),
+            ("gs",  "Изэнтр. показатель γₛ", "",       "#c084fc", False),
+            ("a",   "Скорость звука a",      "м/с",    "#4dd0e1", False),
+        ]
+        # по умолчанию показываем основной набор
+        self._plot_default_keys = ["P", "T", "V", "M", "rho", "gs"]
+
+        # — панель выбора параметров —
+        sel_row = QtWidgets.QHBoxLayout()
+        sel_row.setSpacing(8)
+        sel_row.addWidget(QtWidgets.QLabel("Показать графики:"))
+        self.plot_param_checks = {}
+        for key, label, unit, _color, _log in self.PLOT_PARAM_DEFS:
+            cb = QtWidgets.QCheckBox(label + (f", {unit}" if unit else ""))
+            cb.setChecked(key in self._plot_default_keys)
+            cb.toggled.connect(self._redraw_plots)
+            self.plot_param_checks[key] = cb
+            sel_row.addWidget(cb)
+        sel_row.addStretch(1)
+
+        btn_save_1d = QtWidgets.QPushButton("⬇ Сохранить выбранные (PNG)")
+        btn_save_1d.setToolTip(
+            "Сохранить каждый выбранный график в отдельный PNG-файл.")
+        btn_save_1d.clicked.connect(self._save_selected_1d_plots)
+        sel_row.addWidget(btn_save_1d)
+        pv.addLayout(sel_row)
+
+        # — холст графиков 1D + панель навигации/сохранения matplotlib —
+        self.canvas_1d = MplCanvas(width=10, height=6)
+        self.toolbar_1d = NavigationToolbar(self.canvas_1d, plot_widget)
+        pv.addWidget(self.toolbar_1d)
+        pv.addWidget(self.canvas_1d, 1)
+
+        # Обратная совместимость: легаси-холсты (используются в наложениях).
+        # Не отображаются, но методам не мешают.
         self.canvas_PT = MplCanvas(width=5, height=3.5)
         self.canvas_VM = MplCanvas(width=5, height=3.5)
         self.canvas_RHO = MplCanvas(width=5, height=3.5)
-        self.canvas_PROFILE = MplCanvas(width=5, height=3.5)
 
-        grid.addWidget(self.canvas_PT, 0, 0)
-        grid.addWidget(self.canvas_VM, 0, 1)
-        grid.addWidget(self.canvas_RHO, 1, 0)
-        grid.addWidget(self.canvas_PROFILE, 1, 1)
         self.plot_subtabs.addTab(plot_widget, "Графики (1D)")
 
         # Подвкладка 2: поле течения (2D) — теперь живёт здесь, внутри
@@ -2529,27 +2572,15 @@ class MainWindow(QtWidgets.QMainWindow):
         def _smooth(arr):
             return np.asarray(arr, dtype=float)
 
-        # ── Панель 1 (на всю ширину сверху): профиль сопла r(x) ──────────────
-        # GridSpec: верхняя строка — профиль сопла, ниже 3×2 функции.
+        # ── Сетка 3×2: только газодинамические функции (профиль убран) ───────
+        # Профиль сопла отображается на вкладках «Поле течения (2D)» и
+        # «Геометрия сопла», поэтому здесь его не дублируем.
         gs = c.fig.add_gridspec(
-            4, 2, height_ratios=[0.9, 1.0, 1.0, 1.0],
-            left=0.08, right=0.97, top=0.93, bottom=0.06,
+            3, 2, height_ratios=[1.0, 1.0, 1.0],
+            left=0.08, right=0.97, top=0.92, bottom=0.07,
             hspace=0.55, wspace=0.25,
         )
-        ax_prof = c.fig.add_subplot(gs[0, :])
-        ax_prof.fill_between(xs, -r_profile_mm, r_profile_mm,
-                             color='#6ab0ff', alpha=0.20, lw=0, zorder=0)
-        ax_prof.plot(xs, r_profile_mm, '-', color='#1c3fce', lw=2.0, zorder=3)
-        ax_prof.plot(xs, -r_profile_mm, '-', color='#1c3fce', lw=2.0, zorder=3)
-        ax_prof.axhline(0.0, color='#888', ls='-', lw=0.6, zorder=1)
-        ax_prof.axvline(x_throat_mm, color='#555', ls=':', lw=1.0, zorder=2)
-        ax_prof.set_title("Профиль сопла r(x)", fontsize=10)
-        ax_prof.set_xlabel("Координата вдоль оси сопла X, мм", fontsize=8)
-        ax_prof.set_ylabel("r, мм", fontsize=9)
-        ax_prof.tick_params(labelsize=7)
-        ax_prof.grid(True, alpha=0.25)
-        ax_prof.set_aspect('auto')
-        axes_cache = [(ax_prof, xs, r_profile_mm, "Профиль сопла r(x)", "r, мм")]
+        axes_cache = []
 
         panels = [
             ("Функция температуры τ(λ)",   _smooth(tau), "τ(λ) = T/T0",  "#e03131"),
@@ -2561,7 +2592,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
 
         for idx, (title, ys, ylab, color) in enumerate(panels):
-            row = 1 + idx // 2
+            row = idx // 2
             col = idx % 2
             ax = c.fig.add_subplot(gs[row, col])
             ys = np.asarray(ys, dtype=float)
@@ -4031,7 +4062,22 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _snapshot_curves(self, perf):
-        """Снимок кривых 1D-расчёта (x + P, T, V, M, ρ, γₛ) для наложения."""
+        """Снимок кривых 1D-расчёта (x + P, T, V, M, ρ, γₛ) для наложения.
+
+        Берёт значения из единого очищенного источника ``_section_series``,
+        чтобы наложения были согласованы с основными графиками и без «иголок».
+        """
+        ser = self._section_series(perf)
+        if ser:
+            return {
+                "x": ser["x_m"],
+                "P": ser["P_Pa"] / 1e6,
+                "T": ser["T_K"],
+                "V": ser["V"],
+                "M": ser["M"],
+                "rho": ser["rho"],
+                "gs": ser["gamma_s"],
+            }
         stations = perf.stations
         x = np.asarray(self._compute_curve_x(stations), dtype=float)
         return {
@@ -4079,6 +4125,107 @@ class MainWindow(QtWidgets.QMainWindow):
             n = len(getattr(self, "_overlays", []))
             self.lbl_overlay_count.setText(f"Наложений: {n}")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ЕДИНЫЙ ИСТОЧНИК ДАННЫХ ПО СЕЧЕНИЯМ.
+    #  Все параметры газа по сечениям считаются/чистятся здесь (в одном месте)
+    #  и отдаются как словарь массивов. Любые графики (вкладка «Графики (1D)»,
+    #  газодинамические функции) и наложения берут данные именно отсюда.
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _hampel_filter(y, window: int = 2, n_sigma: float = 3.0):
+        """Удаляет одиночные выбросы (медианный фильтр Хампеля).
+
+        Точка считается выбросом, если отклоняется от скользящей медианы более
+        чем на n_sigma·(1.4826·MAD). Выбросы заменяются медианой окна. Сохраняет
+        физический тренд, убирая «иголки» от несошедшегося SP-решателя.
+        """
+        y = np.asarray(y, dtype=float)
+        n = y.size
+        if n < 2 * window + 1:
+            return y.copy()
+        out = y.copy()
+        for i in range(n):
+            lo = max(0, i - window)
+            hi = min(n, i + window + 1)
+            seg = y[lo:hi]
+            med = np.median(seg)
+            mad = np.median(np.abs(seg - med))
+            sigma = 1.4826 * mad
+            if sigma > 0 and abs(y[i] - med) > n_sigma * sigma:
+                out[i] = med
+        return out
+
+    def _section_series(self, perf=None) -> dict:
+        """Единый расчёт параметров газа по сечениям сопла (с очисткой шума).
+
+        Возвращает словарь numpy-массивов, отсортированных по координате x (м),
+        с убранными дубликатами по x и подавленными одиночными выбросами в
+        «шумных» величинах (γₛ, скорость звука, число Маха) — это убирает
+        «иголки», возникающие из-за неполной сходимости SP-задачи в отдельных
+        сечениях.
+
+        Ключи: x_m, P_Pa, T_K, rho, V, a, M, gamma_s, Ae_At, label,
+        i_throat (индекс горловины), x_throat_m.
+        """
+        if perf is None:
+            perf = getattr(self, "perf", None)
+        if perf is None or not getattr(perf, "stations", None):
+            return {}
+
+        stations = list(perf.stations)
+        x = np.asarray(build_nozzle_geometry(
+            stations,
+            L_chamber=self._chamber_length_m(),
+            L_conv=self._auto_conv_div_lengths()[0],
+            L_div=self._auto_conv_div_lengths()[1],
+        ), dtype=float)
+
+        P = np.array([float(s.P_Pa) for s in stations])
+        T = np.array([float(s.T_K) for s in stations])
+        rho = np.array([float(getattr(s, "rho_kg_per_m3", 0.0)) for s in stations])
+        V = np.array([float(getattr(s, "V_m_per_s", 0.0)) for s in stations])
+        a = np.array([float(getattr(s, "a_m_per_s", 0.0)) for s in stations])
+        gs = np.array([float(getattr(s, "gamma_s", 0.0)) for s in stations])
+        Ae = np.array([float(getattr(s, "Ae_At", float('inf'))) for s in stations])
+        labels = [getattr(s, "label", "") for s in stations]
+
+        # 1) сортировка по x и удаление дубликатов координаты
+        order = np.argsort(x, kind="stable")
+        x = x[order]; P = P[order]; T = T[order]; rho = rho[order]
+        V = V[order]; a = a[order]; gs = gs[order]; Ae = Ae[order]
+        labels = [labels[i] for i in order]
+        _, iu = np.unique(np.round(x, 9), return_index=True)
+        iu = np.sort(iu)
+        x = x[iu]; P = P[iu]; T = T[iu]; rho = rho[iu]
+        V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
+        labels = [labels[i] for i in iu]
+
+        # 2) подавление одиночных выбросов в «шумных» величинах решателя.
+        #    γₛ и a физически гладкие — «иголки» это численный шум SP-задачи.
+        #    Для γₛ берём чуть шире окно и строже порог: показатель меняется
+        #    плавно, поэтому даже умеренные «дрожания» — это шум, а не физика.
+        gs = self._hampel_filter(gs, window=3, n_sigma=2.0)
+        gs = self._hampel_filter(gs, window=2, n_sigma=2.0)
+        a = self._hampel_filter(a, window=2, n_sigma=2.5)
+        # число Маха пересчитываем из (уже очищенной) скорости звука —
+        # это убирает «иглы» по M, согласовав его с V и a.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            M = np.where(a > 0, V / a, 0.0)
+        M = self._hampel_filter(M, window=2, n_sigma=3.0)
+
+        # горловина — ближайшее к M=1 сечение (минимум |M-1|)
+        try:
+            i_throat = int(np.nanargmin(np.abs(M - 1.0)))
+        except Exception:
+            i_throat = 0
+
+        return {
+            "x_m": x, "P_Pa": P, "T_K": T, "rho": rho,
+            "V": V, "a": a, "M": M, "gamma_s": gs, "Ae_At": Ae,
+            "label": labels, "i_throat": i_throat,
+            "x_throat_m": float(x[i_throat]) if x.size else 0.0,
+        }
+
     def _draw_overlays(self, ax, key, *, twin=False):
         """Нарисовать наложенные кривые ``key`` на оси ``ax`` (фоном).
 
@@ -4108,197 +4255,205 @@ class MainWindow(QtWidgets.QMainWindow):
         style = self._collect_style()
         self.plot_style = style
 
-        stations = self.perf.stations
-        # X — координата по длине сопла
-        def length_to_m(v, unit):
-            if unit == 'м':
-                return v
-            if unit == 'см':
-                return v * 0.01
-            if unit == 'мм':
-                return v * 0.001
-            return v
-
-        x = build_nozzle_geometry(
-            stations,
-            L_chamber=self._chamber_length_m(),
-            L_conv=self._auto_conv_div_lengths()[0],
-            L_div=self._auto_conv_div_lengths()[1],
-        )
-
-        # ─── Плот 1: P, T ───
-        c = self.canvas_PT
-        c.fig.clear()
-        ax1 = c.fig.add_subplot(111)
-        P = np.array([s.P_Pa / 1e6 for s in stations])
-        T = np.array([s.T_K for s in stations])
-
-        ov_h = self._draw_overlays(ax1, "P")
-        l1, = ax1.plot(x, P, 'o-' if style.show_markers else '-',
-                       color='#cc785c', lw=style.line_width, ms=style.marker_size,
-                       label='P, МПа', zorder=3)
-        ax1.set_xlabel("Координата x, м")
-        ax1.set_ylabel("Давление P, МПа")
-
-        ax2 = ax1.twinx()
-        self._draw_overlays(ax2, "T", twin=True)
-        l2, = ax2.plot(x, T, 's--' if style.show_markers else '--',
-                       color='#6ab0ff', lw=style.line_width, ms=style.marker_size,
-                       label='T, К', zorder=3)
-        ax2.set_ylabel("Температура T, К")
-        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
-
-        style.title = "Давление и температура по длине сопла"
-        style.xlabel = "Координата x, м"
-        style.ylabel = "Давление P, МПа"
-        apply_plot_style(c.fig, ax1, style)
-        # Применим dark fg к ax2 тоже
-        self._style_twinx(ax2, style)
-        c.fig.tight_layout()
-        c.draw()
-
-        # ─── Плот 2: V, M ───
-        c = self.canvas_VM
-        c.fig.clear()
-        ax1 = c.fig.add_subplot(111)
-        V = np.array([s.V_m_per_s for s in stations])
-        M = np.array([s.M for s in stations])
-        ov_h = self._draw_overlays(ax1, "V")
-        l1, = ax1.plot(x, V, 'o-' if style.show_markers else '-',
-                       color='#82d27a', lw=style.line_width, ms=style.marker_size,
-                       label='V, м/с', zorder=3)
-        ax1.set_xlabel("Координата x, м")
-        ax1.set_ylabel("Скорость потока V, м/с")
-        ax2 = ax1.twinx()
-        self._draw_overlays(ax2, "M", twin=True)
-        l2, = ax2.plot(x, M, 'D--' if style.show_markers else '--',
-                       color='#e6b800', lw=style.line_width, ms=style.marker_size,
-                       label='M', zorder=3)
-        ax2.set_ylabel("Число Маха M")
-        # горизонталь M=1
-        ax2.axhline(1.0, color='#a8a29e', lw=0.8, ls=':')
-        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
-        style2 = self._collect_style()
-        style2.title = "Скорость потока и число Маха"
-        style2.xlabel = "Координата x, м"
-        style2.ylabel = "V, м/с"
-        apply_plot_style(c.fig, ax1, style2)
-        self._style_twinx(ax2, style2)
-        c.fig.tight_layout()
-        c.draw()
-
-        # ─── Плот 3: ρ, γs ───
-        c = self.canvas_RHO
-        c.fig.clear()
-        ax1 = c.fig.add_subplot(111)
-        rho = np.array([s.rho_kg_per_m3 for s in stations])
-        gs = np.array([s.gamma_s for s in stations])
-        ov_h = self._draw_overlays(ax1, "rho")
-        l1, = ax1.plot(x, rho, 'o-' if style.show_markers else '-',
-                       color='#cc785c', lw=style.line_width, ms=style.marker_size,
-                       label='ρ, кг/м³', zorder=3)
-        ax1.set_xlabel("Координата x, м")
-        ax1.set_ylabel("Плотность ρ, кг/м³")
-        ax2 = ax1.twinx()
-        self._draw_overlays(ax2, "gs", twin=True)
-        l2, = ax2.plot(x, gs, '^--' if style.show_markers else '--',
-                       color='#c084fc', lw=style.line_width, ms=style.marker_size,
-                       label='γₛ', zorder=3)
-        ax2.set_ylabel("Изэнтр. показатель γₛ")
-        ax2.legend(handles=[l1, l2] + ov_h, loc='best')
-        style3 = self._collect_style()
-        style3.title = "Плотность и изэнтропич. показатель"
-        style3.xlabel = "Координата x, м"
-        style3.ylabel = "ρ, кг/м³"
-        apply_plot_style(c.fig, ax1, style3)
-        self._style_twinx(ax2, style3)
-        c.fig.tight_layout()
-        c.draw()
-
-        # ─── Плот 4: профиль сопла (геометрия) ───
-        c = self.canvas_PROFILE
-        c.fig.clear()
-        ax = c.fig.add_subplot(111)
-
-        # Вариант А: профиль по Добровольскому (выбранный тип + параметры)
-        geom = None
-        if getattr(self, "chk_use_dobro", None) is not None and self.chk_use_dobro.isChecked():
-            geom = self._build_calc_geometry(self.perf)
-
-        if geom is not None:
-            self.last_geometry = geom  # синхронизируем с вкладкой геометрии
-            gx, gr = geom.as_xy_arrays()
-            r_max = float(np.max(gr))
-            ax.plot(gx, gr, '-', color='#cc785c', lw=style.line_width * 1.2)
-            ax.plot(gx, -gr, '-', color='#cc785c', lw=style.line_width * 1.2)
-            ax.fill_between(gx, -gr, gr, alpha=0.15, color='#cc785c')
-
-            # горловина и срез
-            ax.axvline(geom.length_subsonic_m, color='#6b9bd1', ls='--', lw=0.9,
-                       alpha=0.8, label="горловина")
-            ax.axvline(geom.length_total_m, color='#86b386', ls=':', lw=0.9,
-                       alpha=0.8, label="срез")
-            ax.legend(loc='upper left', fontsize=8)
-
-            style4 = self._collect_style()
-            tname = ("Коническое (§2.3)" if geom.method == "conical"
-                     else "Профилированное (§2.6)")
-            style4.title = (f"Профиль сопла — {tname} | "
-                            f"L={geom.length_total_m*1e3:.1f} мм, "
-                            f"θ_a={geom.theta_exit_deg:.1f}°, "
-                            f"φ_рас={geom.phi_dispersion:.4f}")
-            style4.xlabel = "Координата x, м"
-            style4.ylabel = "Радиус r, м"
-            ax.set_aspect('equal', adjustable='datalim')
-            apply_plot_style(c.fig, ax, style4)
-            c.fig.tight_layout()
-            c.draw()
-            # также обновим вкладку «Геометрия сопла»
-            try:
-                self._render_geometry(geom)
-                self._update_geometry_summary(geom)
-            except Exception:
-                pass
+        # ── Единый источник данных по сечениям (очищенный, отсортированный) ──
+        ser = self._section_series(self.perf)
+        if not ser:
             return
 
-        # Вариант Б (запасной): сглаженный профиль из сечений солвера
-        r = nozzle_radius(stations)
-        r_max = float(np.max(r))
-        x_smooth, r_smooth = self._smooth_profile(stations, x, r)
+        # Новый холст «Графики (1D)»: только ВЫБРАННЫЕ пользователем величины.
+        self._draw_selected_1d(ser, style)
 
-        ax.plot(x_smooth, r_smooth, '-', color='#cc785c',
-                lw=style.line_width * 1.2)
-        ax.plot(x_smooth, -r_smooth, '-', color='#cc785c',
-                lw=style.line_width * 1.2)
-        ax.fill_between(x_smooth, -r_smooth, r_smooth, alpha=0.15, color='#cc785c')
+        # Синхронизируем геометрию (для вкладок «Геометрия»/«Поле 2D»),
+        # если включён расчёт профиля по Добровольскому.
+        try:
+            if (getattr(self, "chk_use_dobro", None) is not None
+                    and self.chk_use_dobro.isChecked()):
+                geom = self._build_calc_geometry(self.perf)
+                if geom is not None:
+                    self.last_geometry = geom
+                    self._render_geometry(geom)
+                    self._update_geometry_summary(geom)
+        except Exception:
+            pass
 
-        # Точки сечений
-        if style.show_markers:
-            ax.plot(x, r, 'o', color='#cc785c', ms=style.marker_size,
-                    markeredgecolor='#fafaf9' if style.dark_plot else '#000000',
-                    markeredgewidth=0.6)
-            ax.plot(x, -r, 'o', color='#cc785c', ms=style.marker_size,
-                    markeredgecolor='#fafaf9' if style.dark_plot else '#000000',
-                    markeredgewidth=0.6)
+    # ── Каталог величин для графиков 1D (значения берём из _section_series) ──
+    def _plot_param_value(self, key: str, ser: dict):
+        """Возвращает массив значений величины ``key`` из единого источника."""
+        if key == "P":
+            return ser["P_Pa"] / 1e6
+        if key == "T":
+            return ser["T_K"]
+        if key == "V":
+            return ser["V"]
+        if key == "M":
+            return ser["M"]
+        if key == "rho":
+            return ser["rho"]
+        if key == "gs":
+            return ser["gamma_s"]
+        if key == "a":
+            return ser["a"]
+        return None
 
-        # Подписи сечений (компактные)
-        for i, st in enumerate(stations):
-            short = st.label.replace('Nozzle ', '').replace('Section ', 'S')[:10]
-            ax.annotate(short, (x[i], r[i] + r_max * 0.07),
-                        ha='center', fontsize=8, rotation=45,
-                        color='#fafaf9' if style.dark_plot else '#000000')
-        # Вертикальные пунктирные линии в сечениях
-        for i in range(len(stations)):
-            ax.axvline(x[i], color='#a8a29e', lw=0.4, ls=':', alpha=0.5)
+    def _selected_plot_keys(self):
+        """Ключи величин, отмеченных пользователем (в порядке каталога)."""
+        checks = getattr(self, "plot_param_checks", None)
+        if not checks:
+            return list(self._plot_default_keys)
+        return [k for (k, *_rest) in self.PLOT_PARAM_DEFS
+                if checks.get(k) is not None and checks[k].isChecked()]
 
-        style4 = self._collect_style()
-        style4.title = "Профиль сопла (R/Rₜ относит.)"
-        style4.xlabel = "Координата x, м"
-        style4.ylabel = "R / Rₜ"
-        ax.set_ylim(-r_max * 1.3, r_max * 1.4)
-        apply_plot_style(c.fig, ax, style4)
-        c.fig.tight_layout()
+    def _draw_selected_1d(self, ser, style):
+        """Рисует на ``canvas_1d`` только выбранные пользователем величины.
+
+        Каждая величина — отдельный подграфик (авто-раскладка). Данные берутся
+        из единого ``_section_series`` (расчёт в одном месте), графики лишь
+        отображают их. Каждый рисунок можно сохранить через панель matplotlib
+        или кнопку «Сохранить выбранные».
+        """
+        c = getattr(self, "canvas_1d", None)
+        if c is None:
+            return
+        c.fig.clear()
+        x = ser["x_m"]
+
+        keys = self._selected_plot_keys()
+        defs = {k: (lbl, unit, color) for (k, lbl, unit, color, _log)
+                in self.PLOT_PARAM_DEFS}
+
+        self._apply_fig_facecolor(c.fig, style)
+        if not keys:
+            ax = c.fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Выберите параметры для отображения",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=12, color='#a8a29e')
+            ax.set_axis_off()
+            c.draw()
+            return
+
+        n = len(keys)
+        ncols = 1 if n == 1 else 2
+        nrows = (n + ncols - 1) // ncols
+        x_thr = ser.get("x_throat_m", None)
+
+        marker = 'o' if style.show_markers else None
+        for i, key in enumerate(keys):
+            label, unit, color = defs[key]
+            y = self._plot_param_value(key, ser)
+            ax = c.fig.add_subplot(nrows, ncols, i + 1)
+            ax.plot(x, y, '-', marker=marker, color=color,
+                    lw=style.line_width, ms=style.marker_size, zorder=3)
+            # наложения для сравнения вариантов (если ключ совпадает)
+            self._draw_overlays(ax, key)
+            if key == "M":
+                ax.axhline(1.0, color='#a8a29e', lw=0.8, ls=':')
+            if x_thr is not None:
+                ax.axvline(x_thr, color='#888', ls=':', lw=0.8, alpha=0.7)
+            ttl = label + (f", {unit}" if unit else "")
+            self._style_subplot(ax, style, title=ttl,
+                                 xlabel="Координата x, м",
+                                 ylabel=(unit if unit else label))
+        try:
+            c.fig.tight_layout(pad=1.2)
+        except Exception:
+            pass
         c.draw()
+
+    def _apply_fig_facecolor(self, fig, style):
+        bg = '#1c1917' if style.dark_plot else '#ffffff'
+        fig.patch.set_facecolor(bg)
+
+    def _style_subplot(self, ax, style, *, title="", xlabel="", ylabel=""):
+        """Лёгкая стилизация одиночного подграфика (тёмный/светлый фон)."""
+        fg = '#fafaf9' if style.dark_plot else '#000000'
+        bg = '#262624' if style.dark_plot else '#ffffff'
+        ax.set_facecolor(bg)
+        if title:
+            ax.set_title(title, color=fg, fontsize=style.font_size_axis,
+                         fontfamily=style.font_family)
+        if xlabel:
+            ax.set_xlabel(xlabel, color=fg, fontsize=style.font_size_axis,
+                          fontfamily=style.font_family)
+        if ylabel:
+            ax.set_ylabel(ylabel, color=fg, fontsize=style.font_size_axis,
+                          fontfamily=style.font_family)
+        ax.tick_params(axis='both', which='major',
+                       labelsize=style.font_size_tick,
+                       direction=style.tick_direction,
+                       length=5, width=1.0, color=fg, labelcolor=fg)
+        ax.tick_params(axis='both', which='minor',
+                       direction=style.tick_direction,
+                       length=3, width=0.7, color=fg)
+        for spine in ax.spines.values():
+            spine.set_color(fg)
+            spine.set_linewidth(style.spine_linewidth)
+        ax.xaxis.set_minor_locator(AutoMinorLocator())
+        ax.yaxis.set_minor_locator(AutoMinorLocator())
+        if style.grid_major:
+            ax.grid(True, which='major', alpha=0.3, color=fg)
+        if style.grid_minor:
+            ax.grid(True, which='minor', alpha=0.15, color=fg)
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.get_frame().set_facecolor(bg)
+            leg.get_frame().set_edgecolor(fg)
+            for txt in leg.get_texts():
+                txt.set_color(fg)
+
+    def _save_selected_1d_plots(self):
+        """Сохраняет каждый выбранный график 1D в отдельный PNG-файл."""
+        if self.perf is None:
+            QtWidgets.QMessageBox.information(
+                self, "Нет данных", "Сначала выполните расчёт сопла.")
+            return
+        keys = self._selected_plot_keys()
+        if not keys:
+            QtWidgets.QMessageBox.information(
+                self, "Нет выбора", "Отметьте хотя бы один параметр.")
+            return
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Папка для сохранения графиков")
+        if not dir_path:
+            return
+        style = self._collect_style()
+        ser = self._section_series(self.perf)
+        if not ser:
+            return
+        x = ser["x_m"]
+        x_thr = ser.get("x_throat_m", None)
+        defs = {k: (lbl, unit, color) for (k, lbl, unit, color, _log)
+                in self.PLOT_PARAM_DEFS}
+        from matplotlib.figure import Figure as _Fig
+        saved = 0
+        marker = 'o' if style.show_markers else None
+        for key in keys:
+            label, unit, color = defs[key]
+            y = self._plot_param_value(key, ser)
+            fig = _Fig(figsize=(7, 4.5), dpi=200)
+            ax = fig.add_subplot(111)
+            ax.plot(x, y, '-', marker=marker, color=color,
+                    lw=style.line_width, ms=style.marker_size)
+            if key == "M":
+                ax.axhline(1.0, color='#a8a29e', lw=0.8, ls=':')
+            if x_thr is not None:
+                ax.axvline(x_thr, color='#888', ls=':', lw=0.8, alpha=0.7)
+            ttl = label + (f", {unit}" if unit else "")
+            self._style_subplot(ax, style, title=ttl,
+                                 xlabel="Координата x, м",
+                                 ylabel=(unit if unit else label))
+            self._apply_fig_facecolor(fig, style)
+            fig.tight_layout()
+            path = os.path.join(dir_path, f"nozzle_1d_{key}.png")
+            try:
+                fig.savefig(path, dpi=200, facecolor=fig.get_facecolor(),
+                            bbox_inches='tight')
+                saved += 1
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Ошибка сохранения", f"{path}\n{e}")
+                return
+        self.statusBar().showMessage(
+            f"Сохранено графиков: {saved} → {dir_path}")
 
     def _smooth_profile(self, stations, x, r):
         """Создаёт сглаженный профиль сопла из дискретных точек.
@@ -4454,8 +4609,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dir_path:
             return
         for name, canvas in [
-            ('PT', self.canvas_PT), ('VM', self.canvas_VM),
-            ('rho_gamma', self.canvas_RHO), ('profile', self.canvas_PROFILE),
+            ('1d', self.canvas_1d),
             ('species', self.canvas_species),
         ]:
             path = os.path.join(dir_path, f"nozzle_{name}.png")
