@@ -49,6 +49,25 @@ if _missing:
     print(f"Install: pip install {' '.join(_missing)}")
     sys.exit(1)
 
+# Plotly + Qt WebEngine — интерактивные графики 1D. Опционально: если чего-то
+# нет, интерфейс корректно откатывается на matplotlib-холст (см. PlotlyCanvas).
+PLOTLY_AVAILABLE = False
+WEBENGINE_AVAILABLE = False
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.io as pio
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    go = None
+    make_subplots = None
+    pio = None
+try:
+    from PyQt5 import QtWebEngineWidgets  # noqa: F401
+    WEBENGINE_AVAILABLE = True
+except ImportError:
+    QtWebEngineWidgets = None
+
 # Импорт решателей (всё через пакет fuel_equilibrium)
 from ..rocket.nozzle_flow import (
     Propellant, StationResult, RocketPerformance,
@@ -515,6 +534,60 @@ class MplCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
         self.ax = self.fig.add_subplot(111)
+
+
+# Готов ли встроенный интерактивный Plotly-холст (нужны и plotly, и WebEngine).
+PLOTLY_CANVAS_READY = PLOTLY_AVAILABLE and WEBENGINE_AVAILABLE
+
+
+class PlotlyCanvas(QtWidgets.QWidget):
+    """Интерактивный холст на Plotly, встроенный в Qt через QWebEngineView.
+
+    Принимает готовую ``plotly.graph_objects.Figure`` (метод :meth:`set_figure`)
+    и рендерит её как самодостаточный HTML (offline, с подключённым plotly.js).
+    Хранит последнюю фигуру в :attr:`figure`, чтобы её можно было сохранить.
+
+    Работает только если доступны и ``plotly``, и ``PyQtWebEngine``
+    (см. ``PLOTLY_CANVAS_READY``). Иначе использовать MplCanvas.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.figure = None  # последняя plotly-фигура (go.Figure)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._view = QtWebEngineWidgets.QWebEngineView(self)
+        self._view.setContextMenuPolicy(Qt.NoContextMenu)
+        lay.addWidget(self._view)
+        # Заглушка до первого расчёта.
+        self.show_message("Выполните расчёт сопла, чтобы построить графики.")
+
+    def show_message(self, text: str, *, dark: bool = True):
+        bg = '#1c1917' if dark else '#ffffff'
+        fg = '#a8a29e' if dark else '#555555'
+        html = (
+            f"<html><body style='margin:0;background:{bg};"
+            f"display:flex;align-items:center;justify-content:center;"
+            f"height:100vh;font-family:sans-serif;color:{fg};'>"
+            f"<div>{text}</div></body></html>"
+        )
+        self._view.setHtml(html)
+
+    def set_figure(self, fig):
+        """Отображает plotly-фигуру ``fig`` в виджете."""
+        self.figure = fig
+        # full_html=True + include_plotlyjs='inline' → автономная страница,
+        # не требующая интернета (plotly.js встраивается прямо в HTML).
+        html = pio.to_html(
+            fig, full_html=True, include_plotlyjs='inline',
+            config={
+                'displaylogo': False,
+                'responsive': True,
+                'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+                'toImageButtonOptions': {'format': 'png', 'scale': 2},
+            },
+        )
+        self._view.setHtml(html)
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -1580,18 +1653,28 @@ class MainWindow(QtWidgets.QMainWindow):
             sel_row.addWidget(cb)
         sel_row.addStretch(1)
 
-        btn_save_1d = QtWidgets.QPushButton("⬇ Сохранить выбранные (PNG)")
+        btn_save_1d = QtWidgets.QPushButton("⬇ Сохранить выбранные")
         btn_save_1d.setToolTip(
-            "Сохранить каждый выбранный график в отдельный PNG-файл.")
+            "Сохранить каждый выбранный график в отдельный файл "
+            "(интерактивный HTML + PNG для Plotly, либо PNG).")
         btn_save_1d.clicked.connect(self._save_selected_1d_plots)
         sel_row.addWidget(btn_save_1d)
         pv.addLayout(sel_row)
 
-        # — холст графиков 1D + панель навигации/сохранения matplotlib —
-        self.canvas_1d = MplCanvas(width=10, height=6)
-        self.toolbar_1d = NavigationToolbar(self.canvas_1d, plot_widget)
-        pv.addWidget(self.toolbar_1d)
-        pv.addWidget(self.canvas_1d, 1)
+        # — холст графиков 1D —
+        # По умолчанию интерактивный Plotly (zoom/pan/hover/экспорт PNG прямо в
+        # панели графика). Если plotly/PyQtWebEngine недоступны — откат на
+        # matplotlib-холст с его панелью навигации (полная совместимость).
+        self.use_plotly_1d = PLOTLY_CANVAS_READY
+        if self.use_plotly_1d:
+            self.canvas_1d = PlotlyCanvas(plot_widget)
+            self.toolbar_1d = None
+            pv.addWidget(self.canvas_1d, 1)
+        else:
+            self.canvas_1d = MplCanvas(width=10, height=6)
+            self.toolbar_1d = NavigationToolbar(self.canvas_1d, plot_widget)
+            pv.addWidget(self.toolbar_1d)
+            pv.addWidget(self.canvas_1d, 1)
 
         # Обратная совместимость: легаси-холсты (используются в наложениях).
         # Не отображаются, но методам не мешают.
@@ -4304,13 +4387,135 @@ class MainWindow(QtWidgets.QMainWindow):
                 if checks.get(k) is not None and checks[k].isChecked()]
 
     def _draw_selected_1d(self, ser, style):
-        """Рисует на ``canvas_1d`` только выбранные пользователем величины.
+        """Рисует выбранные величины на ``canvas_1d``.
 
-        Каждая величина — отдельный подграфик (авто-раскладка). Данные берутся
+        Диспетчер: если активен интерактивный Plotly-холст — строит plotly-
+        фигуру, иначе откатывается на matplotlib. Данные в обоих случаях берутся
         из единого ``_section_series`` (расчёт в одном месте), графики лишь
-        отображают их. Каждый рисунок можно сохранить через панель matplotlib
-        или кнопку «Сохранить выбранные».
+        отображают их.
         """
+        if getattr(self, "use_plotly_1d", False) and isinstance(
+                getattr(self, "canvas_1d", None), PlotlyCanvas):
+            self._draw_selected_1d_plotly(ser, style)
+        else:
+            self._draw_selected_1d_mpl(ser, style)
+
+    # ── Построение plotly-фигуры из единого источника данных ─────────────────
+    def _build_plotly_1d_figure(self, ser, style, keys):
+        """Собирает ``go.Figure`` с подграфиками выбранных величин ``keys``.
+
+        Используется и для отображения на холсте, и для сохранения в файлы —
+        чтобы экранный и сохранённый вид были идентичны.
+        """
+        x = ser["x_m"]
+        x_thr = ser.get("x_throat_m", None)
+        defs = {k: (lbl, unit, color) for (k, lbl, unit, color, _log)
+                in self.PLOT_PARAM_DEFS}
+
+        dark = style.dark_plot
+        paper_bg = '#1c1917' if dark else '#ffffff'
+        plot_bg = '#262624' if dark else '#ffffff'
+        fg = '#fafaf9' if dark else '#000000'
+        grid_color = 'rgba(150,150,147,0.30)' if dark else 'rgba(120,120,120,0.30)'
+
+        n = len(keys)
+        ncols = 1 if n == 1 else 2
+        nrows = (n + ncols - 1) // ncols
+        titles = [defs[k][0] + (f", {defs[k][1]}" if defs[k][1] else "")
+                  for k in keys]
+        fig = make_subplots(
+            rows=max(nrows, 1), cols=ncols,
+            subplot_titles=titles,
+            vertical_spacing=0.12 if nrows > 1 else 0.0,
+            horizontal_spacing=0.09 if ncols > 1 else 0.0,
+        )
+
+        mode = 'lines+markers' if style.show_markers else 'lines'
+        ms = max(3, int(style.marker_size))
+        lw = max(1.0, float(style.line_width))
+        for i, key in enumerate(keys):
+            row = i // ncols + 1
+            col = i % ncols + 1
+            label, unit, color = defs[key]
+            y = self._plot_param_value(key, ser)
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y, mode=mode, name=label,
+                    line=dict(color=color, width=lw),
+                    marker=dict(size=ms, color=color),
+                    showlegend=False,
+                    hovertemplate=(f"{label}<br>x=%{{x:.4g}} м<br>"
+                                   f"%{{y:.4g}} {unit}<extra></extra>"),
+                ),
+                row=row, col=col,
+            )
+            # наложения для сравнения вариантов (если ключ совпадает)
+            self._add_plotly_overlays(fig, key, row, col)
+            # линия M = 1 (звуковая)
+            if key == "M":
+                fig.add_hline(row=row, col=col, y=1.0,
+                              line=dict(color='#a8a29e', width=1, dash='dot'))
+            # вертикаль горловины
+            if x_thr is not None:
+                fig.add_vline(row=row, col=col, x=x_thr,
+                              line=dict(color='#888', width=1, dash='dot'))
+            fig.update_xaxes(title_text="x, м", row=row, col=col,
+                             gridcolor=grid_color, zeroline=False,
+                             color=fg, linecolor=fg, mirror=True,
+                             ticks='inside', showline=True)
+            fig.update_yaxes(title_text=(unit if unit else label),
+                             row=row, col=col, gridcolor=grid_color,
+                             zeroline=False, color=fg, linecolor=fg,
+                             mirror=True, ticks='inside', showline=True)
+
+        fig.update_layout(
+            paper_bgcolor=paper_bg, plot_bgcolor=plot_bg,
+            font=dict(family=style.font_family, size=style.font_size_tick,
+                      color=fg),
+            margin=dict(l=60, r=20, t=40, b=50),
+            hovermode='closest',
+            showlegend=False,
+        )
+        # цвет/размер заголовков подграфиков
+        for ann in fig.layout.annotations:
+            ann.font.update(color=fg, size=style.font_size_axis)
+        return fig
+
+    def _add_plotly_overlays(self, fig, key, row, col):
+        """Добавляет наложенные кривые сравнения (если включены) в plotly."""
+        if (not getattr(self, "chk_overlay_show", None)
+                or not self.chk_overlay_show.isChecked()):
+            return
+        for ov in getattr(self, "_overlays", []):
+            y = ov.get(key)
+            if y is None:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=ov["x"], y=y, mode='lines', name=ov.get("label", ""),
+                    line=dict(color=ov["color"], width=1.4, dash='solid'),
+                    opacity=0.55, showlegend=False,
+                    hovertemplate=(f"{ov.get('label','')}<br>"
+                                   f"x=%{{x:.4g}}<br>%{{y:.4g}}<extra></extra>"),
+                ),
+                row=row, col=col,
+            )
+
+    def _draw_selected_1d_plotly(self, ser, style):
+        """Строит интерактивный Plotly-холст из выбранных величин."""
+        c = getattr(self, "canvas_1d", None)
+        if c is None:
+            return
+        keys = self._selected_plot_keys()
+        if not keys:
+            c.show_message("Выберите параметры для отображения",
+                           dark=style.dark_plot)
+            return
+        fig = self._build_plotly_1d_figure(ser, style, keys)
+        c.set_figure(fig)
+
+    def _draw_selected_1d_mpl(self, ser, style):
+        """Резервная отрисовка на matplotlib (если Plotly недоступен)."""
         c = getattr(self, "canvas_1d", None)
         if c is None:
             return
@@ -4401,7 +4606,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 txt.set_color(fg)
 
     def _save_selected_1d_plots(self):
-        """Сохраняет каждый выбранный график 1D в отдельный PNG-файл."""
+        """Сохраняет каждый выбранный график 1D в отдельный файл.
+
+        Если активен Plotly — сохраняет интерактивный HTML (всегда) и PNG
+        (если установлен kaleido). Иначе — PNG через matplotlib.
+        """
         if self.perf is None:
             QtWidgets.QMessageBox.information(
                 self, "Нет данных", "Сначала выполните расчёт сопла.")
@@ -4419,6 +4628,50 @@ class MainWindow(QtWidgets.QMainWindow):
         ser = self._section_series(self.perf)
         if not ser:
             return
+
+        if getattr(self, "use_plotly_1d", False):
+            self._save_selected_1d_plotly(ser, style, keys, dir_path)
+        else:
+            self._save_selected_1d_mpl(ser, style, keys, dir_path)
+
+    def _save_selected_1d_plotly(self, ser, style, keys, dir_path):
+        """Сохраняет каждый график как интерактивный HTML (+ PNG, если можно)."""
+        defs = {k: (lbl, unit, color) for (k, lbl, unit, color, _log)
+                in self.PLOT_PARAM_DEFS}
+        saved_html = 0
+        saved_png = 0
+        png_error = None
+        for key in keys:
+            fig = self._build_plotly_1d_figure(ser, style, [key])
+            # уберём общий заголовок-аннотацию подграфика: для одиночного
+            # файла достаточно заголовка оси/легенды (он уже задаёт смысл).
+            html_path = os.path.join(dir_path, f"nozzle_1d_{key}.html")
+            try:
+                pio.write_html(fig, html_path, full_html=True,
+                               include_plotlyjs='inline',
+                               config={'displaylogo': False})
+                saved_html += 1
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Ошибка сохранения", f"{html_path}\n{e}")
+                return
+            # PNG — опционально (нужен kaleido)
+            png_path = os.path.join(dir_path, f"nozzle_1d_{key}.png")
+            try:
+                fig.write_image(png_path, width=900, height=560, scale=2)
+                saved_png += 1
+            except Exception as e:  # kaleido отсутствует/ошибка — не критично
+                png_error = str(e)
+        msg = f"Сохранено HTML: {saved_html}"
+        if saved_png:
+            msg += f", PNG: {saved_png}"
+        elif png_error:
+            msg += " (PNG пропущен: установите kaleido для экспорта в PNG)"
+        msg += f" → {dir_path}"
+        self.statusBar().showMessage(msg)
+
+    def _save_selected_1d_mpl(self, ser, style, keys, dir_path):
+        """Резервное сохранение в PNG через matplotlib."""
         x = ser["x_m"]
         x_thr = ser.get("x_throat_m", None)
         defs = {k: (lbl, unit, color) for (k, lbl, unit, color, _log)
@@ -4608,20 +4861,46 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not dir_path:
             return
-        for name, canvas in [
-            ('1d', self.canvas_1d),
-            ('species', self.canvas_species),
-        ]:
-            path = os.path.join(dir_path, f"nozzle_{name}.png")
+        # Графики 1D: если активен Plotly-холст — сохраняем его последнюю
+        # фигуру (PNG через kaleido / HTML), иначе matplotlib-холст.
+        if getattr(self, "use_plotly_1d", False) and isinstance(
+                getattr(self, "canvas_1d", None), PlotlyCanvas):
+            fig = getattr(self.canvas_1d, "figure", None)
+            if fig is not None:
+                p_png = os.path.join(dir_path, "nozzle_1d.png")
+                p_html = os.path.join(dir_path, "nozzle_1d.html")
+                try:
+                    pio.write_html(fig, p_html, full_html=True,
+                                   include_plotlyjs='inline')
+                except Exception:
+                    pass
+                try:
+                    fig.write_image(p_png, width=1100, height=700, scale=2)
+                except Exception:
+                    pass  # нет kaleido — HTML всё равно сохранён
+        else:
+            path = os.path.join(dir_path, "nozzle_1d.png")
             try:
-                canvas.fig.savefig(path, dpi=200,
-                                   facecolor=canvas.fig.get_facecolor(),
-                                   bbox_inches='tight')
+                self.canvas_1d.fig.savefig(
+                    path, dpi=200,
+                    facecolor=self.canvas_1d.fig.get_facecolor(),
+                    bbox_inches='tight')
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
-                    self, "Ошибка сохранения", f"{path}\n{e}"
-                )
+                    self, "Ошибка сохранения", f"{path}\n{e}")
                 return
+
+        # Состав продуктов сгорания — всегда matplotlib-холст.
+        path = os.path.join(dir_path, "nozzle_species.png")
+        try:
+            self.canvas_species.fig.savefig(
+                path, dpi=200,
+                facecolor=self.canvas_species.fig.get_facecolor(),
+                bbox_inches='tight')
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Ошибка сохранения", f"{path}\n{e}")
+            return
         self.statusBar().showMessage(f"Рисунки сохранены в {dir_path}")
 
     # ─── Экспорт CSV ───
