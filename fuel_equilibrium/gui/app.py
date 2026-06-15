@@ -583,11 +583,102 @@ class PlotlyCanvas(QtWidgets.QWidget):
             config={
                 'displaylogo': False,
                 'responsive': True,
+                # приближение колёсиком мыши (req: «приближать колёсиком»)
+                'scrollZoom': True,
                 'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
                 'toImageButtonOptions': {'format': 'png', 'scale': 2},
             },
         )
         self._view.setHtml(html)
+
+
+class CheckableComboBox(QtWidgets.QComboBox):
+    """Выпадающий список с множественным выбором (галочки в пунктах).
+
+    Используется для выбора набора отображаемых графиков прямо в панели
+    «Оформление графиков». В поле показывает сводку выбранного
+    («Выбрано: N» или список подписей), список остаётся открытым при
+    переключении галочек. Ключи пунктов хранятся в ``Qt.UserRole + 1``.
+    """
+
+    selectionChanged = pyqtSignal()
+    KEY_ROLE = Qt.UserRole + 1
+
+    def __init__(self, parent=None, placeholder: str = "Выбрать графики…"):
+        super().__init__(parent)
+        self._placeholder = placeholder
+        self.setModel(QtGui.QStandardItemModel(self))
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText(placeholder)
+        # клик по полю открывает выпадающий список
+        self.lineEdit().installEventFilter(self)
+        self.view().installEventFilter(self)
+        self.view().pressed.connect(self._on_item_pressed)
+        self._update_text()
+
+    # — построение списка —
+    def addCheckItem(self, key: str, text: str, checked: bool = False):
+        item = QtGui.QStandardItem(text)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setData(Qt.Checked if checked else Qt.Unchecked, Qt.CheckStateRole)
+        item.setData(key, self.KEY_ROLE)
+        self.model().appendRow(item)
+        self._update_text()
+
+    # — выбранные ключи —
+    def checked_keys(self) -> list:
+        keys = []
+        for i in range(self.model().rowCount()):
+            it = self.model().item(i)
+            if it.data(Qt.CheckStateRole) == Qt.Checked:
+                keys.append(it.data(self.KEY_ROLE))
+        return keys
+
+    def set_checked_keys(self, keys):
+        keys = set(keys or [])
+        for i in range(self.model().rowCount()):
+            it = self.model().item(i)
+            checked = it.data(self.KEY_ROLE) in keys
+            it.setData(Qt.Checked if checked else Qt.Unchecked, Qt.CheckStateRole)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    # — взаимодействие —
+    def _on_item_pressed(self, index):
+        it = self.model().itemFromIndex(index)
+        if it is None:
+            return
+        new_state = (Qt.Unchecked
+                     if it.data(Qt.CheckStateRole) == Qt.Checked
+                     else Qt.Checked)
+        it.setData(new_state, Qt.CheckStateRole)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def eventFilter(self, obj, event):
+        if obj is self.lineEdit() and event.type() == QtCore.QEvent.MouseButtonRelease:
+            self.showPopup()
+            return True
+        return super().eventFilter(obj, event)
+
+    def hidePopup(self):
+        # не закрываем список по клику на пункт — позволяем отметить несколько
+        pass
+
+    def _update_text(self):
+        labels = []
+        for i in range(self.model().rowCount()):
+            it = self.model().item(i)
+            if it.data(Qt.CheckStateRole) == Qt.Checked:
+                labels.append(it.text())
+        if not labels:
+            text = ""
+        elif len(labels) <= 2:
+            text = ", ".join(labels)
+        else:
+            text = f"Выбрано: {len(labels)}"
+        self.lineEdit().setText(text)
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -1038,6 +1129,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
 
+        # Доп. расчётные сечения В КАМЕРЕ (между Injector и Nozzle inlet).
+        # Injector ≡ Nozzle inlet (застойное состояние), поэтому эти сечения
+        # распределяют длину камеры по оси x для отображения участка камеры.
+        self._n_chamber_sections = 4
+        self.sp_n_chamber = QtWidgets.QSpinBox()
+        self.sp_n_chamber.setRange(0, 64)
+        self.sp_n_chamber.setValue(self._n_chamber_sections)
+        self.sp_n_chamber.setToolTip(
+            "Число дополнительных расчётных сечений в камере —\n"
+            "между Injector и Nozzle inlet. Состояние газа в камере\n"
+            "застойное (P₀, T₀, V≈0), поэтому сечения распределяют\n"
+            "длину камеры по оси x, делая участок камеры видимым на графиках."
+        )
+        self.sp_n_chamber.valueChanged.connect(self._on_chamber_sections_changed)
+
         self.sp_density_sub = QtWidgets.QDoubleSpinBox()
         self.sp_density_sub.setRange(0.0, 20.0)
         self.sp_density_sub.setDecimals(2)
@@ -1091,6 +1197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form_gasd = QtWidgets.QFormLayout(tab_gasd)
         form_gasd.setSpacing(6)
         form_gasd.addRow("Промежут. сечений:", self.sp_n_inter)
+        form_gasd.addRow("Сечений в камере:", self.sp_n_chamber)
         form_gasd.addRow("Плотность сечений:", density_widget)
 
         gasd_hint = QtWidgets.QLabel(
@@ -1611,16 +1718,9 @@ class MainWindow(QtWidgets.QMainWindow):
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(4, 4, 4, 4)
 
-        # Слева — внутренние подвкладки: графики 1D и поле течения 2D.
-        self.plot_subtabs = QtWidgets.QTabWidget()
-        self.plot_subtabs.setObjectName("subtabs")
-
-        # ── Подвкладка 1: графики 1D ───────────────────────────────────────
-        # Один холст, на котором отображаются ВЫБРАННЫЕ пользователем величины
-        # (каждая — своим подграфиком). Все значения берутся из единого
-        # источника ``_section_series`` (расчёт в одном месте). Сверху — панель
-        # выбора параметров и сохранения; ниже — стандартная панель matplotlib,
-        # позволяющая сохранять текущий рисунок отдельно.
+        # Объединённая область графиков: один контейнер вместо двух подвкладок
+        # «Графики (1D)» и «Поле течения (2D)». Сверху — единый селектор вида,
+        # ниже — QStackedWidget (1D Plotly / поле 2D matplotlib).
         plot_widget = QtWidgets.QWidget()
         pv = QtWidgets.QVBoxLayout(plot_widget)
         pv.setContentsMargins(4, 4, 4, 4)
@@ -1639,42 +1739,78 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         # по умолчанию показываем основной набор
         self._plot_default_keys = ["P", "T", "V", "M", "rho", "gs"]
+        # показывать ли силуэт профиля сопла на 1D-графиках (req: вкл/выкл)
+        self._show_profile_1d = False
 
-        # — панель выбора параметров —
-        sel_row = QtWidgets.QHBoxLayout()
-        sel_row.setSpacing(8)
-        sel_row.addWidget(QtWidgets.QLabel("Показать графики:"))
-        self.plot_param_checks = {}
-        for key, label, unit, _color, _log in self.PLOT_PARAM_DEFS:
-            cb = QtWidgets.QCheckBox(label + (f", {unit}" if unit else ""))
-            cb.setChecked(key in self._plot_default_keys)
-            cb.toggled.connect(self._redraw_plots)
-            self.plot_param_checks[key] = cb
-            sel_row.addWidget(cb)
-        sel_row.addStretch(1)
+        # — верхняя панель: выбор вида + (для 2D) выбор поля + сохранение —
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(8)
+        top_row.addWidget(QtWidgets.QLabel("Вид:"))
+        self.cb_plot_view = QtWidgets.QComboBox()
+        self.cb_plot_view.addItems([
+            "Графики параметров (1D)",
+            "Газодинамические функции",
+            "Поле течения (2D)",
+        ])
+        self.cb_plot_view.setToolTip(
+            "«Графики параметров (1D)» — выбранные величины (P, T, V, M, …)\n"
+            "по длине сопла (интерактивный Plotly: колёсико — приближение,\n"
+            "ЛКМ/колесо — перемещение).\n"
+            "«Газодинамические функции» — τ(λ), π(λ), ε(λ), q(λ), y(λ), λ(x).\n"
+            "«Поле течения (2D)» — цветовое поле параметра по сечению."
+        )
+        self.cb_plot_view.currentIndexChanged.connect(self._on_plot_view_changed)
+        top_row.addWidget(self.cb_plot_view)
 
-        btn_save_1d = QtWidgets.QPushButton("⬇ Сохранить выбранные")
-        btn_save_1d.setToolTip(
+        top_row.addSpacing(16)
+        self.lbl_field_2d_field = QtWidgets.QLabel("Поле:")
+        top_row.addWidget(self.lbl_field_2d_field)
+        self.cb_field_2d = QtWidgets.QComboBox()
+        self.cb_field_2d.addItems([
+            "M (число Маха)", "P (давление)", "T (температура)",
+            "V (скорость)", "Угол потока, °",
+        ])
+        self._field_2d_keys = {
+            0: ("M", "M"), 1: ("P_Pa", "P, Па"), 2: ("T_K", "T, К"),
+            3: ("V_m_per_s", "V, м/с"), 4: ("flow_angle_deg", "угол, °"),
+        }
+        self.cb_field_2d.currentIndexChanged.connect(lambda *_: self._render_field_2d())
+        top_row.addWidget(self.cb_field_2d)
+        top_row.addStretch(1)
+
+        self.btn_save_1d = QtWidgets.QPushButton("⬇ Сохранить выбранные")
+        self.btn_save_1d.setToolTip(
             "Сохранить каждый выбранный график в отдельный файл "
             "(интерактивный HTML + PNG для Plotly, либо PNG).")
-        btn_save_1d.clicked.connect(self._save_selected_1d_plots)
-        sel_row.addWidget(btn_save_1d)
-        pv.addLayout(sel_row)
+        self.btn_save_1d.clicked.connect(self._save_selected_1d_plots)
+        top_row.addWidget(self.btn_save_1d)
+        pv.addLayout(top_row)
 
-        # — холст графиков 1D —
-        # По умолчанию интерактивный Plotly (zoom/pan/hover/экспорт PNG прямо в
-        # панели графика). Если plotly/PyQtWebEngine недоступны — откат на
-        # matplotlib-холст с его панелью навигации (полная совместимость).
+        # — переключаемые страницы: 1D-графики / поле 2D —
+        self.plot_stack = QtWidgets.QStackedWidget()
+
+        # Страница 0 — интерактивные 1D-графики (Plotly или matplotlib).
+        page_1d = QtWidgets.QWidget()
+        p1 = QtWidgets.QVBoxLayout(page_1d)
+        p1.setContentsMargins(0, 0, 0, 0)
+        p1.setSpacing(4)
         self.use_plotly_1d = PLOTLY_CANVAS_READY
         if self.use_plotly_1d:
-            self.canvas_1d = PlotlyCanvas(plot_widget)
+            self.canvas_1d = PlotlyCanvas(page_1d)
             self.toolbar_1d = None
-            pv.addWidget(self.canvas_1d, 1)
+            p1.addWidget(self.canvas_1d, 1)
         else:
             self.canvas_1d = MplCanvas(width=10, height=6)
-            self.toolbar_1d = NavigationToolbar(self.canvas_1d, plot_widget)
-            pv.addWidget(self.toolbar_1d)
-            pv.addWidget(self.canvas_1d, 1)
+            self.toolbar_1d = NavigationToolbar(self.canvas_1d, page_1d)
+            p1.addWidget(self.toolbar_1d)
+            p1.addWidget(self.canvas_1d, 1)
+        self.plot_stack.addWidget(page_1d)
+
+        # Страница 1 — поле течения 2D / газодинамические функции (mpl).
+        self.tab_field_2d = self._build_field_2d_page()
+        self.plot_stack.addWidget(self.tab_field_2d)
+
+        pv.addWidget(self.plot_stack, 1)
 
         # Обратная совместимость: легаси-холсты (используются в наложениях).
         # Не отображаются, но методам не мешают.
@@ -1682,14 +1818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas_VM = MplCanvas(width=5, height=3.5)
         self.canvas_RHO = MplCanvas(width=5, height=3.5)
 
-        self.plot_subtabs.addTab(plot_widget, "Графики (1D)")
-
-        # Подвкладка 2: поле течения (2D) — теперь живёт здесь, внутри
-        # раздела «Графики по длине сопла».
-        self.tab_field_2d = self._build_field_2d_tab()
-        self.plot_subtabs.addTab(self.tab_field_2d, "Поле течения (2D)")
-
-        h.addWidget(self.plot_subtabs, 1)
+        h.addWidget(plot_widget, 1)
 
         # Справа — панель настройки стиля
         side = QtWidgets.QWidget()
@@ -1700,6 +1829,25 @@ class MainWindow(QtWidgets.QMainWindow):
         gb_style = QtWidgets.QGroupBox("Оформление графиков")
         sf = QtWidgets.QFormLayout(gb_style)
         sf.setSpacing(4)
+
+        # — выбор отображаемых графиков (выпадающий список с множ. выбором) —
+        # Перенесено сюда из верхней панели по требованию.
+        self.cb_plot_params = CheckableComboBox(placeholder="Показать графики…")
+        for key, label, unit, _color, _log in self.PLOT_PARAM_DEFS:
+            self.cb_plot_params.addCheckItem(
+                key, label + (f", {unit}" if unit else ""),
+                checked=(key in self._plot_default_keys),
+            )
+        self.cb_plot_params.selectionChanged.connect(self._redraw_plots)
+        sf.addRow("Показать графики:", self.cb_plot_params)
+
+        # — включение/выключение силуэта профиля сопла на 1D-графиках —
+        self.chk_show_profile = QtWidgets.QCheckBox("Профиль сопла на графиках")
+        self.chk_show_profile.setChecked(self._show_profile_1d)
+        self.chk_show_profile.setToolTip(
+            "Показывать силуэт контура сопла (r(x)) фоном на 1D-графиках.")
+        self.chk_show_profile.toggled.connect(self._on_toggle_profile_1d)
+        sf.addRow("", self.chk_show_profile)
 
         self.cb_font = QtWidgets.QComboBox()
         self.cb_font.addItems([
@@ -2210,44 +2358,13 @@ class MainWindow(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
     # Вкладка «Поле течения (2D)» — заготовка квази-2D расчёта
     # ─────────────────────────────────────────────────────────────────────────
-    def _build_field_2d_tab(self) -> QtWidgets.QWidget:
+    def _build_field_2d_page(self) -> QtWidgets.QWidget:
+        # Страница поля течения 2D / газодинамических функций внутри
+        # объединённой области графиков. Селекторы вида и поля вынесены
+        # в общую верхнюю панель (см. _build_plot_tab).
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(8, 8, 8, 8)
-
-        ctrl = QtWidgets.QHBoxLayout()
-        # Выбор режима отображения: 2D-поле или детальные газодинамические
-        # функции по длине сопла (доступны и при 1D-расчёте).
-        ctrl.addWidget(QtWidgets.QLabel("Вид:"))
-        self.cb_field_2d_mode = QtWidgets.QComboBox()
-        self.cb_field_2d_mode.addItems([
-            "Газодинамические функции (1D)",
-            "Поле течения (2D)",
-        ])
-        self.cb_field_2d_mode.setToolTip(
-            "«Газодинамические функции (1D)» — детальные интерактивные графики\n"
-            "τ(λ), π(λ), ε(λ), q(λ), y(λ), λ(x) по длине сопла (по 1D-расчёту).\n"
-            "«Поле течения (2D)» — цветовое поле параметра по сечению (нужен 2D-расчёт)."
-        )
-        self.cb_field_2d_mode.currentIndexChanged.connect(self._on_field_2d_mode_changed)
-        ctrl.addWidget(self.cb_field_2d_mode)
-
-        ctrl.addSpacing(16)
-        self.lbl_field_2d_field = QtWidgets.QLabel("Поле:")
-        ctrl.addWidget(self.lbl_field_2d_field)
-        self.cb_field_2d = QtWidgets.QComboBox()
-        self.cb_field_2d.addItems([
-            "M (число Маха)", "P (давление)", "T (температура)",
-            "V (скорость)", "Угол потока, °",
-        ])
-        self._field_2d_keys = {
-            0: ("M", "M"), 1: ("P_Pa", "P, Па"), 2: ("T_K", "T, К"),
-            3: ("V_m_per_s", "V, м/с"), 4: ("flow_angle_deg", "угол, °"),
-        }
-        self.cb_field_2d.currentIndexChanged.connect(lambda *_: self._render_field_2d())
-        ctrl.addWidget(self.cb_field_2d)
-        ctrl.addStretch(1)
-        v.addLayout(ctrl)
+        v.setContentsMargins(0, 0, 0, 0)
 
         self.lbl_field_2d_info = QtWidgets.QLabel(
             "«Газодинамические функции (1D)» строятся всегда по результатам 1D-расчёта:\n"
@@ -2290,13 +2407,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._field_2d_marker = None
 
         self._last_field_2d: Optional[Nozzle2DResult] = None
-
-        # Стартовый режим — «Газодинамические функции (1D)»: селектор поля (M/P/T/V)
-        # скрываем, т.к. он актуален только для 2D-поля.
-        if hasattr(self, "cb_field_2d"):
-            self.cb_field_2d.setVisible(False)
-        if hasattr(self, "lbl_field_2d_field"):
-            self.lbl_field_2d_field.setVisible(False)
         return w
 
     def _update_field_2d_from_perf(self):
@@ -2322,25 +2432,61 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"2D-расчёт пропущен: {e}", 5000)
             self._last_field_2d = None
-        # Если 2D-поле успешно посчитано — автоматически переключаемся на его
-        # отображение; иначе остаёмся на газодинамических функциях (1D).
-        if (self._last_field_2d is not None and hasattr(self, "cb_field_2d_mode")
-                and self.cb_field_2d_mode.currentIndex() != 1):
-            # currentIndexChanged сам вызовет перерисовку
-            self.cb_field_2d_mode.setCurrentIndex(1)
+        # Если 2D-поле успешно посчитано — автоматически переключаем единый
+        # селектор вида на «Поле течения (2D)» (индекс 2); иначе остаёмся.
+        if (self._last_field_2d is not None and hasattr(self, "cb_plot_view")
+                and self.cb_plot_view.currentIndex() != 2):
+            self.cb_plot_view.setCurrentIndex(2)
             return
         self._render_field_2d()
 
-    def _on_field_2d_mode_changed(self, *args):
-        """Переключение режима «функции 1D» / «поле 2D»: показать нужные элементы."""
-        is_2d = (hasattr(self, "cb_field_2d_mode")
-                 and self.cb_field_2d_mode.currentIndex() == 1)
-        # Селектор поля (M/P/T/V) актуален только для 2D-режима.
+    def _field_view_is_2d(self) -> bool:
+        """True, если выбран режим «Поле течения (2D)» в едином селекторе."""
+        return (hasattr(self, "cb_plot_view")
+                and self.cb_plot_view.currentIndex() == 2)
+
+    def _on_plot_view_changed(self, *args):
+        """Переключение единого вида: 1D-графики / газодинам. функции / поле 2D."""
+        idx = self.cb_plot_view.currentIndex() if hasattr(self, "cb_plot_view") else 0
+        # Страница 0 — 1D-графики параметров; страница 1 — поле/функции (mpl).
+        if hasattr(self, "plot_stack"):
+            self.plot_stack.setCurrentIndex(0 if idx == 0 else 1)
+
+        is_1d_params = (idx == 0)
+        is_2d_field = (idx == 2)
+        # Селектор поля (M/P/T/V) актуален только для 2D-поля.
         if hasattr(self, "cb_field_2d"):
-            self.cb_field_2d.setVisible(is_2d)
+            self.cb_field_2d.setVisible(is_2d_field)
         if hasattr(self, "lbl_field_2d_field"):
-            self.lbl_field_2d_field.setVisible(is_2d)
-        self._render_field_2d()
+            self.lbl_field_2d_field.setVisible(is_2d_field)
+        # Кнопка сохранения 1D и выбор параметров/профиля — только для 1D-режима.
+        if hasattr(self, "btn_save_1d"):
+            self.btn_save_1d.setVisible(is_1d_params)
+        if hasattr(self, "cb_plot_params"):
+            self.cb_plot_params.setEnabled(is_1d_params)
+        if hasattr(self, "chk_show_profile"):
+            self.chk_show_profile.setEnabled(is_1d_params)
+
+        if is_1d_params:
+            self._redraw_plots()
+        else:
+            self._render_field_2d()
+
+    def _on_toggle_profile_1d(self, checked: bool):
+        """Вкл/выкл силуэт профиля сопла на 1D-графиках."""
+        self._show_profile_1d = bool(checked)
+        self._redraw_plots()
+
+    def _on_chamber_sections_changed(self, value: int):
+        """Изменение числа расчётных сечений в камере (Injector→Nozzle inlet).
+
+        Сечения камеры синтезируются в ``_section_series`` (застойное
+        состояние камеры), поэтому пересчёт решателя не требуется — достаточно
+        перерисовать графики.
+        """
+        self._n_chamber_sections = int(value)
+        if getattr(self, "perf", None) is not None:
+            self._redraw_plots()
 
     def _render_field_2d(self):
         c = getattr(self, "canvas_field_2d", None)
@@ -2353,8 +2499,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Режим «Газодинамические функции (1D)» ──────────────────────────────
         # Доступен всегда при наличии 1D-расчёта (self.perf), даже если 2D-поле
         # не считалось. Строит детальные интерактивные графики τ, π, ε, q, y, λ.
-        mode_2d = (hasattr(self, "cb_field_2d_mode")
-                   and self.cb_field_2d_mode.currentIndex() == 1)
+        mode_2d = self._field_view_is_2d()
         if not mode_2d:
             self._render_gasdynamic_functions_1d(c)
             return
@@ -4256,11 +4401,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return {}
 
         stations = list(perf.stations)
+        L_chamber = self._chamber_length_m()
+        L_conv, L_div = self._auto_conv_div_lengths()
         x = np.asarray(build_nozzle_geometry(
             stations,
-            L_chamber=self._chamber_length_m(),
-            L_conv=self._auto_conv_div_lengths()[0],
-            L_div=self._auto_conv_div_lengths()[1],
+            L_chamber=L_chamber,
+            L_conv=L_conv,
+            L_div=L_div,
         ), dtype=float)
 
         P = np.array([float(s.P_Pa) for s in stations])
@@ -4271,6 +4418,31 @@ class MainWindow(QtWidgets.QMainWindow):
         gs = np.array([float(getattr(s, "gamma_s", 0.0)) for s in stations])
         Ae = np.array([float(getattr(s, "Ae_At", float('inf'))) for s in stations])
         labels = [getattr(s, "label", "") for s in stations]
+
+        # ── Доп. расчётные сечения В КАМЕРЕ (между Injector и Nozzle inlet) ──
+        # Injector и Nozzle inlet термодинамически совпадают (застойное
+        # состояние камеры: одинаковые P₀, T₀, ρ₀, V≈0). Дополнительные сечения
+        # в камере распределяют длину камеры по оси x, делая участок камеры
+        # видимым на графиках. Их состояние копируется с инжектора (камеры).
+        n_cham = int(getattr(self, "_n_chamber_sections", 0) or 0)
+        if n_cham > 0:
+            i_inj = None
+            for i, lab in enumerate(labels):
+                if str(lab).strip().lower() == "injector":
+                    i_inj = i
+                    break
+            if i_inj is None:
+                i_inj = int(np.argmin(x)) if x.size else 0
+            xs_extra = np.linspace(0.0, L_chamber, n_cham + 2)[1:-1]
+            P0 = P[i_inj]; T0 = T[i_inj]; rho0 = rho[i_inj]
+            V0 = V[i_inj]; a0 = a[i_inj]; gs0 = gs[i_inj]; Ae0 = Ae[i_inj]
+            for k, xc in enumerate(xs_extra, start=1):
+                x = np.append(x, float(xc))
+                P = np.append(P, P0); T = np.append(T, T0)
+                rho = np.append(rho, rho0); V = np.append(V, V0)
+                a = np.append(a, a0); gs = np.append(gs, gs0)
+                Ae = np.append(Ae, Ae0)
+                labels.append(f"Chamber {k}")
 
         # 1) сортировка по x и удаление дубликатов координаты
         order = np.argsort(x, kind="stable")
@@ -4302,9 +4474,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             i_throat = 0
 
+        # относительный радиус контура r/r_throat = sqrt(Ae/At) — для силуэта
+        # профиля сопла на графиках. В камере (Ae→∞ из инжектора) ограничиваем
+        # величину радиусом камеры (макс. конечное значение профиля).
+        with np.errstate(invalid='ignore'):
+            r_rel = np.sqrt(np.clip(Ae, 0.0, None))
+        finite = r_rel[np.isfinite(r_rel)]
+        r_cap = float(np.nanmax(finite)) if finite.size else 1.0
+        r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
+
         return {
             "x_m": x, "P_Pa": P, "T_K": T, "rho": rho,
             "V": V, "a": a, "M": M, "gamma_s": gs, "Ae_At": Ae,
+            "r_rel": r_rel,
             "label": labels, "i_throat": i_throat,
             "x_throat_m": float(x[i_throat]) if x.size else 0.0,
         }
@@ -4343,7 +4525,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ser:
             return
 
-        # Новый холст «Графики (1D)»: только ВЫБРАННЫЕ пользователем величины.
+        # Если активен НЕ режим «Графики параметров (1D)», перенаправляем на
+        # отрисовку поля/газодинамических функций и выходим.
+        if hasattr(self, "cb_plot_view") and self.cb_plot_view.currentIndex() != 0:
+            self._render_field_2d()
+            return
+
+        # Холст «Графики параметров (1D)»: только ВЫБРАННЫЕ пользователем величины.
         self._draw_selected_1d(ser, style)
 
         # Синхронизируем геометрию (для вкладок «Геометрия»/«Поле 2D»),
@@ -4380,11 +4568,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _selected_plot_keys(self):
         """Ключи величин, отмеченных пользователем (в порядке каталога)."""
-        checks = getattr(self, "plot_param_checks", None)
-        if not checks:
+        cb = getattr(self, "cb_plot_params", None)
+        if cb is None:
             return list(self._plot_default_keys)
-        return [k for (k, *_rest) in self.PLOT_PARAM_DEFS
-                if checks.get(k) is not None and checks[k].isChecked()]
+        checked = set(cb.checked_keys())
+        return [k for (k, *_rest) in self.PLOT_PARAM_DEFS if k in checked]
 
     def _draw_selected_1d(self, ser, style):
         """Рисует выбранные величины на ``canvas_1d``.
@@ -4475,10 +4663,70 @@ class MainWindow(QtWidgets.QMainWindow):
             margin=dict(l=60, r=20, t=40, b=50),
             hovermode='closest',
             showlegend=False,
+            # перемещение по графику при зажатой ЛКМ (req: «перемещаться,
+            # зажимая левую кнопку мыши»); колёсико — приближение (scrollZoom).
+            dragmode='pan',
         )
         # цвет/размер заголовков подграфиков
         for ann in fig.layout.annotations:
             ann.font.update(color=fg, size=style.font_size_axis)
+
+        # Силуэт профиля сопла (по требованию — включаемый фон r(x)).
+        if getattr(self, "_show_profile_1d", False) and "r_rel" in ser:
+            self._add_plotly_profile(fig, ser, keys, ncols)
+        return fig
+
+    def _add_plotly_profile(self, fig, ser, keys, ncols):
+        """Рисует силуэт контура сопла r(x) фоном в нижней части подграфиков.
+
+        Силуэт (относительный радиус r/r_throat из ``ser['r_rel']``) рисуется
+        прямо на осях каждого подграфика (row/col), масштабированный в нижние
+        ~28 % диапазона значений параметра — как ориентир формы сопла под
+        кривыми. Заливается полупрозрачным цветом. Не создаёт дополнительных
+        осей (надёжно для произвольного числа подграфиков).
+        """
+        import numpy as _np
+        x = _np.asarray(ser["x_m"], dtype=float)
+        r = _np.asarray(ser["r_rel"], dtype=float)
+        if x.size == 0 or r.size == 0 or not _np.any(_np.isfinite(r)):
+            return
+        rmax = float(_np.nanmax(r)) or 1.0
+        r_unit = r / rmax  # в [0..1]
+        fill_color = 'rgba(106,176,255,0.12)'
+        line_color = 'rgba(106,176,255,0.45)'
+        for i, key in enumerate(keys):
+            row = i // ncols + 1
+            col = i % ncols + 1
+            y = self._plot_param_value(key, ser)
+            if y is None:
+                continue
+            y = _np.asarray(y, dtype=float)
+            finite = y[_np.isfinite(y)]
+            if finite.size == 0:
+                continue
+            ymin = float(_np.nanmin(finite))
+            ymax = float(_np.nanmax(finite))
+            span = (ymax - ymin) or (abs(ymax) or 1.0)
+            base = ymin
+            top = ymin + 0.28 * span * r_unit  # силуэт в нижней полосе
+            # базовая линия (низ) — для заливки tonexty
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=_np.full_like(x, base), mode='lines',
+                    line=dict(width=0, color=fill_color),
+                    hoverinfo='skip', showlegend=False,
+                ),
+                row=row, col=col,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=top, mode='lines',
+                    line=dict(width=1.2, color=line_color),
+                    fill='tonexty', fillcolor=fill_color,
+                    name='Профиль сопла', hoverinfo='skip', showlegend=False,
+                ),
+                row=row, col=col,
+            )
         return fig
 
     def _add_plotly_overlays(self, fig, key, row, col):
@@ -5096,6 +5344,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'Pc_unit': self.cb_Pc_unit.currentText(),
             'Pe_unit': self.cb_Pe_unit.currentText(),
             'n_inter': self.sp_n_inter.value(),
+            'n_chamber': self.sp_n_chamber.value(),
             'density_sub': self.sp_density_sub.value(),
             'density_crit': self.sp_density_crit.value(),
             'density_sup': self.sp_density_sup.value(),
@@ -5224,6 +5473,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._on_mix_mode_changed()
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
+            self.sp_n_chamber.setValue(cfg.get('n_chamber', 4))
             self.sp_density_sub.setValue(cfg.get('density_sub', 1.0))
             self.sp_density_crit.setValue(cfg.get('density_crit', 1.0))
             self.sp_density_sup.setValue(cfg.get('density_sup', 1.0))
