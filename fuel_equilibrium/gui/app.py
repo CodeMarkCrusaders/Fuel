@@ -4374,7 +4374,128 @@ class MainWindow(QtWidgets.QMainWindow):
         s.append(f"  M_camera:  {st_c.M:8.4f}      |  M_exit:  {st_e.M:8.4f}")
         s.append(f"  MW_camera: {st_c.mw_g_per_mol:8.4f} г/моль|  MW_exit: {st_e.mw_g_per_mol:8.4f} г/моль")
         s.append("")
+
+        # ── Отчёт о геометрии сопла (RPA-стиль) ──────────────────────────────
+        geom_lines = self._format_nozzle_geometry_report(perf)
+        if geom_lines:
+            s.extend(geom_lines)
+
         self.txt_perf.setPlainText("\n".join(s))
+
+    def _format_nozzle_geometry_report(self, perf: "RocketPerformance") -> list:
+        """Формирует текстовый отчёт о геометрии сопла (камера + parabolic bell).
+
+        Использует построенную геометрию ``_build_calc_geometry(perf)``
+        (тип сопла и параметры берутся из панели расчёта профиля). Формат
+        отчёта повторяет RPA-сводку «Geometry of thrust chamber with
+        parabolic nozzle»: диаметры камеры/горловины/среза, радиусы скруглений,
+        углы параболы Tn/Te, длины частей и интегральные характеристики
+        (Ae/At, Le/Dt, коэффициент рассеяния и т.п.).
+        """
+        try:
+            geom = self._build_calc_geometry(perf)
+        except Exception:
+            geom = None
+        if geom is None:
+            return []
+
+        try:
+            mm = 1000.0
+            Dt = 2.0 * geom.R_throat_m * mm          # диаметр горловины
+            De = 2.0 * geom.R_exit_m * mm            # диаметр среза
+            Dc = 2.0 * geom.R_chamber_m * mm         # диаметр камеры
+            R1 = geom.R_round_sub_m * mm             # скругление сходящейся стороны
+            R2 = geom.R1_inlet_m * mm                # скругление входа из камеры
+            Rn = geom.r_round_sup_m * mm             # скругление расходящейся стороны
+            Lc = geom.length_subsonic_m * mm         # длина дозвуковой части (камера+конфузор)
+            Le = geom.length_supersonic_m * mm       # длина сверхзвуковой части
+            Ltot = geom.length_total_m * mm
+            Tn = geom.theta_max_deg                  # начальный угол параболы
+            Te = geom.theta_exit_deg                 # конечный угол параболы (на срезе)
+            ar = geom.area_ratio
+            phi_disp = geom.phi_dispersion           # коэффициент рассеяния (divergence eff.)
+            b_deg = float(geom.theta_in_deg)         # полуугол сжатия конфузора
+
+            # Длина цилиндрической части камеры и характеристическая длина L*
+            try:
+                Lcyl = self._chamber_length_m() * mm
+            except Exception:
+                Lcyl = float('nan')
+            # L* = Vк / Aкр; Vк ≈ Aк·Lцил + ΔVконфузора (оценка по конусу)
+            Lstar_mm = float('nan')
+            try:
+                A_t = math.pi * geom.R_throat_m ** 2
+                A_c = math.pi * geom.R_chamber_m ** 2
+                L_conv = max(geom.length_subsonic_m - self._chamber_length_m(), 0.0)
+                V_cyl = A_c * self._chamber_length_m()
+                # объём конфузора как усечённого конуса
+                V_conv = (L_conv / 3.0) * (A_t + A_c + math.sqrt(max(A_t * A_c, 0.0)))
+                if A_t > 0:
+                    Lstar_mm = (V_cyl + V_conv) / A_t * mm
+            except Exception:
+                pass
+
+            # Эталонная длина 15°-конического сопла (для отношения Le/cl15)
+            Le15_mm = float('nan')
+            try:
+                Le15_mm = rao_reference_length_15deg(geom.R_throat_m, ar) * mm
+            except Exception:
+                pass
+
+            # коэффициент тяги в пустоте (из расчёта)
+            CF_vac = float('nan')
+            try:
+                st_e = perf.stations[-1]
+                pa = float(st_e.P_Pa)
+                pk = float(perf.stations[0].P_Pa)
+                # CF_vac = CF + (pa/pk)·(Ae/At)
+                CF_vac = float(perf.CF) + (pa / pk) * ar
+            except Exception:
+                CF_vac = float(getattr(perf, "CF", float('nan')))
+
+            method_names = {
+                "rpa_parabolic": "параболическое (bell, RPA)",
+                "profiled":      "профилированное (оптимальное)",
+                "conical":       "коническое",
+            }
+            mname = method_names.get(geom.method, geom.method)
+
+            def _f(v, fmt="{:.2f}"):
+                return fmt.format(v) if (v == v and math.isfinite(v)) else "—"
+
+            g = []
+            g.append("═" * 70)
+            g.append("  ГЕОМЕТРИЯ СОПЛА И КАМЕРЫ")
+            g.append("═" * 70)
+            g.append(f"  Тип контура:  {mname}")
+            g.append("")
+            g.append(f"  Dк (камера) ...... {_f(Dc):>10} мм   b (сжатие) .. {_f(b_deg):>7} град")
+            g.append(f"  Dкр (горловина) .. {_f(Dt):>10} мм")
+            g.append(f"  Dа (срез) ........ {_f(De):>10} мм")
+            g.append("")
+            g.append(f"  R1 (скр. горла) .. {_f(R1):>10} мм   R2 (вход) ... {_f(R2):>7} мм")
+            g.append(f"  Rn (скр. за горл.) {_f(Rn):>10} мм")
+            g.append("")
+            g.append(f"  L* (характ.) ..... {_f(Lstar_mm):>10} мм")
+            g.append(f"  Lцил (цилиндр) ... {_f(Lcyl):>10} мм")
+            g.append(f"  Lдозв (камера+конф){_f(Lc):>10} мм")
+            g.append(f"  Lсверхзв (Le) .... {_f(Le):>10} мм   Tn .......... {_f(Tn):>7} град")
+            g.append(f"  Lполная .......... {_f(Ltot):>10} мм   Te .......... {_f(Te):>7} град")
+            g.append("")
+            g.append(f"  Ae/At ............ {_f(ar, '{:.4f}'):>10}")
+            if Dt > 0:
+                g.append(f"  Le/Dt ............ {_f(Le/Dt, '{:.4f}'):>10}")
+            if Le15_mm == Le15_mm and Le15_mm > 0:
+                g.append(f"  Le/cl15 .......... {_f(100.0*Le/Le15_mm, '{:.2f}'):>10} %"
+                         f"  (отн. к 15°-конич. соплу)")
+            g.append("")
+            g.append(f"  Коэф. рассеяния (φрас) ... {_f(phi_disp, '{:.5f}'):>10}")
+            if CF_vac == CF_vac and math.isfinite(CF_vac):
+                g.append(f"  Коэф. тяги CF (вакуум) ... {_f(CF_vac, '{:.5f}'):>10}")
+            g.append("")
+            return g
+        except Exception:
+            return []
 
     def _fill_species_table(self, perf: RocketPerformance):
         self._refresh_species_view()
