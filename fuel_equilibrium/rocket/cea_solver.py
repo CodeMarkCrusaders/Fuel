@@ -11,7 +11,9 @@ Cantera использует NASA-полиномы (те же, что и в CEA)
 """
 
 import math
+import os
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from scipy.optimize import brentq
@@ -28,6 +30,7 @@ from .nozzle_flow import (
     RocketPerformance,
     Propellant,
     _build_segmented_pressure_grid,
+    _resolve_worker_count,
 )
 
 
@@ -287,6 +290,27 @@ def _make_gas(needed_species: List[str]) -> 'ct.Solution':
         raise
 
 
+def _clone_gas(gas: 'ct.Solution') -> 'ct.Solution':
+    """Создаёт НЕЗАВИСИМУЮ копию Cantera-объекта Solution.
+
+    Объекты Cantera Solution хранят изменяемое термодинамическое состояние и
+    НЕ потокобезопасны: одновременная запись TPY/equilibrate в общий объект из
+    нескольких потоков повреждает состояние. Для параллельного расчёта сечений
+    каждому потоку нужна собственная копия газа. Состояние (T, P, Y) переносим,
+    чтобы копия была сразу пригодна к использованию.
+    """
+    src = gas.source if getattr(gas, "source", None) else 'gri30.yaml'
+    try:
+        clone = ct.Solution(src)
+    except Exception:
+        clone = ct.Solution('gri30.yaml')
+    try:
+        clone.TPY = gas.T, gas.P, gas.Y
+    except Exception:
+        pass
+    return clone
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Основная функция: расчёт сопла через Cantera (аналог solve_rocket_nozzle)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,16 +520,81 @@ def solve_rocket_nozzle_cea(
         P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
 
         flow_pressures = [*P_pre, *P_post]
-        for k, P_k in enumerate(flow_pressures, start=1):
-            _sp_solve(S_chamber_per_kg, float(P_k),
-                      T_guess=station_throat.T_K * 0.8)
+        tasks = list(enumerate(flow_pressures, start=1))
+
+        # Каждое сечение — независимая SP-задача равновесия и может считаться
+        # в своём потоке. ВАЖНО: ядро Cantera (`equilibrate`) удерживает GIL и
+        # не распараллеливается потоками, а копия Solution на поток стоит дорого,
+        # поэтому по умолчанию для Cantera-решателя идём последовательно.
+        # Параллельный режим включается явно через FUEL_NOZZLE_WORKERS>1.
+        env_workers = os.environ.get("FUEL_NOZZLE_WORKERS")
+        n_workers = _resolve_worker_count(len(tasks)) if env_workers else 1
+
+        # При параллельном расчёте каждому потоку выдаём СОБСТВЕННУЮ копию
+        # Cantera-газа (Solution не потокобезопасен).
+        import threading
+        _tls = threading.local()
+
+        def _thread_gas():
+            g = getattr(_tls, "gas", None)
+            if g is None:
+                g = _clone_gas(gas) if n_workers > 1 else gas
+                _tls.gas = g
+            return g
+
+        def _sp_solve_on(g, S_target, P_target, T_guess):
+            """SP-равновесие для конкретного газа g (итерации по T бренгом)."""
+            def _resid(T_try):
+                g.TPY = T_try, P_target, Y_dict
+                g.equilibrate('TP')
+                return g.entropy_mass - S_target
+            try:
+                T_lo, T_hi = 200.0, max(T_chamber * 1.5, 5000.0)
+                f_lo = _resid(T_lo)
+                f_hi = _resid(T_hi)
+                if f_lo * f_hi < 0:
+                    T_eq = brentq(_resid, T_lo, T_hi, xtol=0.01, rtol=1e-7,
+                                  maxiter=80)
+                else:
+                    g.TPY = T_guess, P_target, Y_dict
+                    g.equilibrate('SP')
+                    T_eq = g.T
+                g.TPY = T_eq, P_target, Y_dict
+                g.equilibrate('TP')
+            except Exception:
+                g.TPY = T_guess, P_target, Y_dict
+                g.equilibrate('SP')
+
+        def _compute_section(args):
+            k, P_k = args
+            g = _thread_gas()
+            _sp_solve_on(g, S_chamber_per_kg, float(P_k),
+                         station_throat.T_K * 0.8)
             st = _make_station_cantera(
-                f'Section {k}', gas, float(P_k), H_chamber_per_kg, species_list
+                f'Section {k}', g, float(P_k), H_chamber_per_kg, species_list
             )
+            return k, float(P_k), st
+
+        if n_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_compute_section, tasks))
+        else:
+            results = [_compute_section(t) for t in tasks]
+
+        # порядок сечений восстанавливаем по давлению (ход потока), не завися
+        # от порядка завершения потоков
+        for k, P_k, st in results:
             if P_k > P_throat:
                 intermediate_pre_throat.append(st)
             else:
                 intermediate_post_throat.append(st)
+
+        intermediate_pre_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+        intermediate_post_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+
+        if progress_cb:
+            progress_cb(f"Сечения посчитаны ({len(tasks)} шт., "
+                        f"{n_workers} поток(ов))")
 
     # ── 6) Ae/At
     flux_throat = station_throat.mass_flux_kg_per_m2_s
