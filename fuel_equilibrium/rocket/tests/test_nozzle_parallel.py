@@ -106,3 +106,48 @@ def test_parallel_matches_serial():
     # температура в каждом сечении совпадает
     for s_ser, s_par in zip(perf_serial.stations, perf_par.stations):
         assert s_par.T_K == pytest.approx(s_ser.T_K, rel=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Эквивалентность serial / parallel для CEA-решателя (Cantera)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cea_parallel_matches_serial():
+    """Параллельный расчёт сечений CEA-решателя совпадает с последовательным.
+
+    Каждый поток использует собственную копию Cantera-газа, поэтому результат
+    должен быть идентичен последовательному (с точностью до численного шума).
+    """
+    pytest.importorskip("cantera")
+    from fuel_equilibrium.rocket.cea_solver import solve_rocket_nozzle_cea
+    from fuel_equilibrium.rocket.nozzle_flow import Propellant
+
+    ox = Propellant("O2", 0.85)
+    fu = Propellant("H2", 0.15)
+    Pc, Pe = 5.0e6, 0.1e6
+
+    def run():
+        return solve_rocket_nozzle_cea(
+            ox, fu, Pc, Pe, n_intermediate_stations=10,
+        )
+
+    try:
+        os.environ.pop("FUEL_NOZZLE_WORKERS", None)
+        perf_serial = run()           # по умолчанию — последовательно
+        os.environ["FUEL_NOZZLE_WORKERS"] = "4"
+        perf_par = run()              # явный параллельный режим
+    finally:
+        os.environ.pop("FUEL_NOZZLE_WORKERS", None)
+
+    assert len(perf_serial.stations) == len(perf_par.stations)
+    p_serial = [s.P_Pa for s in perf_serial.stations]
+    p_par = [s.P_Pa for s in perf_par.stations]
+    for a, b in zip(p_serial, p_par):
+        assert a == pytest.approx(b, rel=1e-9)
+
+    assert perf_par.Cstar_m_per_s == pytest.approx(
+        perf_serial.Cstar_m_per_s, rel=1e-9)
+    assert perf_par.Isp_s == pytest.approx(perf_serial.Isp_s, rel=1e-9)
+
+    for s_ser, s_par in zip(perf_serial.stations, perf_par.stations):
+        assert s_par.T_K == pytest.approx(s_ser.T_K, rel=1e-9)

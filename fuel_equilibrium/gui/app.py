@@ -434,6 +434,7 @@ class PlotStyle:
     line_width: float = 1.8
     marker_size: float = 6.0
     show_markers: bool = True
+    smooth: bool = False   # сглаживание кривых (сплайн) на 1D-графиках
 
 
 def apply_plot_style(fig, ax, style: PlotStyle):
@@ -678,7 +679,28 @@ class CheckableComboBox(QtWidgets.QComboBox):
             text = ", ".join(labels)
         else:
             text = f"Выбрано: {len(labels)}"
-        self.lineEdit().setText(text)
+        self._full_text = text
+        self._apply_elided_text()
+
+    def _apply_elided_text(self):
+        """Показывает текст с многоточием (…), если он не помещается в поле."""
+        le = self.lineEdit()
+        full = getattr(self, "_full_text", "")
+        if not full:
+            le.setText("")
+            le.setToolTip("")
+            return
+        fm = le.fontMetrics()
+        avail = max(0, le.width() - 8)   # небольшой отступ под рамку
+        elided = fm.elidedText(full, Qt.ElideRight, avail)
+        le.setText(elided)
+        # полный текст — в подсказке, если был обрезан
+        le.setToolTip(full if elided != full else "")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # при изменении ширины пересчитываем многоточие
+        self._apply_elided_text()
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -1729,13 +1751,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # Каталог доступных для отображения величин:
         # (ключ из _section_series, подпись, единицы, цвет, признак log).
         self.PLOT_PARAM_DEFS = [
-            ("P",   "Давление P",            "МПа",    "#cc785c", False),
-            ("T",   "Температура T",         "К",      "#6ab0ff", False),
-            ("V",   "Скорость потока V",     "м/с",    "#82d27a", False),
-            ("M",   "Число Маха M",          "",       "#e6b800", False),
-            ("rho", "Плотность ρ",           "кг/м³",  "#cc785c", False),
-            ("gs",  "Изэнтр. показатель γₛ", "",       "#c084fc", False),
-            ("a",   "Скорость звука a",      "м/с",    "#4dd0e1", False),
+            ("P",     "Давление P",            "МПа",     "#cc785c", False),
+            ("T",     "Температура T",         "К",       "#6ab0ff", False),
+            ("V",     "Скорость потока V",     "м/с",     "#82d27a", False),
+            ("M",     "Число Маха M",          "",        "#e6b800", False),
+            ("rho",   "Плотность ρ",           "кг/м³",   "#cc785c", False),
+            ("gs",    "Изэнтр. показатель γₛ", "",        "#c084fc", False),
+            ("a",     "Скорость звука a",      "м/с",     "#4dd0e1", False),
+            # — термодинамические величины —
+            ("S",     "Энтропия S",            "Дж/(кг·К)", "#f472b6", False),
+            ("H",     "Энтальпия H",           "МДж/кг",  "#fb923c", False),
+            ("q_dyn", "Динам. давление q",     "МПа",     "#34d399", False),
+            # — газодинамические функции —
+            ("tau",   "τ(λ) = T/T₀",           "",        "#6ab0ff", False),
+            ("pi",    "π(λ) = P/P₀",           "",        "#cc785c", False),
+            ("eps",   "ε(λ) = ρ/ρ₀",           "",        "#c084fc", False),
+            ("lam",   "λ(x) — скор. коэфф.",   "",        "#e6b800", False),
+            ("q_gd",  "q(λ) — прив. расход",   "",        "#82d27a", False),
+            ("y_gd",  "y(λ) — функц. имп.",    "",        "#4dd0e1", False),
         ]
         # по умолчанию показываем основной набор
         self._plot_default_keys = ["P", "T", "V", "M", "rho", "gs"]
@@ -1749,14 +1782,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_plot_view = QtWidgets.QComboBox()
         self.cb_plot_view.addItems([
             "Графики параметров (1D)",
-            "Газодинамические функции",
             "Поле течения (2D)",
         ])
         self.cb_plot_view.setToolTip(
-            "«Графики параметров (1D)» — выбранные величины (P, T, V, M, …)\n"
-            "по длине сопла (интерактивный Plotly: колёсико — приближение,\n"
-            "ЛКМ/колесо — перемещение).\n"
-            "«Газодинамические функции» — τ(λ), π(λ), ε(λ), q(λ), y(λ), λ(x).\n"
+            "«Графики параметров (1D)» — выбранные величины (P, T, V, M, …,\n"
+            "а также газодинамические функции τ, π, ε, q, y, λ, энтропия,\n"
+            "энтальпия, динамическое давление) по длине сопла (интерактивный\n"
+            "Plotly: колёсико — приближение, ЛКМ/колесо — перемещение).\n"
             "«Поле течения (2D)» — цветовое поле параметра по сечению."
         )
         self.cb_plot_view.currentIndexChanged.connect(self._on_plot_view_changed)
@@ -1822,9 +1854,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Справа — панель настройки стиля
         side = QtWidgets.QWidget()
-        side.setMaximumWidth(260)
+        self._style_side_panel = side
+        self._side_panel_width = 260
+        side.setFixedWidth(self._side_panel_width)
         side_v = QtWidgets.QVBoxLayout(side)
         side_v.setContentsMargins(4, 4, 4, 4)
+
+        # — слайдер настройки ширины боковой панели (по требованию) —
+        width_row = QtWidgets.QHBoxLayout()
+        width_row.setSpacing(6)
+        width_row.addWidget(QtWidgets.QLabel("Ширина:"))
+        self.sl_side_width = QtWidgets.QSlider(Qt.Horizontal)
+        self.sl_side_width.setRange(200, 520)
+        self.sl_side_width.setValue(self._side_panel_width)
+        self.sl_side_width.setToolTip("Ширина панели «Оформление графиков».")
+        self.sl_side_width.valueChanged.connect(self._on_side_width_changed)
+        width_row.addWidget(self.sl_side_width, 1)
+        self.lbl_side_width = QtWidgets.QLabel(f"{self._side_panel_width}px")
+        self.lbl_side_width.setStyleSheet("color: #a8a29e; font-size: 10px;")
+        self.lbl_side_width.setMinimumWidth(40)
+        width_row.addWidget(self.lbl_side_width)
+        side_v.addLayout(width_row)
 
         gb_style = QtWidgets.QGroupBox("Оформление графиков")
         sf = QtWidgets.QFormLayout(gb_style)
@@ -1878,9 +1928,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_lw.setValue(1.8)
         sf.addRow("Толщ. линий:", self.sp_lw)
 
-        self.chk_markers = QtWidgets.QCheckBox("Маркеры на точках")
+        self.chk_markers = QtWidgets.QCheckBox("Отображать точки")
         self.chk_markers.setChecked(True)
+        self.chk_markers.setToolTip(
+            "Показывать маркеры в расчётных точках (сечениях) на 1D-графиках.")
+        self.chk_markers.toggled.connect(self._redraw_plots)
         sf.addRow("", self.chk_markers)
+
+        self.chk_smooth = QtWidgets.QCheckBox("Сглаживание графиков")
+        self.chk_smooth.setChecked(False)
+        self.chk_smooth.setToolTip(
+            "Сглаживать кривые на 1D-графиках (сплайн-интерполяция).")
+        self.chk_smooth.toggled.connect(self._redraw_plots)
+        sf.addRow("", self.chk_smooth)
 
         self.chk_grid_major = QtWidgets.QCheckBox("Основная сетка")
         self.chk_grid_major.setChecked(True)
@@ -2435,25 +2495,25 @@ class MainWindow(QtWidgets.QMainWindow):
         # Если 2D-поле успешно посчитано — автоматически переключаем единый
         # селектор вида на «Поле течения (2D)» (индекс 2); иначе остаёмся.
         if (self._last_field_2d is not None and hasattr(self, "cb_plot_view")
-                and self.cb_plot_view.currentIndex() != 2):
-            self.cb_plot_view.setCurrentIndex(2)
+                and self.cb_plot_view.currentIndex() != 1):
+            self.cb_plot_view.setCurrentIndex(1)
             return
         self._render_field_2d()
 
     def _field_view_is_2d(self) -> bool:
         """True, если выбран режим «Поле течения (2D)» в едином селекторе."""
         return (hasattr(self, "cb_plot_view")
-                and self.cb_plot_view.currentIndex() == 2)
+                and self.cb_plot_view.currentIndex() == 1)
 
     def _on_plot_view_changed(self, *args):
-        """Переключение единого вида: 1D-графики / газодинам. функции / поле 2D."""
+        """Переключение единого вида: 1D-графики параметров / поле 2D."""
         idx = self.cb_plot_view.currentIndex() if hasattr(self, "cb_plot_view") else 0
-        # Страница 0 — 1D-графики параметров; страница 1 — поле/функции (mpl).
+        # Страница 0 — 1D-графики параметров; страница 1 — поле 2D (mpl).
         if hasattr(self, "plot_stack"):
             self.plot_stack.setCurrentIndex(0 if idx == 0 else 1)
 
         is_1d_params = (idx == 0)
-        is_2d_field = (idx == 2)
+        is_2d_field = (idx == 1)
         # Селектор поля (M/P/T/V) актуален только для 2D-поля.
         if hasattr(self, "cb_field_2d"):
             self.cb_field_2d.setVisible(is_2d_field)
@@ -2477,6 +2537,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_profile_1d = bool(checked)
         self._redraw_plots()
 
+    def _on_side_width_changed(self, value: int):
+        """Изменение ширины боковой панели «Оформление графиков» слайдером."""
+        self._side_panel_width = int(value)
+        if getattr(self, "_style_side_panel", None) is not None:
+            self._style_side_panel.setFixedWidth(self._side_panel_width)
+        if hasattr(self, "lbl_side_width"):
+            self.lbl_side_width.setText(f"{self._side_panel_width}px")
+        # пересчёт многоточия в мультивыборе под новую ширину
+        if hasattr(self, "cb_plot_params"):
+            self.cb_plot_params._apply_elided_text()
+
     def _on_chamber_sections_changed(self, value: int):
         """Изменение числа расчётных сечений в камере (Injector→Nozzle inlet).
 
@@ -2496,20 +2567,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._field_2d_plot_cache = None
         self._field_2d_marker = None
 
-        # ── Режим «Газодинамические функции (1D)» ──────────────────────────────
-        # Доступен всегда при наличии 1D-расчёта (self.perf), даже если 2D-поле
-        # не считалось. Строит детальные интерактивные графики τ, π, ε, q, y, λ.
+        # На страницу поля 2D переходим только из режима «Поле течения (2D)».
+        # Газодинамические функции (τ, π, ε, q, y, λ) теперь доступны прямо в
+        # списке величин режима «Графики параметров (1D)».
         mode_2d = self._field_view_is_2d()
         if not mode_2d:
-            self._render_gasdynamic_functions_1d(c)
+            ax = c.fig.add_subplot(111)
+            ax.text(0.5, 0.5,
+                    "Газодинамические функции (τ, π, ε, q, y, λ) теперь\n"
+                    "доступны в списке величин режима\n"
+                    "«Графики параметров (1D)».",
+                    ha='center', va='center', fontsize=11, color='#888')
+            ax.set_axis_off()
+            c.fig.tight_layout()
+            c.draw()
             return
 
         res = self._last_field_2d
         if res is None:
             ax = c.fig.add_subplot(111)
             ax.text(0.5, 0.5,
-                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт,\n"
-                    "либо переключите «Вид» на «Газодинамические функции (1D)».",
+                    "Нет данных 2D.\nВыберите режим «Двумерный (2D)» и выполните расчёт.",
                     ha='center', va='center', fontsize=11, color='#888')
             ax.set_axis_off()
             c.fig.tight_layout()
@@ -4266,6 +4344,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s.font_size_legend = self.sp_font_leg.value()
         s.line_width = self.sp_lw.value()
         s.show_markers = self.chk_markers.isChecked()
+        if hasattr(self, "chk_smooth"):
+            s.smooth = self.chk_smooth.isChecked()
         s.grid_major = self.chk_grid_major.isChecked()
         s.grid_minor = self.chk_grid_minor.isChecked()
         s.dark_plot = self.chk_dark_plot.isChecked()
@@ -4305,6 +4385,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 "M": ser["M"],
                 "rho": ser["rho"],
                 "gs": ser["gamma_s"],
+                "a": ser.get("a"),
+                "S": ser.get("S"),
+                "H": (ser.get("H") / 1e6 if ser.get("H") is not None else None),
+                "q_dyn": (ser.get("q_dyn") / 1e6
+                          if ser.get("q_dyn") is not None else None),
+                "tau": ser.get("tau"),
+                "pi": ser.get("pi"),
+                "eps": ser.get("eps"),
+                "lam": ser.get("lam"),
+                "q_gd": ser.get("q_gd"),
+                "y_gd": ser.get("y_gd"),
             }
         stations = perf.stations
         x = np.asarray(self._compute_curve_x(stations), dtype=float)
@@ -4483,10 +4574,67 @@ class MainWindow(QtWidgets.QMainWindow):
         r_cap = float(np.nanmax(finite)) if finite.size else 1.0
         r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
 
+        # ── Дополнительные термодинамические величины из исходных сечений ──────
+        # Энтропия S и энтальпия H берутся напрямую из StationResult (если есть),
+        # с той же сортировкой/дедупликацией, что и остальные массивы.
+        S = np.array([float(getattr(s, "S_J_per_kgK", float('nan'))) for s in stations])
+        H = np.array([float(getattr(s, "H_J_per_kg", float('nan'))) for s in stations])
+        if n_cham > 0:
+            S0 = S[i_inj] if S.size else float('nan')
+            H0 = H[i_inj] if H.size else float('nan')
+            for _ in range(int(n_cham)):
+                S = np.append(S, S0)
+                H = np.append(H, H0)
+        # применяем тот же порядок сортировки/дедупликации (order → iu)
+        if S.size == order.size:
+            S = S[order][iu]
+        else:
+            S = np.full_like(x, float('nan'))
+        if H.size == order.size:
+            H = H[order][iu]
+        else:
+            H = np.full_like(x, float('nan'))
+
+        # ── Газодинамические функции (изэнтропические соотношения) ────────────
+        # Параметры торможения (камера = сечение инжектора / минимум x).
+        try:
+            i0 = int(np.argmin(x)) if x.size else 0
+        except Exception:
+            i0 = 0
+        T0 = float(T[i0]) if T.size and T[i0] > 0 else (
+            float(np.nanmax(T)) if T.size else 1.0)
+        P0 = float(P[i0]) if P.size and P[i0] > 0 else (
+            float(np.nanmax(P)) if P.size else 1.0)
+        rho0 = float(rho[i0]) if rho.size and rho[i0] > 0 else (
+            float(np.nanmax(rho)) if rho.size else 1.0)
+        # τ = T/T₀, π = P/P₀, ε = ρ/ρ₀ — прямо из величин по сечениям.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            tau = T / T0 if T0 else np.zeros_like(T)
+            pi = P / P0 if P0 else np.zeros_like(P)
+            eps = rho / rho0 if rho0 else np.zeros_like(rho)
+        # λ — скоростной коэффициент: λ² = ((k+1)/2·M²) / (1 + (k-1)/2·M²).
+        k = np.where(gs > 1.0, gs, 1.2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            lam2 = ((k + 1.0) / 2.0 * M * M) / (1.0 + (k - 1.0) / 2.0 * M * M)
+        lam = np.sqrt(np.clip(lam2, 0.0, None))
+        # q(λ) — приведённый расход; y(λ) — функция удельного импульса.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            base = np.clip(1.0 - (k - 1.0) / (k + 1.0) * lam * lam, 0.0, None)
+            q_gd = (lam * ((k + 1.0) / 2.0) ** (1.0 / (k - 1.0))
+                    * base ** (1.0 / (k - 1.0)))
+            y_gd = np.where(lam > 1e-9,
+                            (1.0 + lam * lam) / (2.0 * lam) * q_gd, 0.0)
+        # Динамическое давление q_dyn = ½·ρ·V².
+        q_dyn = 0.5 * rho * V * V
+
         return {
             "x_m": x, "P_Pa": P, "T_K": T, "rho": rho,
             "V": V, "a": a, "M": M, "gamma_s": gs, "Ae_At": Ae,
             "r_rel": r_rel,
+            "S": S, "H": H,
+            "tau": tau, "pi": pi, "eps": eps,
+            "lam": lam, "q_gd": q_gd, "y_gd": y_gd,
+            "q_dyn": q_dyn,
             "label": labels, "i_throat": i_throat,
             "x_throat_m": float(x[i_throat]) if x.size else 0.0,
         }
@@ -4564,6 +4712,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return ser["gamma_s"]
         if key == "a":
             return ser["a"]
+        # ── термодинамические величины ──
+        if key == "S":
+            return ser.get("S")
+        if key == "H":
+            v = ser.get("H")
+            return v / 1e6 if v is not None else None   # Дж/кг → МДж/кг
+        if key == "q_dyn":
+            v = ser.get("q_dyn")
+            return v / 1e6 if v is not None else None   # Па → МПа
+        # ── газодинамические функции ──
+        if key == "tau":
+            return ser.get("tau")
+        if key == "pi":
+            return ser.get("pi")
+        if key == "eps":
+            return ser.get("eps")
+        if key == "lam":
+            return ser.get("lam")
+        if key == "q_gd":
+            return ser.get("q_gd")
+        if key == "y_gd":
+            return ser.get("y_gd")
         return None
 
     def _selected_plot_keys(self):
@@ -4621,6 +4791,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = 'lines+markers' if style.show_markers else 'lines'
         ms = max(3, int(style.marker_size))
         lw = max(1.0, float(style.line_width))
+        # сглаживание кривых — сплайн-форма линии Plotly (по требованию).
+        line_shape = 'spline' if getattr(style, "smooth", False) else 'linear'
         for i, key in enumerate(keys):
             row = i // ncols + 1
             col = i % ncols + 1
@@ -4629,7 +4801,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fig.add_trace(
                 go.Scatter(
                     x=x, y=y, mode=mode, name=label,
-                    line=dict(color=color, width=lw),
+                    line=dict(color=color, width=lw, shape=line_shape),
                     marker=dict(size=ms, color=color),
                     showlegend=False,
                     hovertemplate=(f"{label}<br>x=%{{x:.4g}} м<br>"
@@ -4762,6 +4934,34 @@ class MainWindow(QtWidgets.QMainWindow):
         fig = self._build_plotly_1d_figure(ser, style, keys)
         c.set_figure(fig)
 
+    @staticmethod
+    def _smooth_xy(x, y, n_out: int = 300):
+        """Возвращает сглаженную кривую (x, y) через PCHIP-интерполяцию.
+
+        Используется для matplotlib-фолбэка при включённом сглаживании.
+        Если scipy недоступен или точек слишком мало — возвращает исходные.
+        """
+        try:
+            xa = np.asarray(x, dtype=float)
+            ya = np.asarray(y, dtype=float)
+            m = np.isfinite(xa) & np.isfinite(ya)
+            xa, ya = xa[m], ya[m]
+            if xa.size < 3:
+                return x, y
+            xu, iu = np.unique(xa, return_index=True)
+            yu = ya[iu]
+            if xu.size < 3:
+                return x, y
+            xs = np.linspace(float(xu[0]), float(xu[-1]), int(n_out))
+            try:
+                from scipy.interpolate import PchipInterpolator  # type: ignore
+                ys = PchipInterpolator(xu, yu)(xs)
+            except Exception:
+                ys = np.interp(xs, xu, yu)
+            return xs, ys
+        except Exception:
+            return x, y
+
     def _draw_selected_1d_mpl(self, ser, style):
         """Резервная отрисовка на matplotlib (если Plotly недоступен)."""
         c = getattr(self, "canvas_1d", None)
@@ -4790,12 +4990,19 @@ class MainWindow(QtWidgets.QMainWindow):
         x_thr = ser.get("x_throat_m", None)
 
         marker = 'o' if style.show_markers else None
+        smooth = getattr(style, "smooth", False)
         for i, key in enumerate(keys):
             label, unit, color = defs[key]
             y = self._plot_param_value(key, ser)
             ax = c.fig.add_subplot(nrows, ncols, i + 1)
-            ax.plot(x, y, '-', marker=marker, color=color,
-                    lw=style.line_width, ms=style.marker_size, zorder=3)
+            # маркеры — на исходных точках; линия — сглаженная (если включено).
+            xl, yl = x, y
+            if smooth and y is not None:
+                xl, yl = self._smooth_xy(x, y)
+            ax.plot(xl, yl, '-', color=color, lw=style.line_width, zorder=3)
+            if marker is not None:
+                ax.plot(x, y, linestyle='none', marker=marker, color=color,
+                        ms=style.marker_size, zorder=4)
             # наложения для сравнения вариантов (если ключ совпадает)
             self._draw_overlays(ax, key)
             if key == "M":
