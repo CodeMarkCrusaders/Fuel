@@ -658,11 +658,39 @@ class CheckableComboBox(QtWidgets.QComboBox):
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
         self.lineEdit().setPlaceholderText(placeholder)
-        # клик по полю открывает выпадающий список
+        # клик по полю открывает/закрывает выпадающий список
         self.lineEdit().installEventFilter(self)
+        # фильтр на сам popup (viewport) — чтобы корректно отслеживать
+        # переключение галочек и закрытие при клике мимо/потере фокуса.
         self.view().installEventFilter(self)
-        self.view().pressed.connect(self._on_item_pressed)
+        self.view().viewport().installEventFilter(self)
+        # ВАЖНО: переключение пунктов обрабатывается ТОЛЬКО в eventFilter по
+        # MouseButtonRelease на viewport'е. Сигнал view().pressed НЕ
+        # подключаем, иначе галочка переключалась бы дважды (на pressed и на
+        # release) — отсюда были «пропуски» добавления/удаления кривых.
+
+        # текущее состояние popup'а (для надёжного toggle по клику в поле)
+        self._popup_open = False
+        # момент последнего закрытия popup'а (мс) — чтобы клик по полю,
+        # пришедший сразу после авто-закрытия Qt, не открывал список заново.
+        self._closed_at = QtCore.QElapsedTimer()
+        self._closed_at.start()
+        self._closed_at.invalidate()
+
+        # Дебаунс: рассылку «selectionChanged» откладываем на короткий
+        # интервал, чтобы быстрые клики по нескольким пунктам не запускали
+        # тяжёлую перерисовку графиков на каждый клик (устраняет лаги и
+        # «пропуски» добавления/удаления кривых).
+        self._emit_timer = QtCore.QTimer(self)
+        self._emit_timer.setSingleShot(True)
+        self._emit_timer.setInterval(180)
+        self._emit_timer.timeout.connect(self.selectionChanged.emit)
+
         self._update_text()
+
+    def _schedule_emit(self):
+        """Отложенная (дебаунс) рассылка сигнала об изменении выбора."""
+        self._emit_timer.start()
 
     # — построение списка —
     def addCheckItem(self, key: str, text: str, checked: bool = False):
@@ -689,29 +717,65 @@ class CheckableComboBox(QtWidgets.QComboBox):
             checked = it.data(self.KEY_ROLE) in keys
             it.setData(Qt.Checked if checked else Qt.Unchecked, Qt.CheckStateRole)
         self._update_text()
+        # программное изменение — рассылаем сразу (без дебаунса),
+        # чтобы графики синхронизировались немедленно.
         self.selectionChanged.emit()
 
     # — взаимодействие —
-    def _on_item_pressed(self, index):
-        it = self.model().itemFromIndex(index)
-        if it is None:
+    def _toggle_item(self, it):
+        """Переключить галочку у пункта модели и обновить поле/сигнал."""
+        if it is None or not (it.flags() & Qt.ItemIsEnabled):
             return
         new_state = (Qt.Unchecked
                      if it.data(Qt.CheckStateRole) == Qt.Checked
                      else Qt.Checked)
         it.setData(new_state, Qt.CheckStateRole)
         self._update_text()
-        self.selectionChanged.emit()
+        self._schedule_emit()
 
     def eventFilter(self, obj, event):
-        if obj is self.lineEdit() and event.type() == QtCore.QEvent.MouseButtonRelease:
-            self.showPopup()
+        et = event.type()
+        # — клик по текстовому полю: открыть/закрыть список —
+        if obj is self.lineEdit() and et == QtCore.QEvent.MouseButtonRelease:
+            # Если Qt только что авто-закрыл popup при клике мимо него
+            # (≤250 мс назад), не открываем список заново — иначе клик «по полю
+            # ради закрытия» мгновенно открывал бы его обратно.
+            recently_closed = (self._closed_at.isValid()
+                               and self._closed_at.elapsed() < 250)
+            if self._popup_open:
+                self.hidePopup()
+            elif not recently_closed:
+                self.showPopup()
+            return True
+        # — клик в области popup'а: переключаем пункт под курсором, но
+        #   список оставляем открытым (множественный выбор) —
+        if obj is self.view().viewport() and et == QtCore.QEvent.MouseButtonRelease:
+            idx = self.view().indexAt(event.pos())
+            if idx.isValid():
+                self._toggle_item(self.model().itemFromIndex(idx))
+            else:
+                # клик мимо пунктов внутри popup — закрываем
+                self.hidePopup()
             return True
         return super().eventFilter(obj, event)
 
+    def showPopup(self):
+        super().showPopup()
+        self._popup_open = True
+
     def hidePopup(self):
-        # не закрываем список по клику на пункт — позволяем отметить несколько
-        pass
+        # Закрываем список (по клику в поле, мимо пунктов или при потере
+        # фокуса). Множественный выбор обеспечивается тем, что клики ПО
+        # пунктам обрабатываются в eventFilter и popup НЕ закрывают.
+        if self._popup_open:
+            self._closed_at.restart()
+        self._popup_open = False
+        super().hidePopup()
+
+    def focusOutEvent(self, event):
+        # при потере фокуса список должен скрываться (по требованию)
+        self.hidePopup()
+        super().focusOutEvent(event)
 
     def _update_text(self):
         labels = []
@@ -2029,47 +2093,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sf.addRow("", btn_save)
 
         side_v.addWidget(gb_style)
-
-        # ─── Наложение графиков (сравнение нескольких 1D-расчётов) ───
-        gb_overlay = QtWidgets.QGroupBox("Наложение графиков (1D)")
-        of = QtWidgets.QVBoxLayout(gb_overlay)
-        of.setSpacing(4)
-
-        self.chk_overlay_show = QtWidgets.QCheckBox("Показывать наложения")
-        self.chk_overlay_show.setChecked(True)
-        self.chk_overlay_show.setToolTip(
-            "Отображать ранее зафиксированные кривые поверх текущего расчёта "
-            "для сравнения вариантов."
-        )
-        self.chk_overlay_show.toggled.connect(self._redraw_plots)
-        of.addWidget(self.chk_overlay_show)
-
-        self.sp_overlay_name = QtWidgets.QLineEdit()
-        self.sp_overlay_name.setPlaceholderText("Имя варианта (необязательно)")
-        of.addWidget(self.sp_overlay_name)
-
-        btn_overlay_add = QtWidgets.QPushButton("➕ Зафиксировать как наложение")
-        btn_overlay_add.setToolTip(
-            "Сохранить кривые текущего 1D-расчёта как наложение, чтобы "
-            "сравнить с последующими расчётами."
-        )
-        btn_overlay_add.clicked.connect(self._add_overlay_snapshot)
-        of.addWidget(btn_overlay_add)
-
-        btn_overlay_clear = QtWidgets.QPushButton("🗑 Очистить наложения")
-        btn_overlay_clear.clicked.connect(self._clear_overlays)
-        of.addWidget(btn_overlay_clear)
-
-        self.lbl_overlay_count = QtWidgets.QLabel("Наложений: 0")
-        self.lbl_overlay_count.setStyleSheet("color: #a8a29e; font-size: 10px;")
-        of.addWidget(self.lbl_overlay_count)
-
-        side_v.addWidget(gb_overlay)
         side_v.addStretch(1)
         h.addWidget(side)
-
-        # Хранилище снимков для наложения (список dict с массивами кривых)
-        self._overlays = []
         return w
 
     def _build_species_tab(self) -> QtWidgets.QWidget:
@@ -4429,98 +4454,6 @@ class MainWindow(QtWidgets.QMainWindow):
         s.tick_direction = self.cb_tick_dir.currentText().split()[0]
         return s
 
-    # ─── Наложение графиков (overlay) для сравнения 1D-расчётов ───
-
-    def _compute_curve_x(self, stations):
-        """Координата x по длине сопла для текущих сечений (как в _redraw_plots)."""
-        def length_to_m(v, unit):
-            if unit == 'см':
-                return v * 0.01
-            if unit == 'мм':
-                return v * 0.001
-            return v
-        return build_nozzle_geometry(
-            stations,
-            L_chamber=self._chamber_length_m(),
-            L_conv=self._auto_conv_div_lengths()[0],
-            L_div=self._auto_conv_div_lengths()[1],
-        )
-
-    def _snapshot_curves(self, perf):
-        """Снимок кривых 1D-расчёта (x + P, T, V, M, ρ, γₛ) для наложения.
-
-        Берёт значения из единого очищенного источника ``_section_series``,
-        чтобы наложения были согласованы с основными графиками и без «иголок».
-        """
-        ser = self._section_series(perf)
-        if ser:
-            return {
-                "x": ser["x_m"],
-                "P": ser["P_Pa"] / 1e6,
-                "T": ser["T_K"],
-                "V": ser["V"],
-                "M": ser["M"],
-                "rho": ser["rho"],
-                "gs": ser["gamma_s"],
-                "a": ser.get("a"),
-                "S": ser.get("S"),
-                "H": (ser.get("H") / 1e6 if ser.get("H") is not None else None),
-                "q_dyn": (ser.get("q_dyn") / 1e6
-                          if ser.get("q_dyn") is not None else None),
-                "tau": ser.get("tau"),
-                "pi": ser.get("pi"),
-                "eps": ser.get("eps"),
-                "lam": ser.get("lam"),
-                "q_gd": ser.get("q_gd"),
-                "y_gd": ser.get("y_gd"),
-            }
-        stations = perf.stations
-        x = np.asarray(self._compute_curve_x(stations), dtype=float)
-        return {
-            "x": x,
-            "P": np.array([s.P_Pa / 1e6 for s in stations]),
-            "T": np.array([s.T_K for s in stations]),
-            "V": np.array([s.V_m_per_s for s in stations]),
-            "M": np.array([s.M for s in stations]),
-            "rho": np.array([s.rho_kg_per_m3 for s in stations]),
-            "gs": np.array([s.gamma_s for s in stations]),
-        }
-
-    def _add_overlay_snapshot(self):
-        """Зафиксировать текущий 1D-расчёт как наложение для сравнения."""
-        if getattr(self, "perf", None) is None:
-            self.statusBar().showMessage(
-                "Нет расчёта для фиксации наложения.", 4000
-            )
-            return
-        if not hasattr(self, "_overlays"):
-            self._overlays = []
-        name = self.sp_overlay_name.text().strip()
-        if not name:
-            name = f"Вариант {len(self._overlays) + 1}"
-        snap = self._snapshot_curves(self.perf)
-        # цвет наложения из палитры (циклически)
-        palette = ['#9aa0a6', '#d4a373', '#90be6d', '#577590',
-                   '#f9c74f', '#bc6c25', '#8ecae6', '#e07a5f']
-        snap["label"] = name
-        snap["color"] = palette[len(self._overlays) % len(palette)]
-        self._overlays.append(snap)
-        self._update_overlay_count()
-        self.sp_overlay_name.clear()
-        self.statusBar().showMessage(f"Наложение «{name}» добавлено.", 4000)
-        self._redraw_plots()
-
-    def _clear_overlays(self):
-        """Очистить все наложения."""
-        self._overlays = []
-        self._update_overlay_count()
-        self._redraw_plots()
-
-    def _update_overlay_count(self):
-        if hasattr(self, "lbl_overlay_count"):
-            n = len(getattr(self, "_overlays", []))
-            self.lbl_overlay_count.setText(f"Наложений: {n}")
-
     # ─────────────────────────────────────────────────────────────────────────
     #  ЕДИНЫЙ ИСТОЧНИК ДАННЫХ ПО СЕЧЕНИЯМ.
     #  Все параметры газа по сечениям считаются/чистятся здесь (в одном месте)
@@ -4734,29 +4667,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "x_throat_m": float(x[i_throat]) if x.size else 0.0,
         }
 
-    def _draw_overlays(self, ax, key, *, twin=False):
-        """Нарисовать наложенные кривые ``key`` на оси ``ax`` (фоном).
-
-        Возвращает список handle'ов для легенды (по одному на наложение,
-        только для основной оси, чтобы не дублировать в легенде).
-        """
-        handles = []
-        if not getattr(self, "chk_overlay_show", None) or not self.chk_overlay_show.isChecked():
-            return handles
-        for ov in getattr(self, "_overlays", []):
-            y = ov.get(key)
-            if y is None:
-                continue
-            lw = max(0.8, self._collect_style().line_width * 0.7)
-            line, = ax.plot(
-                ov["x"], y, '-', color=ov["color"], lw=lw,
-                alpha=0.55, zorder=1,
-                label=(f"{ov['label']}" if not twin else None),
-            )
-            if not twin:
-                handles.append(line)
-        return handles
-
     def _redraw_plots(self):
         if self.perf is None:
             return
@@ -4914,29 +4824,42 @@ class MainWindow(QtWidgets.QMainWindow):
             horizontal_spacing=0.09 if ncols > 1 else 0.0,
         )
 
-        mode = 'lines+markers' if style.show_markers else 'lines'
         ms = max(3, int(style.marker_size))
         lw = max(1.0, float(style.line_width))
-        # сглаживание кривых — сплайн-форма линии Plotly (по требованию).
-        line_shape = 'spline' if getattr(style, "smooth", False) else 'linear'
+        # «Сглаживание графиков» — более плотная передискретизация кривой.
+        n_out = 600 if getattr(style, "smooth", False) else 400
         for i, key in enumerate(keys):
             row = i // ncols + 1
             col = i % ncols + 1
             label, unit, color = defs[key]
             y = self._plot_param_value(key, ser)
+            if y is None:
+                continue
+
+            # Линию строим по ГУСТО передискретизированной (PCHIP) кривой —
+            # это даёт визуально плавные графики без «иголок» и без выбросов
+            # сплайна Plotly (PCHIP монотонно-сохраняющий, не «перелетает»).
+            # Маркеры при этом остаются на ИСХОДНЫХ расчётных точках (сечениях).
+            xl, yl = self._smooth_xy(x, y, n_out=n_out)
             fig.add_trace(
                 go.Scatter(
-                    x=x, y=y, mode=mode, name=label,
-                    line=dict(color=color, width=lw, shape=line_shape),
-                    marker=dict(size=ms, color=color),
+                    x=xl, y=yl, mode='lines', name=label,
+                    line=dict(color=color, width=lw, shape='linear'),
                     showlegend=False,
                     hovertemplate=(f"{label}<br>x=%{{x:.4g}} м<br>"
                                    f"%{{y:.4g}} {unit}<extra></extra>"),
                 ),
                 row=row, col=col,
             )
-            # наложения для сравнения вариантов (если ключ совпадает)
-            self._add_plotly_overlays(fig, key, row, col)
+            if style.show_markers:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x, y=y, mode='markers', name=label,
+                        marker=dict(size=ms, color=color),
+                        showlegend=False, hoverinfo='skip',
+                    ),
+                    row=row, col=col,
+                )
             # линия M = 1 (звуковая)
             if key == "M":
                 fig.add_hline(row=row, col=col, y=1.0,
@@ -5034,26 +4957,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return fig
 
-    def _add_plotly_overlays(self, fig, key, row, col):
-        """Добавляет наложенные кривые сравнения (если включены) в plotly."""
-        if (not getattr(self, "chk_overlay_show", None)
-                or not self.chk_overlay_show.isChecked()):
-            return
-        for ov in getattr(self, "_overlays", []):
-            y = ov.get(key)
-            if y is None:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=ov["x"], y=y, mode='lines', name=ov.get("label", ""),
-                    line=dict(color=ov["color"], width=1.4, dash='solid'),
-                    opacity=0.55, showlegend=False,
-                    hovertemplate=(f"{ov.get('label','')}<br>"
-                                   f"x=%{{x:.4g}}<br>%{{y:.4g}}<extra></extra>"),
-                ),
-                row=row, col=col,
-            )
-
     def _draw_selected_1d_plotly(self, ser, style):
         """Строит интерактивный Plotly-холст из выбранных величин."""
         c = getattr(self, "canvas_1d", None)
@@ -5123,21 +5026,20 @@ class MainWindow(QtWidgets.QMainWindow):
         x_thr = ser.get("x_throat_m", None)
 
         marker = 'o' if style.show_markers else None
-        smooth = getattr(style, "smooth", False)
+        # линию всегда строим по плотной PCHIP-кривой (плавно, без «иголок»);
+        # «Сглаживание графиков» лишь повышает плотность точек.
+        n_out = 600 if getattr(style, "smooth", False) else 400
         for i, key in enumerate(keys):
             label, unit, color = defs[key]
             y = self._plot_param_value(key, ser)
             ax = c.fig.add_subplot(nrows, ncols, i + 1)
-            # маркеры — на исходных точках; линия — сглаженная (если включено).
-            xl, yl = x, y
-            if smooth and y is not None:
-                xl, yl = self._smooth_xy(x, y)
+            # маркеры — на исходных точках; линия — сглаженная PCHIP-кривая.
+            xl, yl = (self._smooth_xy(x, y, n_out=n_out)
+                      if y is not None else (x, y))
             ax.plot(xl, yl, '-', color=color, lw=style.line_width, zorder=3)
             if marker is not None:
                 ax.plot(x, y, linestyle='none', marker=marker, color=color,
                         ms=style.marker_size, zorder=4)
-            # наложения для сравнения вариантов (если ключ совпадает)
-            self._draw_overlays(ax, key)
             if key == "M":
                 ax.axhline(1.0, color='#a8a29e', lw=0.8, ls=':')
             if x_thr is not None:
