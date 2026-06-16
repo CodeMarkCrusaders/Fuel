@@ -737,26 +737,33 @@ class CheckableComboBox(QtWidgets.QComboBox):
         et = event.type()
         # — клик по текстовому полю: открыть/закрыть список —
         if obj is self.lineEdit() and et == QtCore.QEvent.MouseButtonRelease:
-            # Если Qt только что авто-закрыл popup при клике мимо него
-            # (≤250 мс назад), не открываем список заново — иначе клик «по полю
-            # ради закрытия» мгновенно открывал бы его обратно.
+            # Клик по полю, пришедший сразу после авто-закрытия popup'а
+            # (например, клик мимо списка попал по полю), не должен заново
+            # открывать список.
             recently_closed = (self._closed_at.isValid()
-                               and self._closed_at.elapsed() < 250)
+                               and self._closed_at.elapsed() < 200)
             if self._popup_open:
                 self.hidePopup()
             elif not recently_closed:
                 self.showPopup()
             return True
         # — клик в области popup'а: переключаем пункт под курсором, но
-        #   список оставляем открытым (множественный выбор) —
+        #   список оставляем ОТКРЫТЫМ (множественный выбор) —
         if obj is self.view().viewport() and et == QtCore.QEvent.MouseButtonRelease:
             idx = self.view().indexAt(event.pos())
             if idx.isValid():
                 self._toggle_item(self.model().itemFromIndex(idx))
-            else:
-                # клик мимо пунктов внутри popup — закрываем
-                self.hidePopup()
-            return True
+                return True   # гасим release → Qt не закрывает список
+            # клик мимо пунктов внутри popup — пусть закрывается штатно
+            return super().eventFilter(obj, event)
+        # — popup скрылся (клик мимо/Esc/потеря фокуса) — синхронизируем флаг.
+        #   Закрытие при клике вне списка обеспечивает сам Qt (штатное
+        #   поведение popup'а), нам нужно лишь отметить момент закрытия,
+        #   чтобы повторный клик по полю не открыл список мгновенно.
+        if obj is self.view() and et == QtCore.QEvent.Hide:
+            if self._popup_open:
+                self._closed_at.restart()
+            self._popup_open = False
         return super().eventFilter(obj, event)
 
     def showPopup(self):
@@ -764,18 +771,10 @@ class CheckableComboBox(QtWidgets.QComboBox):
         self._popup_open = True
 
     def hidePopup(self):
-        # Закрываем список (по клику в поле, мимо пунктов или при потере
-        # фокуса). Множественный выбор обеспечивается тем, что клики ПО
-        # пунктам обрабатываются в eventFilter и popup НЕ закрывают.
         if self._popup_open:
             self._closed_at.restart()
         self._popup_open = False
         super().hidePopup()
-
-    def focusOutEvent(self, event):
-        # при потере фокуса список должен скрываться (по требованию)
-        self.hidePopup()
-        super().focusOutEvent(event)
 
     def _update_text(self):
         labels = []
@@ -1838,6 +1837,12 @@ class MainWindow(QtWidgets.QMainWindow):
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(4, 4, 4, 4)
 
+        # Разделитель между областью графиков и панелью оформления —
+        # перетаскиваемый сплиттер (как у левой панели исходных данных),
+        # вместо отдельного слайдера ширины.
+        plot_splitter = QtWidgets.QSplitter(Qt.Horizontal)
+        plot_splitter.setChildrenCollapsible(False)
+
         # Объединённая область графиков: один контейнер вместо двух подвкладок
         # «Графики (1D)» и «Поле течения (2D)». Сверху — единый селектор вида,
         # ниже — QStackedWidget (1D Plotly / поле 2D matplotlib).
@@ -1951,31 +1956,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas_VM = MplCanvas(width=5, height=3.5)
         self.canvas_RHO = MplCanvas(width=5, height=3.5)
 
-        h.addWidget(plot_widget, 1)
+        plot_splitter.addWidget(plot_widget)
 
-        # Справа — панель настройки стиля
+        # Справа — панель настройки стиля (внутри прокручиваемой области,
+        # чтобы при узкой ширине содержимое не обрезалось).
         side = QtWidgets.QWidget()
         self._style_side_panel = side
-        self._side_panel_width = 260
-        side.setFixedWidth(self._side_panel_width)
         side_v = QtWidgets.QVBoxLayout(side)
         side_v.setContentsMargins(4, 4, 4, 4)
-
-        # — слайдер настройки ширины боковой панели (по требованию) —
-        width_row = QtWidgets.QHBoxLayout()
-        width_row.setSpacing(6)
-        width_row.addWidget(QtWidgets.QLabel("Ширина:"))
-        self.sl_side_width = QtWidgets.QSlider(Qt.Horizontal)
-        self.sl_side_width.setRange(200, 520)
-        self.sl_side_width.setValue(self._side_panel_width)
-        self.sl_side_width.setToolTip("Ширина панели «Оформление графиков».")
-        self.sl_side_width.valueChanged.connect(self._on_side_width_changed)
-        width_row.addWidget(self.sl_side_width, 1)
-        self.lbl_side_width = QtWidgets.QLabel(f"{self._side_panel_width}px")
-        self.lbl_side_width.setStyleSheet("color: #a8a29e; font-size: 10px;")
-        self.lbl_side_width.setMinimumWidth(40)
-        width_row.addWidget(self.lbl_side_width)
-        side_v.addLayout(width_row)
 
         gb_style = QtWidgets.QGroupBox("Оформление графиков")
         sf = QtWidgets.QFormLayout(gb_style)
@@ -2094,7 +2082,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         side_v.addWidget(gb_style)
         side_v.addStretch(1)
-        h.addWidget(side)
+
+        # Панель оформления — в прокручиваемой области (как левая панель).
+        side_scroll = QtWidgets.QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setWidget(side)
+        side_scroll.setMinimumWidth(220)
+        plot_splitter.addWidget(side_scroll)
+
+        # Графики тянутся, панель оформления — фиксированный приоритет ширины.
+        plot_splitter.setStretchFactor(0, 1)
+        plot_splitter.setStretchFactor(1, 0)
+        plot_splitter.setSizes([1040, 280])
+        h.addWidget(plot_splitter, 1)
         return w
 
     def _build_species_tab(self) -> QtWidgets.QWidget:
@@ -2623,21 +2623,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Вкл/выкл силуэт профиля сопла на 1D-графиках."""
         self._show_profile_1d = bool(checked)
         self._redraw_plots()
-
-    def _on_side_width_changed(self, value: int):
-        """Изменение ширины боковой панели «Оформление графиков» слайдером."""
-        self._side_panel_width = int(value)
-        if getattr(self, "_style_side_panel", None) is not None:
-            self._style_side_panel.setFixedWidth(self._side_panel_width)
-        if hasattr(self, "lbl_side_width"):
-            self.lbl_side_width.setText(f"{self._side_panel_width}px")
-        # пересчёт многоточия в мультивыборе под новую ширину
-        if hasattr(self, "cb_plot_params"):
-            self.cb_plot_params._apply_elided_text()
-        # Ширина панели меняет ширину поля графиков → в режиме «Авто» может
-        # измениться число колонок. Перерисовываем с задержкой (debounce),
-        # чтобы не пересобирать фигуру на каждый шаг слайдера.
-        self._schedule_plot_reflow()
 
     def _schedule_plot_reflow(self):
         """Откладывает перерисовку 1D-графиков (раскладка по колонкам)."""
