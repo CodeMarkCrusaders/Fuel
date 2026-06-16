@@ -18,6 +18,7 @@ import numpy as np
 from ..core.nasa9_parser import Species
 from ..core.gibbs_solver import EquilibriumResult
 from ..rocket.nozzle_flow import RocketPerformance
+from ..rocket.of_sweep import OFSweepResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,4 +152,52 @@ def print_nozzle_table(perf: RocketPerformance, top_k_species: int = 12) -> None
     print()
 
 
-__all__ = ["print_result", "print_nozzle_table"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Печать таблицы развёртки по O/F (Isp vs O/F, RPA / CEA style)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_of_sweep_table(sweep: OFSweepResult) -> None:
+    """Печатает таблицу развёртки по O/F и найденный оптимум.
+
+    Для каждой точки сетки показываются O/F, α, температура в камере,
+    C*, Isp (на срезе) и Isp_vac. Точки с ошибкой помечаются.
+    Внизу — оптимальные O/F по Isp и по Isp_vac.
+    """
+    print()
+    print("=" * 78)
+    print(f"  Развёртка по O/F:  {sweep.oxidizer_name} / {sweep.fuel_name}")
+    print(f"  Pc = {sweep.P_chamber_Pa/1e6:.4f} МПа,  Pe = {sweep.P_exit_Pa/1e6:.4f} МПа")
+    print("=" * 78)
+
+    print(f"  {'O/F':>8} {'alpha':>8} {'T_chamber':>11} {'C*':>10} "
+          f"{'Isp':>10} {'Isp_vac':>10}")
+    print(f"  {'':>8} {'':>8} {'K':>11} {'m/s':>10} {'s':>10} {'s':>10}")
+    print("  " + "-" * 60)
+
+    for p in sweep.points:
+        if p.ok:
+            marker = " *" if p.of == _node_of(sweep) else "  "
+            print(f"  {p.of:>8.4f} {p.alpha:>8.4f} {p.T_chamber_K:>11.2f} "
+                  f"{p.Cstar_m_per_s:>10.2f} {p.Isp_s:>10.3f} "
+                  f"{p.Isp_vac_s:>10.3f}{marker}")
+        else:
+            print(f"  {p.of:>8.4f} {'—':>8} {'—':>11} {'—':>10} "
+                  f"{'ОШИБКА':>10} {'':>10}   ({p.error})")
+
+    print("  " + "-" * 60)
+    print(f"\n  Оптимум по Isp     :  O/F = {sweep.best_of:.4f},  "
+          f"Isp = {sweep.best_Isp_s:.3f} с")
+    print(f"  Оптимум по Isp_vac :  O/F = {sweep.best_of_vac:.4f},  "
+          f"Isp_vac = {sweep.best_Isp_vac_s:.3f} с")
+    print(f"  (критерий по умолчанию: {sweep.optimize_for})")
+    print()
+
+
+def _node_of(sweep: OFSweepResult) -> float:
+    """O/F узловой точки-максимума (для пометки '*' в таблице)."""
+    if 0 <= sweep.best_point_index < len(sweep.points):
+        return sweep.points[sweep.best_point_index].of
+    return float("nan")
+
+
+__all__ = ["print_result", "print_nozzle_table", "print_of_sweep_table"]

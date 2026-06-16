@@ -50,6 +50,14 @@ from .nozzle_flow_2d import (
     build_axisymmetric_grid,
 )
 
+# Развёртка характеристик по соотношению компонентов O/F с поиском оптимума
+# (классическая функция RPA / NASA CEA «Isp vs O/F»).
+from .of_sweep import (
+    OFSweepPoint,
+    OFSweepResult,
+    sweep_of_ratio,
+)
+
 # CEA-решатель опционален: требует cantera
 try:
     from .cea_solver import (
@@ -93,6 +101,10 @@ __all__ = [
     "Nozzle2DResult",
     "solve_nozzle_2d",
     "build_axisymmetric_grid",
+    # развёртка по O/F и поиск оптимума
+    "OFSweepPoint",
+    "OFSweepResult",
+    "sweep_of_ratio",
     "CANTERA_AVAILABLE",
 ]
 

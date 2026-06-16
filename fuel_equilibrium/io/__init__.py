@@ -22,12 +22,13 @@ __all__ = [
     "NullLogger",
     "print_result",
     "print_nozzle_table",
+    "print_of_sweep_table",
 ]
 
 
 def __getattr__(name):
     # PEP 562: ленивые атрибуты модуля
-    if name in ("print_result", "print_nozzle_table"):
+    if name in ("print_result", "print_nozzle_table", "print_of_sweep_table"):
         from . import reporting
         return getattr(reporting, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

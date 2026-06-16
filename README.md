@@ -158,6 +158,54 @@ print_nozzle_table(perf)
 print(f"Isp = {perf.Isp_s:.2f} с")
 ```
 
+### Развёртка по соотношению компонентов O/F (поиск оптимума Isp)
+
+Модуль `fuel_equilibrium.rocket.of_sweep` строит классическую кривую
+**«Isp vs O/F»** (как в RPA / NASA CEA): для серии массовых соотношений
+окислитель/горючее запускается равновесный расчёт сопла, собираются кривые
+`Isp`, `Isp_vac`, `C*`, `T_chamber`, `CF`, после чего находится O/F,
+максимизирующий удельный импульс. Оптимум уточняется параболической
+интерполяцией по трём узлам вокруг максимума сетки, поэтому он не «прилипает»
+к узлам, а попадает между ними.
+
+```python
+from fuel_equilibrium.core import parse_thermo_file, find_thermo_db
+from fuel_equilibrium.rocket import sweep_of_ratio
+from fuel_equilibrium.io import print_of_sweep_table
+
+db = parse_thermo_file(find_thermo_db())
+
+sweep = sweep_of_ratio(
+    oxidizer_name="O2(L)", fuel_name="H2(L)",
+    P_chamber=10e6, P_exit=0.1013e6,
+    species_db=db,
+    of_min=3.0, of_max=8.0, n_points=6,   # либо of_values=[4.0, 5.0, 6.0]
+    optimize_for="Isp",                    # или "Isp_vac"
+)
+
+print_of_sweep_table(sweep)
+print(f"Оптимум по Isp:     O/F = {sweep.best_of:.3f},  Isp = {sweep.best_Isp_s:.2f} с")
+print(f"Оптимум по Isp_vac: O/F = {sweep.best_of_vac:.3f},  Isp_vac = {sweep.best_Isp_vac_s:.2f} с")
+```
+
+Для H₂/O₂ при `Pc = 10 МПа`, `Pe = 1 атм` это даёт оптимум по импульсу на
+срезе при **O/F ≈ 4.3** и по вакуумному импульсу при **O/F ≈ 4.6** — в
+согласии со справочными данными по кислородно-водородным ЖРД.
+
+Особенности:
+
+* сетка задаётся либо равномерно (`of_min` / `of_max` / `n_points`), либо
+  явным списком значений (`of_values`, имеет приоритет);
+* `fuel_mass_kg` задаёт базовую массу горючего, масса окислителя берётся как
+  `O/F · fuel_mass_kg`;
+* `oxidizer_T_K` / `fuel_T_K` — температуры подачи (по умолчанию из базы, в
+  т. ч. криогенные `T_assigned`);
+* точки, где расчёт упал, помечаются полем `error` и не участвуют в поиске
+  оптимума (вся развёртка не падает из-за одной точки);
+* в результате `OFSweepResult` каждая точка (`OFSweepPoint`) хранит полный
+  объект `RocketPerformance` (`performance`) — можно построить любой график
+  или вытащить состав/сечения для выбранного O/F.
+
 ### Построение геометрии сопла (учебник Добровольского, гл. 2)
 
 Модуль `fuel_equilibrium.rocket.nozzle_geometry` строит контур сопла по
