@@ -864,6 +864,8 @@ class NozzleSolverWorker(QThread):
                 P_exit=p['P_exit'],
                 n_intermediate_stations=p.get('n_inter', 5),
                 include_condensed=p.get('include_condensed', False),
+                injection_velocity=p.get('injection_velocity', 0.0),
+                chamber_pressure_drop_frac=p.get('chamber_pressure_drop_frac', 0.0),
                 verbose=False,
                 progress_cb=lambda s: self.progress.emit(s),
             )
@@ -875,6 +877,8 @@ class NozzleSolverWorker(QThread):
                 species_db=self.species_db,
                 n_intermediate_stations=p.get('n_inter', 5),
                 include_condensed=p.get('include_condensed', True),
+                injection_velocity=p.get('injection_velocity', 0.0),
+                chamber_pressure_drop_frac=p.get('chamber_pressure_drop_frac', 0.0),
                 verbose=False,
                 logger=NullLogger(),
             )
@@ -1191,6 +1195,36 @@ class MainWindow(QtWidgets.QMainWindow):
             "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
 
+        # Скорость подачи компонентов на входе в камеру (м/с). Из-за неё
+        # полная энтальпия H₀ = h + V²/2, поэтому скорость в камере не нулевая.
+        self.sp_inj_velocity = QtWidgets.QDoubleSpinBox()
+        self.sp_inj_velocity.setRange(0.0, 500.0)
+        self.sp_inj_velocity.setDecimals(1)
+        self.sp_inj_velocity.setSingleStep(1.0)
+        self.sp_inj_velocity.setValue(0.0)
+        self.sp_inj_velocity.setSuffix(" м/с")
+        self.sp_inj_velocity.setToolTip(
+            "Скорость подачи компонентов топлива на входе в камеру сгорания.\n"
+            "Полная (тормозная) энтальпия H₀ = h_статич + V_впр²/2 сохраняется\n"
+            "по длине сопла, поэтому скорость на сечении инжектора равна V_впр\n"
+            "(а не нулю)."
+        )
+
+        # Перепад давления в камере (%). Газ на входе в сопло расширяется до
+        # P_inlet = P_chamber·(1−Δp), поэтому слегка ускоряется (V > V_впр).
+        self.sp_chamber_dp = QtWidgets.QDoubleSpinBox()
+        self.sp_chamber_dp.setRange(0.0, 30.0)
+        self.sp_chamber_dp.setDecimals(2)
+        self.sp_chamber_dp.setSingleStep(0.5)
+        self.sp_chamber_dp.setValue(0.0)
+        self.sp_chamber_dp.setSuffix(" %")
+        self.sp_chamber_dp.setToolTip(
+            "Относительный перепад давления в камере сгорания.\n"
+            "На входе в сопло P_inlet = P_chamber·(1 − Δp/100).\n"
+            "Газ при той же энтропии расширяется, h_статич падает,\n"
+            "поэтому скорость на сечении «Nozzle inlet» становится больше V_впр."
+        )
+
         # Доп. сечения в камере и настройка плотности сечений УБРАНЫ
         # (по требованию). В камере газ застойный (Injector ≡ Nozzle inlet),
         # поэтому отдельные сечения камеры не несли новой физики, а распределение
@@ -1213,6 +1247,8 @@ class MainWindow(QtWidgets.QMainWindow):
         form_basic.setSpacing(6)
         form_basic.addRow("Давление в камере:", w_Pc)
         form_basic.addRow("Давление на срезе:", w_Pe)
+        form_basic.addRow("Скорость подачи:", self.sp_inj_velocity)
+        form_basic.addRow("Перепад давл. в камере:", self.sp_chamber_dp)
         form_basic.addRow("", self.chk_condensed)
 
         tab_gasd = QtWidgets.QWidget()
@@ -4173,6 +4209,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'P_exit': pv_to_pa(P_exit, self.cb_Pe_unit.currentText()),
             'n_inter': self.sp_n_inter.value(),
             'include_condensed': self.chk_condensed.isChecked(),
+            'injection_velocity': self.sp_inj_velocity.value(),
+            'chamber_pressure_drop_frac': self.sp_chamber_dp.value() / 100.0,
         }
         solver = 'cea' if self.rb_cea.isChecked() else 'own'
 
@@ -5647,6 +5685,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'Pe_unit': self.cb_Pe_unit.currentText(),
             'n_inter': self.sp_n_inter.value(),
             'include_condensed': self.chk_condensed.isChecked(),
+            'injection_velocity': self.sp_inj_velocity.value(),
+            'chamber_pressure_drop': self.sp_chamber_dp.value(),
             'solver': 'cea' if self.rb_cea.isChecked() else 'own',
             'L_chamber': self.sp_L_chamber.value(),
             'L_conv': self.sp_L_conv.value(),
@@ -5772,6 +5812,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_mix_mode_changed()
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
             self.chk_condensed.setChecked(cfg.get('include_condensed', True))
+            self.sp_inj_velocity.setValue(cfg.get('injection_velocity', 0.0))
+            self.sp_chamber_dp.setValue(cfg.get('chamber_pressure_drop', 0.0))
             if cfg.get('solver') == 'cea' and CANTERA_AVAILABLE:
                 self.rb_cea.setChecked(True)
             else:

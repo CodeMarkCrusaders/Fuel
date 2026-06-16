@@ -587,6 +587,8 @@ def solve_rocket_nozzle(
     section_density_critical: float = 1.0,
     section_density_supersonic: float = 1.0,
     include_condensed: bool = True,
+    injection_velocity: float = 0.0,
+    chamber_pressure_drop_frac: float = 0.0,
     verbose: bool = False,
     logger: Optional[IterationLogger] = None,
     max_gas_species: int = 60,
@@ -600,6 +602,14 @@ def solve_rocket_nozzle(
                                   (0..1048) для газодинамического расчёта.
         section_density_*       — относительная плотность сечений по зонам
                                   дозвук/критика/сверхзвук.
+        injection_velocity — скорость подачи компонентов на входе (м/с).
+                             Полная (тормозная) энтальпия
+                             H₀ = h_статич + V_впр²/2 сохраняется по длине,
+                             поэтому на сечении инжектора V = V_впр (а не 0).
+        chamber_pressure_drop_frac — относительный перепад давления в камере
+                             (0…0.3): на входе в сопло P_inlet =
+                             P_chamber·(1−Δp). Газ слегка ускоряется, скорость
+                             на «Nozzle inlet» становится больше V_впр.
         species_db      — база NASA-9.
         logger          — куда писать журнал итераций.
 
@@ -675,13 +685,27 @@ def solve_rocket_nozzle(
         tol_H=1e-5,
     )
     H_chamber_total = chamber.enthalpy
-    H_chamber_per_kg = H_chamber_total / mass_total_kg
+    H_chamber_static_per_kg = H_chamber_total / mass_total_kg
     S_chamber_total = chamber.entropy
     T_chamber = chamber.T
 
+    # Скорость подачи компонентов: полная (тормозная) энтальпия
+    # H₀ = h_статич + V_впр²/2 сохраняется вдоль сопла, поэтому V на инжекторе
+    # равна V_впр, а не нулю. Все сечения строятся от этой H₀.
+    V_inj = max(0.0, float(injection_velocity))
+    H_chamber_per_kg = H_chamber_static_per_kg + 0.5 * V_inj * V_inj
+
+    # Относительный перепад давления в камере (на входе в сопло).
+    dp_frac = min(max(float(chamber_pressure_drop_frac), 0.0), 0.5)
+    P_inlet = P_chamber * (1.0 - dp_frac)
+
     if logger.enabled:
         logger.log(f'T_chamber = {T_chamber:.4f} К')
-        logger.log(f'H_chamber = {H_chamber_per_kg/1000:.4f} кДж/кг')
+        logger.log(f'H_chamber(статич) = {H_chamber_static_per_kg/1000:.4f} кДж/кг')
+        if V_inj > 0:
+            logger.log(f'V_впр = {V_inj:.2f} м/с  →  H₀ = {H_chamber_per_kg/1000:.4f} кДж/кг')
+        if dp_frac > 0:
+            logger.log(f'Δp камеры = {dp_frac*100:.2f}%  →  P_inlet = {P_inlet/1e6:.5f} МПа')
         logger.log(f'S_chamber = {S_chamber_total/mass_total_kg/1000:.4f} кДж/(кг·К)')
 
     station_chamber = _make_station(
@@ -766,12 +790,31 @@ def solve_rocket_nozzle(
         mass_total_g, H_chamber_per_kg,
     )
 
-    # ── 6) "Nozzle inlet" — формально считаем что вход в сопло = камера
-    # (CEA так и делает: Injector ≡ Nozzle inlet при stagnation).
-    station_inlet = _make_station(
-        'Nozzle inlet', species_list, elements, chamber, P_chamber,
-        mass_total_g, H_chamber_per_kg,
-    )
+    # ── 6) "Nozzle inlet" — вход в сопло.
+    # Без перепада давления и без скорости подачи он совпадает с камерой
+    # (Injector ≡ Nozzle inlet при stagnation). При наличии перепада давления
+    # газ при той же энтропии расширяется до P_inlet, h_статич падает,
+    # поэтому скорость на входе V = sqrt(2·(H₀ − h_inlet)) становится больше V_впр.
+    if dp_frac > 0.0:
+        inlet_eq = solve_equilibrium_SP(
+            species_list=species_list,
+            element_abundances=elements,
+            S_target=S_chamber_total, P=P_inlet,
+            T_init=T_chamber * 0.98,
+            include_condensed=include_condensed,
+            verbose=False,
+            logger=NullLogger(),
+            tol_S=1e-6,
+        )
+        station_inlet = _make_station(
+            'Nozzle inlet', species_list, elements, inlet_eq, P_inlet,
+            mass_total_g, H_chamber_per_kg,
+        )
+    else:
+        station_inlet = _make_station(
+            'Nozzle inlet', species_list, elements, chamber, P_chamber,
+            mass_total_g, H_chamber_per_kg,
+        )
 
     # ── 7) Промежуточные сечения: до горловины и после горловины ────────
     intermediate_pre_throat = []
