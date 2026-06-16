@@ -325,6 +325,8 @@ def solve_rocket_nozzle_cea(
     section_density_critical: float = 1.0,
     section_density_supersonic: float = 1.0,
     include_condensed: bool = False,
+    injection_velocity: float = 0.0,
+    chamber_pressure_drop_frac: float = 0.0,
     verbose: bool = False,
     progress_cb=None,
 ) -> RocketPerformance:
@@ -332,6 +334,16 @@ def solve_rocket_nozzle_cea(
 
     Аналог `solve_rocket_nozzle`, но в качестве решателя используется
     Cantera, чей алгоритм минимизации Гиббса идентичен NASA CEA.
+
+    Скорость в камере НЕ нулевая (по физике подачи):
+
+    * ``injection_velocity`` — скорость подачи компонентов на входе (м/с).
+      Полная (тормозная) энтальпия H₀ = h_статич + V_впр²/2 сохраняется по
+      длине, поэтому на сечении инжектора V = V_впр (а не 0).
+    * ``chamber_pressure_drop_frac`` — относительный перепад давления в камере
+      (0…0.3) от форсуночной головки до входа в сопло. Из-за ΔP газ слегка
+      ускоряется, поэтому на «Nozzle inlet» давление = P_кам·(1−ΔP), а
+      скорость чуть выше V_впр (изэнтропическое доускорение в камере).
     """
     if not CANTERA_AVAILABLE:
         raise RuntimeError(
@@ -420,20 +432,20 @@ def solve_rocket_nozzle_cea(
         gas.equilibrate('HP')
 
     T_chamber = gas.T
-    H_chamber_per_kg = gas.enthalpy_mass
+    # Статическая энтальпия равновесных продуктов в камере (при P_chamber).
+    H_chamber_static = gas.enthalpy_mass
     S_chamber_per_kg = gas.entropy_mass
 
-    species_list = list(gas.species_names)
-    station_chamber = _make_station_cantera(
-        'Injector', gas, P_chamber, H_chamber_per_kg, species_list
-    )
-    station_inlet = _make_station_cantera(
-        'Nozzle inlet', gas, P_chamber, H_chamber_per_kg, species_list
-    )
+    # Полная (тормозная) энтальпия с учётом кинетической энергии подачи:
+    #   H₀ = h_статич + V_впр²/2.
+    # Именно H₀ сохраняется вдоль сопла, поэтому скорость в любом сечении
+    #   V = sqrt(2·(H₀ − h_local)) ⇒ на инжекторе V = V_впр (не 0).
+    V_inj = max(0.0, float(injection_velocity))
+    H_chamber_per_kg = H_chamber_static + 0.5 * V_inj * V_inj
 
-    # ── 3) Горловина (M=1): ищем брентом по P
-    if progress_cb:
-        progress_cb("Поиск горловины (M=1)...")
+    # Перепад давления в камере: давление на входе в сопло ниже форсуночного.
+    dp_frac = min(max(float(chamber_pressure_drop_frac), 0.0), 0.5)
+    P_inlet = P_chamber * (1.0 - dp_frac)
 
     def _sp_solve(S_target, P_target, T_guess=None):
         """SP-equilibrium через итерации по T (более надёжно, чем gas.SPY)."""
@@ -459,6 +471,31 @@ def solve_rocket_nozzle_cea(
         except Exception:
             gas.TPY = T_guess, P_target, Y_dict
             gas.equilibrate('SP')
+
+    species_list = list(gas.species_names)
+    # Инжектор: P = P_кам, h = h_статич(камера) ⇒ V = V_впр.
+    station_chamber = _make_station_cantera(
+        'Injector', gas, P_chamber, H_chamber_per_kg, species_list
+    )
+    # Вход в сопло: при наличии перепада давления делаем SP-равновесие при
+    # P_inlet (та же энтропия камеры) — газ слегка ускоряется, h падает,
+    # V = sqrt(2·(H₀ − h_inlet)) > V_впр. Без перепада совпадает с инжектором.
+    if dp_frac > 0.0:
+        _sp_solve(S_chamber_per_kg, P_inlet, T_guess=T_chamber)
+        station_inlet = _make_station_cantera(
+            'Nozzle inlet', gas, P_inlet, H_chamber_per_kg, species_list
+        )
+        # вернуть газ в состояние камеры для последующих шагов
+        gas.TPY = T_chamber, P_chamber, Y_dict
+        gas.equilibrate('TP')
+    else:
+        station_inlet = _make_station_cantera(
+            'Nozzle inlet', gas, P_chamber, H_chamber_per_kg, species_list
+        )
+
+    # ── 3) Горловина (M=1): ищем брентом по P
+    if progress_cb:
+        progress_cb("Поиск горловины (M=1)...")
 
     def throat_residual(P_try):
         _sp_solve(S_chamber_per_kg, P_try, T_guess=T_chamber * 0.9)

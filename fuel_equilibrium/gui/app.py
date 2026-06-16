@@ -384,6 +384,29 @@ QProgressBar::chunk {
     background-color: #cc785c;
     border-radius: 2px;
 }
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #3a3a37;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background: #cc785c;
+    border-radius: 2px;
+}
+QSlider::add-page:horizontal {
+    background: #3a3a37;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #cc785c;
+    border: 2px solid #1c1917;
+    width: 12px;
+    height: 12px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+QSlider::handle:horizontal:hover { background: #e08e6f; }
 """
 
 
@@ -575,20 +598,43 @@ class PlotlyCanvas(QtWidgets.QWidget):
         self._view.setHtml(html)
 
     def set_figure(self, fig):
-        """Отображает plotly-фигуру ``fig`` в виджете."""
+        """Отображает plotly-фигуру ``fig`` в виджете.
+
+        Высота фигуры фиксирована (задаётся в ``fig.layout.height``), ширина —
+        тянется по ширине области. Если общая высота превышает видимую область,
+        страница прокручивается вертикально (overflow-y:auto на body).
+        """
         self.figure = fig
-        # full_html=True + include_plotlyjs='inline' → автономная страница,
-        # не требующая интернета (plotly.js встраивается прямо в HTML).
-        html = pio.to_html(
-            fig, full_html=True, include_plotlyjs='inline',
+        fig_h = None
+        try:
+            fig_h = int(fig.layout.height) if fig.layout.height else None
+        except Exception:
+            fig_h = None
+        # div графика: фиксированная высота (если задана) и 100% ширины.
+        div_style = (f"width:100%;height:{fig_h}px;"
+                     if fig_h else "width:100%;height:100%;")
+        # full_html=False → встраиваем div графика в свой каркас страницы с
+        # прокручиваемым body (чтобы при многих графиках появлялась прокрутка).
+        inner = pio.to_html(
+            fig, full_html=False, include_plotlyjs='inline',
+            default_height=(f"{fig_h}px" if fig_h else "100%"),
+            default_width="100%",
             config={
                 'displaylogo': False,
+                # responsive по ширине; высоту держим фиксированной.
                 'responsive': True,
                 # приближение колёсиком мыши (req: «приближать колёсиком»)
                 'scrollZoom': True,
                 'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
                 'toImageButtonOptions': {'format': 'png', 'scale': 2},
             },
+        )
+        html = (
+            "<html><head><meta charset='utf-8'>"
+            "<style>html,body{margin:0;padding:0;background:#1c1917;"
+            "overflow-x:hidden;overflow-y:auto;}"
+            f".plot-wrap{{{div_style}}}</style></head>"
+            f"<body><div class='plot-wrap'>{inner}</div></body></html>"
         )
         self._view.setHtml(html)
 
@@ -817,10 +863,9 @@ class NozzleSolverWorker(QThread):
                 P_chamber=p['P_chamber'],
                 P_exit=p['P_exit'],
                 n_intermediate_stations=p.get('n_inter', 5),
-                section_density_subsonic=p.get('density_sub', 1.0),
-                section_density_critical=p.get('density_crit', 1.0),
-                section_density_supersonic=p.get('density_sup', 1.0),
                 include_condensed=p.get('include_condensed', False),
+                injection_velocity=p.get('injection_velocity', 0.0),
+                chamber_pressure_drop_frac=p.get('chamber_pressure_drop_frac', 0.0),
                 verbose=False,
                 progress_cb=lambda s: self.progress.emit(s),
             )
@@ -831,10 +876,9 @@ class NozzleSolverWorker(QThread):
                 P_exit=p['P_exit'],
                 species_db=self.species_db,
                 n_intermediate_stations=p.get('n_inter', 5),
-                section_density_subsonic=p.get('density_sub', 1.0),
-                section_density_critical=p.get('density_crit', 1.0),
-                section_density_supersonic=p.get('density_sup', 1.0),
                 include_condensed=p.get('include_condensed', True),
+                injection_velocity=p.get('injection_velocity', 0.0),
+                chamber_pressure_drop_frac=p.get('chamber_pressure_drop_frac', 0.0),
                 verbose=False,
                 logger=NullLogger(),
             )
@@ -1151,51 +1195,41 @@ class MainWindow(QtWidgets.QMainWindow):
             "Injector, Nozzle inlet, Nozzle throat, Nozzle exit."
         )
 
-        # Доп. расчётные сечения В КАМЕРЕ (между Injector и Nozzle inlet).
-        # Injector ≡ Nozzle inlet (застойное состояние), поэтому эти сечения
-        # распределяют длину камеры по оси x для отображения участка камеры.
-        self._n_chamber_sections = 4
-        self.sp_n_chamber = QtWidgets.QSpinBox()
-        self.sp_n_chamber.setRange(0, 64)
-        self.sp_n_chamber.setValue(self._n_chamber_sections)
-        self.sp_n_chamber.setToolTip(
-            "Число дополнительных расчётных сечений в камере —\n"
-            "между Injector и Nozzle inlet. Состояние газа в камере\n"
-            "застойное (P₀, T₀, V≈0), поэтому сечения распределяют\n"
-            "длину камеры по оси x, делая участок камеры видимым на графиках."
+        # Скорость подачи компонентов на входе в камеру (м/с). Из-за неё
+        # полная энтальпия H₀ = h + V²/2, поэтому скорость в камере не нулевая.
+        self.sp_inj_velocity = QtWidgets.QDoubleSpinBox()
+        self.sp_inj_velocity.setRange(0.0, 500.0)
+        self.sp_inj_velocity.setDecimals(1)
+        self.sp_inj_velocity.setSingleStep(1.0)
+        self.sp_inj_velocity.setValue(0.0)
+        self.sp_inj_velocity.setSuffix(" м/с")
+        self.sp_inj_velocity.setToolTip(
+            "Скорость подачи компонентов топлива на входе в камеру сгорания.\n"
+            "Полная (тормозная) энтальпия H₀ = h_статич + V_впр²/2 сохраняется\n"
+            "по длине сопла, поэтому скорость на сечении инжектора равна V_впр\n"
+            "(а не нулю)."
         )
-        self.sp_n_chamber.valueChanged.connect(self._on_chamber_sections_changed)
 
-        self.sp_density_sub = QtWidgets.QDoubleSpinBox()
-        self.sp_density_sub.setRange(0.0, 20.0)
-        self.sp_density_sub.setDecimals(2)
-        self.sp_density_sub.setValue(1.0)
-        self.sp_density_sub.setSingleStep(0.1)
-        self.sp_density_sub.setToolTip("Относительная плотность сечений в дозвуковой зоне (камера → горловина).")
+        # Перепад давления в камере (%). Газ на входе в сопло расширяется до
+        # P_inlet = P_chamber·(1−Δp), поэтому слегка ускоряется (V > V_впр).
+        self.sp_chamber_dp = QtWidgets.QDoubleSpinBox()
+        self.sp_chamber_dp.setRange(0.0, 30.0)
+        self.sp_chamber_dp.setDecimals(2)
+        self.sp_chamber_dp.setSingleStep(0.5)
+        self.sp_chamber_dp.setValue(0.0)
+        self.sp_chamber_dp.setSuffix(" %")
+        self.sp_chamber_dp.setToolTip(
+            "Относительный перепад давления в камере сгорания.\n"
+            "На входе в сопло P_inlet = P_chamber·(1 − Δp/100).\n"
+            "Газ при той же энтропии расширяется, h_статич падает,\n"
+            "поэтому скорость на сечении «Nozzle inlet» становится больше V_впр."
+        )
 
-        self.sp_density_crit = QtWidgets.QDoubleSpinBox()
-        self.sp_density_crit.setRange(0.0, 20.0)
-        self.sp_density_crit.setDecimals(2)
-        self.sp_density_crit.setValue(1.0)
-        self.sp_density_crit.setSingleStep(0.1)
-        self.sp_density_crit.setToolTip("Относительная плотность сечений в критической зоне (вблизи горловины).")
-
-        self.sp_density_sup = QtWidgets.QDoubleSpinBox()
-        self.sp_density_sup.setRange(0.0, 20.0)
-        self.sp_density_sup.setDecimals(2)
-        self.sp_density_sup.setValue(1.0)
-        self.sp_density_sup.setSingleStep(0.1)
-        self.sp_density_sup.setToolTip("Относительная плотность сечений в сверхзвуковой зоне (горловина → срез).")
-
-        density_widget = QtWidgets.QWidget()
-        density_layout = QtWidgets.QHBoxLayout(density_widget)
-        density_layout.setContentsMargins(0, 0, 0, 0)
-        density_layout.addWidget(QtWidgets.QLabel("дозвук"))
-        density_layout.addWidget(self.sp_density_sub)
-        density_layout.addWidget(QtWidgets.QLabel("критика"))
-        density_layout.addWidget(self.sp_density_crit)
-        density_layout.addWidget(QtWidgets.QLabel("сверхзвук"))
-        density_layout.addWidget(self.sp_density_sup)
+        # Доп. сечения в камере и настройка плотности сечений УБРАНЫ
+        # (по требованию). В камере газ застойный (Injector ≡ Nozzle inlet),
+        # поэтому отдельные сечения камеры не несли новой физики, а распределение
+        # промежуточных сечений теперь равномерное (плотность = 1.0).
+        self._n_chamber_sections = 0
 
         self.chk_condensed = QtWidgets.QCheckBox("Учитывать конденсат")
         self.chk_condensed.setChecked(True)
@@ -1213,18 +1247,18 @@ class MainWindow(QtWidgets.QMainWindow):
         form_basic.setSpacing(6)
         form_basic.addRow("Давление в камере:", w_Pc)
         form_basic.addRow("Давление на срезе:", w_Pe)
+        form_basic.addRow("Скорость подачи:", self.sp_inj_velocity)
+        form_basic.addRow("Перепад давл. в камере:", self.sp_chamber_dp)
         form_basic.addRow("", self.chk_condensed)
 
         tab_gasd = QtWidgets.QWidget()
         form_gasd = QtWidgets.QFormLayout(tab_gasd)
         form_gasd.setSpacing(6)
         form_gasd.addRow("Промежут. сечений:", self.sp_n_inter)
-        form_gasd.addRow("Сечений в камере:", self.sp_n_chamber)
-        form_gasd.addRow("Плотность сечений:", density_widget)
 
         gasd_hint = QtWidgets.QLabel(
-            "Распределение промежуточных сечений выполняется\n"
-            "на участках: дозвук, критика, сверхзвук."
+            "Промежуточные сечения распределяются равномерно\n"
+            "по длине сопла (дозвук → горловина → сверхзвук)."
         )
         gasd_hint.setStyleSheet("color: #a8a29e; font-size: 10px;")
         gasd_hint.setWordWrap(True)
@@ -1820,6 +1854,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # — переключаемые страницы: 1D-графики / поле 2D —
         self.plot_stack = QtWidgets.QStackedWidget()
+        # Следим за изменением размера поля графиков: в режиме «Авто» число
+        # колонок зависит от ширины — перестраиваем раскладку при ресайзе.
+        self.plot_stack.installEventFilter(self)
 
         # Страница 0 — интерактивные 1D-графики (Plotly или matplotlib).
         page_1d = QtWidgets.QWidget()
@@ -1898,6 +1935,31 @@ class MainWindow(QtWidgets.QMainWindow):
             "Показывать силуэт контура сопла (r(x)) фоном на 1D-графиках.")
         self.chk_show_profile.toggled.connect(self._on_toggle_profile_1d)
         sf.addRow("", self.chk_show_profile)
+
+        # — РАЗМЕР графиков (вынесено в оформление по требованию) —
+        # Фиксированная высота одного графика (строки). При нескольких графиках
+        # они располагаются сеткой и общая высота = высота_строки × число_строк;
+        # если получается выше области — появляется вертикальная прокрутка.
+        self.sp_plot_row_h = QtWidgets.QSpinBox()
+        self.sp_plot_row_h.setRange(160, 600)
+        self.sp_plot_row_h.setSingleStep(20)
+        self.sp_plot_row_h.setValue(280)
+        self.sp_plot_row_h.setSuffix(" px")
+        self.sp_plot_row_h.setToolTip(
+            "Фиксированная высота одного графика. Чем больше графиков выбрано,\n"
+            "тем выше общее поле — лишнее прокручивается вниз.")
+        self.sp_plot_row_h.valueChanged.connect(self._redraw_plots)
+        sf.addRow("Высота графика:", self.sp_plot_row_h)
+
+        # Число колонок: «Авто» (зависит от ширины поля графиков),
+        # либо принудительно 1 или 2 колонки.
+        self.cb_plot_cols = QtWidgets.QComboBox()
+        self.cb_plot_cols.addItems(["Авто", "1 колонка", "2 колонки"])
+        self.cb_plot_cols.setToolTip(
+            "Раскладка графиков по колонкам. «Авто»: при широком поле — 2\n"
+            "колонки, при узком — 1. Можно зафиксировать число колонок.")
+        self.cb_plot_cols.currentIndexChanged.connect(self._redraw_plots)
+        sf.addRow("Колонки:", self.cb_plot_cols)
 
         self.cb_font = QtWidgets.QComboBox()
         self.cb_font.addItems([
@@ -2547,17 +2609,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # пересчёт многоточия в мультивыборе под новую ширину
         if hasattr(self, "cb_plot_params"):
             self.cb_plot_params._apply_elided_text()
+        # Ширина панели меняет ширину поля графиков → в режиме «Авто» может
+        # измениться число колонок. Перерисовываем с задержкой (debounce),
+        # чтобы не пересобирать фигуру на каждый шаг слайдера.
+        self._schedule_plot_reflow()
 
-    def _on_chamber_sections_changed(self, value: int):
-        """Изменение числа расчётных сечений в камере (Injector→Nozzle inlet).
+    def _schedule_plot_reflow(self):
+        """Откладывает перерисовку 1D-графиков (раскладка по колонкам)."""
+        if getattr(self, "perf", None) is None:
+            return
+        t = getattr(self, "_reflow_timer", None)
+        if t is None:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._redraw_plots)
+            self._reflow_timer = t
+        t.start(180)
 
-        Сечения камеры синтезируются в ``_section_series`` (застойное
-        состояние камеры), поэтому пересчёт решателя не требуется — достаточно
-        перерисовать графики.
+    def eventFilter(self, obj, event):
+        """Перестроение раскладки графиков при изменении размера их поля.
+
+        В режиме колонок «Авто» число колонок зависит от ширины области
+        графиков, поэтому при её ресайзе планируем отложенную перерисовку.
         """
-        self._n_chamber_sections = int(value)
-        if getattr(self, "perf", None) is not None:
-            self._redraw_plots()
+        if (obj is getattr(self, "plot_stack", None)
+                and event.type() == QtCore.QEvent.Resize):
+            self._schedule_plot_reflow()
+        return super().eventFilter(obj, event)
 
     def _render_field_2d(self):
         c = getattr(self, "canvas_field_2d", None)
@@ -4130,10 +4208,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'P_chamber': pv_to_pa(P_chamber, self.cb_Pc_unit.currentText()),
             'P_exit': pv_to_pa(P_exit, self.cb_Pe_unit.currentText()),
             'n_inter': self.sp_n_inter.value(),
-            'density_sub': self.sp_density_sub.value(),
-            'density_crit': self.sp_density_crit.value(),
-            'density_sup': self.sp_density_sup.value(),
             'include_condensed': self.chk_condensed.isChecked(),
+            'injection_velocity': self.sp_inj_velocity.value(),
+            'chamber_pressure_drop_frac': self.sp_chamber_dp.value() / 100.0,
         }
         solver = 'cea' if self.rb_cea.isChecked() else 'own'
 
@@ -4596,7 +4673,13 @@ class MainWindow(QtWidgets.QMainWindow):
             H = np.full_like(x, float('nan'))
 
         # ── Газодинамические функции (изэнтропические соотношения) ────────────
-        # Параметры торможения (камера = сечение инжектора / минимум x).
+        # ВАЖНО: τ, π, ε, q, y считаем АНАЛИТИЧЕСКИ из скоростного коэффициента λ,
+        # а не делением «сырых» T/T₀, P/P₀ и т.п. по сечениям. Так гарантируем
+        # гладкие, физически согласованные кривые без «иголок» (выбросы решателя
+        # в отдельных сечениях не попадают в функции) и корректное поведение в
+        # камере (λ→0 ⇒ τ,π,ε→1, q,y→0) — без искусственных скачков.
+
+        # Параметры торможения (камера = сечение с минимумом x).
         try:
             i0 = int(np.argmin(x)) if x.size else 0
         except Exception:
@@ -4607,23 +4690,35 @@ class MainWindow(QtWidgets.QMainWindow):
             float(np.nanmax(P)) if P.size else 1.0)
         rho0 = float(rho[i0]) if rho.size and rho[i0] > 0 else (
             float(np.nanmax(rho)) if rho.size else 1.0)
-        # τ = T/T₀, π = P/P₀, ε = ρ/ρ₀ — прямо из величин по сечениям.
-        with np.errstate(divide='ignore', invalid='ignore'):
-            tau = T / T0 if T0 else np.zeros_like(T)
-            pi = P / P0 if P0 else np.zeros_like(P)
-            eps = rho / rho0 if rho0 else np.zeros_like(rho)
+
+        # Единый показатель k для газодинамических функций — медиана γₛ по
+        # сечениям (устойчива к выбросам). Один k для всех точек делает функции
+        # τ(λ)…y(λ) строго монотонными/гладкими, как в справочных таблицах ГДФ.
+        finite_gs = gs[np.isfinite(gs) & (gs > 1.0)]
+        k_ref = float(np.median(finite_gs)) if finite_gs.size else 1.2
+        k_ref = min(max(k_ref, 1.05), 1.67)
+
         # λ — скоростной коэффициент: λ² = ((k+1)/2·M²) / (1 + (k-1)/2·M²).
-        k = np.where(gs > 1.0, gs, 1.2)
+        # Считаем из (уже очищенного) M с единым k и дополнительно подавляем
+        # одиночные выбросы — λ должна быть гладкой монотонной по ходу потока.
         with np.errstate(divide='ignore', invalid='ignore'):
-            lam2 = ((k + 1.0) / 2.0 * M * M) / (1.0 + (k - 1.0) / 2.0 * M * M)
+            lam2 = ((k_ref + 1.0) / 2.0 * M * M) / (
+                1.0 + (k_ref - 1.0) / 2.0 * M * M)
         lam = np.sqrt(np.clip(lam2, 0.0, None))
-        # q(λ) — приведённый расход; y(λ) — функция удельного импульса.
+        lam = self._hampel_filter(lam, window=2, n_sigma=2.5)
+        lam_max = math.sqrt((k_ref + 1.0) / (k_ref - 1.0))
+        lam = np.clip(lam, 0.0, lam_max - 1e-6)
+
+        # Аналитические ГДФ от λ с единым k_ref (гладкие по построению).
         with np.errstate(divide='ignore', invalid='ignore'):
-            base = np.clip(1.0 - (k - 1.0) / (k + 1.0) * lam * lam, 0.0, None)
-            q_gd = (lam * ((k + 1.0) / 2.0) ** (1.0 / (k - 1.0))
-                    * base ** (1.0 / (k - 1.0)))
+            tau = 1.0 - (k_ref - 1.0) / (k_ref + 1.0) * lam * lam       # T/T₀
+            tau = np.clip(tau, 0.0, 1.0)
+            pi = tau ** (k_ref / (k_ref - 1.0))                          # P/P₀
+            eps = tau ** (1.0 / (k_ref - 1.0))                           # ρ/ρ₀
+            q_gd = (lam * ((k_ref + 1.0) / 2.0) ** (1.0 / (k_ref - 1.0))
+                    * tau ** (1.0 / (k_ref - 1.0)))                      # q(λ)
             y_gd = np.where(lam > 1e-9,
-                            (1.0 + lam * lam) / (2.0 * lam) * q_gd, 0.0)
+                            (1.0 + lam * lam) / (2.0 * lam) * q_gd, 0.0)  # y(λ)
         # Динамическое давление q_dyn = ½·ρ·V².
         q_dyn = 0.5 * rho * V * V
 
@@ -4744,6 +4839,34 @@ class MainWindow(QtWidgets.QMainWindow):
         checked = set(cb.checked_keys())
         return [k for (k, *_rest) in self.PLOT_PARAM_DEFS if k in checked]
 
+    @property
+    def _plot_row_height(self) -> int:
+        """Фиксированная высота одного графика (из настроек оформления)."""
+        sp = getattr(self, "sp_plot_row_h", None)
+        return int(sp.value()) if sp is not None else 280
+
+    def _plot_ncols(self, n: int) -> int:
+        """Число колонок раскладки графиков.
+
+        Режим из выпадающего списка «Колонки»: «Авто» — зависит от ширины поля
+        графиков (узкое → 1, широкое → 2), либо принудительно 1/2. Для одного
+        графика всегда 1 колонка.
+        """
+        if n <= 1:
+            return 1
+        cb = getattr(self, "cb_plot_cols", None)
+        mode = cb.currentIndex() if cb is not None else 0
+        if mode == 1:          # «1 колонка»
+            return 1
+        if mode == 2:          # «2 колонки»
+            return 2
+        # «Авто»: по ширине области графиков (порог ~720px → 2 колонки).
+        try:
+            w = int(self.plot_stack.width())
+        except Exception:
+            w = 0
+        return 2 if w >= 720 else 1
+
     def _draw_selected_1d(self, ser, style):
         """Рисует выбранные величины на ``canvas_1d``.
 
@@ -4777,14 +4900,17 @@ class MainWindow(QtWidgets.QMainWindow):
         grid_color = 'rgba(150,150,147,0.30)' if dark else 'rgba(120,120,120,0.30)'
 
         n = len(keys)
-        ncols = 1 if n == 1 else 2
+        ncols = self._plot_ncols(n)
         nrows = (n + ncols - 1) // ncols
         titles = [defs[k][0] + (f", {defs[k][1]}" if defs[k][1] else "")
                   for k in keys]
+        # межстрочный/межколоночный отступ в долях; подбираем так, чтобы при
+        # многих строках заголовки не «съедали» поле.
+        vspace = (min(0.12, 0.9 / max(nrows - 1, 1))) if nrows > 1 else 0.0
         fig = make_subplots(
             rows=max(nrows, 1), cols=ncols,
             subplot_titles=titles,
-            vertical_spacing=0.12 if nrows > 1 else 0.0,
+            vertical_spacing=vspace,
             horizontal_spacing=0.09 if ncols > 1 else 0.0,
         )
 
@@ -4828,6 +4954,11 @@ class MainWindow(QtWidgets.QMainWindow):
                              zeroline=False, color=fg, linecolor=fg,
                              mirror=True, ticks='inside', showline=True)
 
+        # Фиксированная высота строки (из настроек оформления) → общая высота
+        # фигуры = высота_строки × число_строк. При большом числе графиков поле
+        # становится выше области просмотра и прокручивается вниз.
+        row_h = int(getattr(self, "_plot_row_height", 280))
+        total_h = max(row_h * max(nrows, 1), row_h)
         fig.update_layout(
             paper_bgcolor=paper_bg, plot_bgcolor=plot_bg,
             font=dict(family=style.font_family, size=style.font_size_tick,
@@ -4835,6 +4966,8 @@ class MainWindow(QtWidgets.QMainWindow):
             margin=dict(l=60, r=20, t=40, b=50),
             hovermode='closest',
             showlegend=False,
+            height=total_h,
+            autosize=True,
             # перемещение по графику при зажатой ЛКМ (req: «перемещаться,
             # зажимая левую кнопку мыши»); колёсико — приближение (scrollZoom).
             dragmode='pan',
@@ -4985,7 +5118,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         n = len(keys)
-        ncols = 1 if n == 1 else 2
+        ncols = self._plot_ncols(n)
         nrows = (n + ncols - 1) // ncols
         x_thr = ser.get("x_throat_m", None)
 
@@ -5551,11 +5684,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'Pc_unit': self.cb_Pc_unit.currentText(),
             'Pe_unit': self.cb_Pe_unit.currentText(),
             'n_inter': self.sp_n_inter.value(),
-            'n_chamber': self.sp_n_chamber.value(),
-            'density_sub': self.sp_density_sub.value(),
-            'density_crit': self.sp_density_crit.value(),
-            'density_sup': self.sp_density_sup.value(),
             'include_condensed': self.chk_condensed.isChecked(),
+            'injection_velocity': self.sp_inj_velocity.value(),
+            'chamber_pressure_drop': self.sp_chamber_dp.value(),
             'solver': 'cea' if self.rb_cea.isChecked() else 'own',
             'L_chamber': self.sp_L_chamber.value(),
             'L_conv': self.sp_L_conv.value(),
@@ -5680,11 +5811,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._on_mix_mode_changed()
             self.sp_n_inter.setValue(cfg.get('n_inter', 8))
-            self.sp_n_chamber.setValue(cfg.get('n_chamber', 4))
-            self.sp_density_sub.setValue(cfg.get('density_sub', 1.0))
-            self.sp_density_crit.setValue(cfg.get('density_crit', 1.0))
-            self.sp_density_sup.setValue(cfg.get('density_sup', 1.0))
             self.chk_condensed.setChecked(cfg.get('include_condensed', True))
+            self.sp_inj_velocity.setValue(cfg.get('injection_velocity', 0.0))
+            self.sp_chamber_dp.setValue(cfg.get('chamber_pressure_drop', 0.0))
             if cfg.get('solver') == 'cea' and CANTERA_AVAILABLE:
                 self.rb_cea.setChecked(True)
             else:
