@@ -83,6 +83,10 @@ from ..rocket.nozzle_flow_2d import solve_nozzle_2d, Nozzle2DResult
 from ..rocket.analytic_sizing import (
     AnalyticSizingInput, AnalyticSizingResult, compute_analytic_sizing,
 )
+from ..rocket.signal_cleanup import (
+    hampel_filter as _hampel_filter,
+    monotone_despike as _monotone_despike,
+)
 from ..io.reporting import print_nozzle_table
 from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
@@ -4568,27 +4572,30 @@ class MainWindow(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _hampel_filter(y, window: int = 2, n_sigma: float = 3.0):
-        """Удаляет одиночные выбросы (медианный фильтр Хампеля).
+        """Медианный фильтр Хампеля (для НЕмонотонных гладких величин: γₛ, a).
 
-        Точка считается выбросом, если отклоняется от скользящей медианы более
-        чем на n_sigma·(1.4826·MAD). Выбросы заменяются медианой окна. Сохраняет
-        физический тренд, убирая «иголки» от несошедшегося SP-решателя.
+        Тонкая обёртка над :func:`rocket.signal_cleanup.hampel_filter`.
         """
-        y = np.asarray(y, dtype=float)
-        n = y.size
-        if n < 2 * window + 1:
-            return y.copy()
-        out = y.copy()
-        for i in range(n):
-            lo = max(0, i - window)
-            hi = min(n, i + window + 1)
-            seg = y[lo:hi]
-            med = np.median(seg)
-            mad = np.median(np.abs(seg - med))
-            sigma = 1.4826 * mad
-            if sigma > 0 and abs(y[i] - med) > n_sigma * sigma:
-                out[i] = med
-        return out
+        return _hampel_filter(y, window=window, n_sigma=n_sigma)
+
+    @staticmethod
+    def _monotone_despike(y, decreasing: bool = True,
+                          rel_tol: float = 0.03, iters: int = 8,
+                          curv_k: float = 2.0):
+        """Подавляет «резкие пики» в МОНОТОННОЙ по ходу потока величине.
+
+        Течение в сопле монотонно (P, T, ρ убывают; V, M растут от камеры к
+        срезу). Эталон — изотоническая регрессия (PAVA): точка, выбивающаяся из
+        монотонного тренда больше чем на ``rel_tol``·размах, считается численным
+        шумом несошедшейся SP-задачи и заменяется интерполяцией по «хорошим»
+        соседям. Дополнительно выброс ловится по большой кривизне (2-я разность),
+        что напрямую убирает «резкие пики» — даже соседние (кластеры из 2–3
+        испорченных точек подряд). В отличие от Хампеля надёжно работает на
+        крутых монотонных участках. Тонкая обёртка над
+        :func:`rocket.signal_cleanup.monotone_despike`.
+        """
+        return _monotone_despike(y, decreasing=decreasing, rel_tol=rel_tol,
+                                 iters=iters, curv_k=curv_k)
 
     def _section_series(self, perf=None) -> dict:
         """Единый расчёт параметров газа по сечениям сопла (с очисткой шума).
@@ -4662,17 +4669,32 @@ class MainWindow(QtWidgets.QMainWindow):
         V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
         labels = [labels[i] for i in iu]
 
-        # 2) подавление одиночных выбросов в «шумных» величинах решателя.
-        #    γₛ и a физически гладкие — «иголки» это численный шум SP-задачи.
-        #    Для γₛ берём чуть шире окно и строже порог: показатель меняется
-        #    плавно, поэтому даже умеренные «дрожания» — это шум, а не физика.
+        # 2) подавление одиночных выбросов («резких пиков») от решателя.
+        #
+        #    (а) МОНОТОННЫЕ по ходу потока величины (P, T, ρ убывают; V растёт)
+        #        чистим изотоническим де-спайком: одиночный выброс, выбивающийся
+        #        из монотонного тренда камера→горловина→срез, — это численный шум
+        #        несошедшейся SP-задачи, а не физика. Этот метод надёжно убирает
+        #        «пики», которые медианный фильтр Хампеля пропускает на крутом
+        #        монотонном тренде (там локальный MAD большой, и порог не срабатывает).
+        P = self._monotone_despike(P, decreasing=True)
+        T = self._monotone_despike(T, decreasing=True)
+        rho = self._monotone_despike(rho, decreasing=True)
+        V = self._monotone_despike(V, decreasing=False)
+        #
+        #    (б) НЕмонотонные «гладкие» величины (γₛ, a) — мягкий фильтр Хампеля:
+        #        показатель и скорость звука меняются плавно, «иголки» это шум.
         gs = self._hampel_filter(gs, window=3, n_sigma=2.0)
         gs = self._hampel_filter(gs, window=2, n_sigma=2.0)
         a = self._hampel_filter(a, window=2, n_sigma=2.5)
-        # число Маха пересчитываем из (уже очищенной) скорости звука —
-        # это убирает «иглы» по M, согласовав его с V и a.
+        # перевычисляем a из γₛ там, где оно «осиротело» после чистки: a остаётся
+        # согласованным с T и γₛ (a=√(γₛ·R·T)) — но т.к. R меняется по сечениям,
+        # ограничимся фильтрацией. Число Маха пересчитываем из (очищенных) V и a.
         with np.errstate(divide='ignore', invalid='ignore'):
             M = np.where(a > 0, V / a, 0.0)
+        # M физически монотонно растёт по ходу потока — добиваем де-спайком,
+        # затем мягким Хампелем (страхует от близко стоящих выбросов).
+        M = self._monotone_despike(M, decreasing=False)
         M = self._hampel_filter(M, window=2, n_sigma=3.0)
 
         # горловина — ближайшее к M=1 сечение (минимум |M-1|)
@@ -4710,6 +4732,14 @@ class MainWindow(QtWidgets.QMainWindow):
             H = H[order][iu]
         else:
             H = np.full_like(x, float('nan'))
+
+        # Энтальпия H монотонно убывает по ходу потока (переходит в кинетическую
+        # энергию) — чистим де-спайком. Энтропия S при изоэнтропическом течении
+        # почти постоянна — убираем редкие «иголки» мягким Хампелем.
+        if np.isfinite(H).sum() >= 4:
+            H = self._monotone_despike(H, decreasing=True)
+        if np.isfinite(S).sum() >= 5:
+            S = self._hampel_filter(S, window=2, n_sigma=3.0)
 
         # ── Газодинамические функции (изэнтропические соотношения) ────────────
         # ВАЖНО: τ, π, ε, q, y считаем АНАЛИТИЧЕСКИ из скоростного коэффициента λ,
