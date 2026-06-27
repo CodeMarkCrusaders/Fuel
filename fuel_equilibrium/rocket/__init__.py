@@ -37,10 +37,8 @@ from .nozzle_geometry import (
     rao_reference_length_15deg,
     estimate_bell_angles,
     build_geometry_from_performance,
+    build_nozzle_geometry,
 )
-# Диспетчер геометрии импортируем под отдельным именем, чтобы не конфликтовать
-# с build_nozzle_geometry из cea_solver (другая сигнатура/назначение).
-from .nozzle_geometry import build_nozzle_geometry as build_dobrovolsky_geometry
 
 # Двумерный (осесимметричный) расчёт сопла — заготовка (1D/2D выбор в GUI).
 from .nozzle_flow_2d import (
@@ -62,7 +60,7 @@ from .of_sweep import (
 try:
     from .cea_solver import (
         solve_rocket_nozzle_cea,
-        build_nozzle_geometry,
+        build_axial_coordinates,
         nozzle_radius,
         CANTERA_AVAILABLE,
     )
@@ -94,7 +92,7 @@ __all__ = [
     "build_rpa_parabolic_nozzle",
     "rao_reference_length_15deg",
     "estimate_bell_angles",
-    "build_dobrovolsky_geometry",
+    "build_nozzle_geometry",
     "build_geometry_from_performance",
     # двумерный (осесимметричный) расчёт — заготовка
     "Nozzle2DField",
@@ -109,4 +107,4 @@ __all__ = [
 ]
 
 if CANTERA_AVAILABLE:
-    __all__ += ["solve_rocket_nozzle_cea", "build_nozzle_geometry", "nozzle_radius"]
+    __all__ += ["solve_rocket_nozzle_cea", "build_axial_coordinates", "nozzle_radius"]

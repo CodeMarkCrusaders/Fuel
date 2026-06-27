@@ -196,6 +196,8 @@ def exit_angle_from_underexpansion(
 # даёт ~80 % длины конического 15° при близком φ_рас). Пользователь может
 # заменить сетку через set_optimal_grid().
 #
+import threading
+
 #                 R_a/R_кр   θ_m,°   θ_a,°   x̄_a
 _OPTIMAL_GRID: List[Tuple[float, float, float, float]] = [
     (2.0,   22.0, 14.0,  2.6),
@@ -209,6 +211,9 @@ _OPTIMAL_GRID: List[Tuple[float, float, float, float]] = [
     (20.0,  38.5,  6.0, 50.0),
     (30.0,  39.5,  5.0, 80.0),
 ]
+# Блокировка защищает глобальную сетку _OPTIMAL_GRID при параллельном доступе
+# (set_optimal_grid мутирует её, optimal_angles_from_area_ratio читает).
+_OPTIMAL_GRID_LOCK = threading.Lock()
 
 
 def set_optimal_grid(grid: Sequence[Tuple[float, float, float, float]]) -> None:
@@ -222,7 +227,8 @@ def set_optimal_grid(grid: Sequence[Tuple[float, float, float, float]]) -> None:
     cleaned = sorted((tuple(map(float, row)) for row in grid), key=lambda r: r[0])
     if len(cleaned) < 2:
         raise ValueError("grid должна содержать не менее двух точек")
-    _OPTIMAL_GRID = list(cleaned)  # type: ignore[assignment]
+    with _OPTIMAL_GRID_LOCK:
+        _OPTIMAL_GRID = list(cleaned)  # type: ignore[assignment]
 
 
 def optimal_angles_from_area_ratio(
@@ -240,7 +246,10 @@ def optimal_angles_from_area_ratio(
         raise ValueError("area_ratio должен быть > 1")
     radius_ratio = math.sqrt(area_ratio)  # R_a/R_кр
 
-    grid = _OPTIMAL_GRID
+    # Читаем сетку под блокировкой, чтобы получить консистентный снимок
+    # (set_optimal_grid может атомарно заменить весь список).
+    with _OPTIMAL_GRID_LOCK:
+        grid = list(_OPTIMAL_GRID)
     xs = [row[0] for row in grid]
 
     if radius_ratio <= xs[0]:

@@ -250,16 +250,11 @@ def _stoich_OF_cantera(oxidizer: Propellant, fuel: Propellant) -> float:
 # Создание газа Cantera с подходящим механизмом
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Кэш чтобы не создавать gas-объекты заново
+# Кэш чтобы не создавать gas-объекты заново.
+# ВАЖНО: объекты ct.Solution изменяемы и не потокобезопасны. Возврат из кэша
+# безопасен, т.к. для параллельного расчёта вызывающий код обязан использовать
+# _clone_gas (см. solve_rocket_nozzle_cea: _thread_gas).
 _GAS_CACHE = {}
-
-def _pick_mechanism(element_set: set) -> str:
-    """Выбирает подходящий yaml-механизм Cantera."""
-    # gri30 покрывает C/H/O/N (метан, водород, природный газ)
-    # nasa_gas — содержит больше элементов (фтор, хлор и т.п.)
-    if element_set <= {'C', 'H', 'O', 'N', 'AR'}:
-        return 'gri30.yaml'
-    return 'nasa_gas.yaml'
 
 
 def _make_gas(needed_species: List[str]) -> 'ct.Solution':
@@ -685,7 +680,7 @@ def solve_rocket_nozzle_cea(
 # Геометрия конического сопла — для построения профиля по длине
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_nozzle_geometry(
+def build_axial_coordinates(
     stations: List[StationResult],
     L_chamber: float = 0.10,    # м — длина камеры
     L_conv: float = 0.05,       # м — длина конфузора

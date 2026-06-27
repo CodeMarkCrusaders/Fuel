@@ -12,7 +12,13 @@ dist/
 .idea/
 .DS_Store
 
+# Сторонний туллинг (Kilo Code и т.п.)
+.kilo/
+
 # Локальные артефакты/референсы
 _refs/
 *.log
 contour_verify.png
+check_result.txt
+check_imports.txt
+check_thermo.txt

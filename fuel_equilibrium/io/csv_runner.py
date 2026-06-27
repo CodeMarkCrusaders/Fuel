@@ -57,7 +57,7 @@ import math
 import sys
 import time
 import traceback
-from decimal import Decimal, InvalidOperation, getcontext
+from decimal import Decimal, InvalidOperation
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -72,10 +72,6 @@ from ..rocket.nozzle_flow import (
     solve_rocket_nozzle,
 )
 from .iteration_logger import IterationLogger, NullLogger
-
-getcontext().prec = 28
-
-R_UNIVERSAL_J_KMOL_K = 8314.46261815324  # Дж/(кмоль·К)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +269,7 @@ def _split_masses_by_alpha(
     Возвращает (mass_ox_kg, mass_fu_kg, of_actual, of_stoich).
     Если стехиометрия не определяется — fallback в 1:1.
     """
-    from nozzle_flow import stoichiometric_OF
+    from ..rocket.nozzle_flow import stoichiometric_OF
     try:
         ox_sp = species_db[oxidizer_name]
         fu_sp = species_db[fuel_name]

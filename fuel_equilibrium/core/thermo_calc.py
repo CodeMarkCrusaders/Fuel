@@ -76,7 +76,7 @@ def g_J(species, T):  return g_over_RT(species, T) * R_UNIVERSAL * T
 
 
 if __name__ == "__main__":
-    from nasa9_parser import parse_thermo_file
+    from .nasa9_parser import parse_thermo_file
     import sys
 
     if len(sys.argv) < 2:
