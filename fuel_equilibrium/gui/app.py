@@ -526,6 +526,7 @@ class MainWindow:
         self._plot_keys = list(PLOT_DEFAULT_KEYS)
         self._show_profile_1d = False
         self._last_geometry: Optional[NozzleGeometry] = None
+        self._last_geometries: Dict[str, NozzleGeometry] = {}
         self._last_analytic_result = None
         # Выбранный тип сопла в панели расчёта
         self._calc_geom_type = "profiled"
@@ -775,10 +776,10 @@ class MainWindow:
         with dpg.group(horizontal=True):
             dpg.add_checkbox(label="Длина камеры",
                              tag="rb_chamber_len", default_value=True,
-                             callback=self._on_chamber_size_mode_changed)
+                             callback=lambda: self._on_chamber_size_mode_changed("rb_chamber_len"))
             dpg.add_checkbox(label="Характеристическая L*",
                              tag="rb_chamber_lstar", default_value=False,
-                             callback=self._on_chamber_size_mode_changed)
+                             callback=lambda: self._on_chamber_size_mode_changed("rb_chamber_lstar"))
         dpg.add_input_float(label="Длина камеры (м)",
                             tag="sp_L_chamber", default_value=0.100,
                             min_value=0.0, min_clamped=False, format="%.4f")
@@ -791,13 +792,13 @@ class MainWindow:
         with dpg.group(horizontal=True):
             dpg.add_checkbox(label="Коническое", tag="rb_calc_conical",
                              default_value=False,
-                             callback=self._on_calc_geom_type_changed)
+                             callback=lambda: self._on_calc_geom_type_changed("rb_calc_conical"))
             dpg.add_checkbox(label="Профилированное", tag="rb_calc_profiled",
                              default_value=True,
-                             callback=self._on_calc_geom_type_changed)
+                             callback=lambda: self._on_calc_geom_type_changed("rb_calc_profiled"))
             dpg.add_checkbox(label="RPA (bell)", tag="rb_calc_rpa",
                              default_value=False,
-                             callback=self._on_calc_geom_type_changed)
+                             callback=lambda: self._on_calc_geom_type_changed("rb_calc_rpa"))
         dpg.add_input_float(label="Rкр — горловина (м)", tag="sp_calc_Rthroat",
                             default_value=0.050, min_value=0.0001,
                             min_clamped=True, format="%.4f")
@@ -845,10 +846,10 @@ class MainWindow:
                             dpg.add_text("Показывать:")
                             dpg.add_checkbox(label="Мольные доли",
                                              tag="rb_mole", default_value=True,
-                                             callback=lambda: self._refresh_species_view())
+                                             callback=lambda: self._on_fraction_mode_changed("rb_mole"))
                             dpg.add_checkbox(label="Массовые доли",
                                              tag="rb_mass", default_value=False,
-                                             callback=lambda: self._refresh_species_view())
+                                             callback=lambda: self._on_fraction_mode_changed("rb_mass"))
                             dpg.add_text("Топ:")
                             dpg.add_slider_int(tag="sp_topN", default_value=15,
                                                min_value=3, max_value=50,
@@ -954,7 +955,8 @@ class MainWindow:
         """Вкладка построения контура сопла."""
         with dpg.group(horizontal=True):
             with dpg.child_window(border=True, width=380, autosize_y=True):
-                dpg.add_text("Тип сопла:", color=C_ACCENT)
+                dpg.add_text("Тип сопла (можно выбрать несколько):",
+                             color=C_ACCENT)
                 with dpg.group(horizontal=True):
                     dpg.add_checkbox(label="Коническое", tag="rb_geom_conical",
                                      default_value=False)
@@ -962,6 +964,9 @@ class MainWindow:
                                      tag="rb_geom_profiled", default_value=True)
                     dpg.add_checkbox(label="RPA (bell)", tag="rb_geom_rpa",
                                      default_value=False)
+                dpg.add_text("Отмеченные профили строятся вместе и "
+                             "отображаются на графике разными цветами.",
+                             color=C_MUTED, wrap=360)
                 dpg.add_input_float(label="Rкр (м)", tag="sp_geom_Rthroat",
                                     default_value=0.050, min_value=0.0001,
                                     min_clamped=True, format="%.4f")
@@ -993,7 +998,9 @@ class MainWindow:
                                callback=self.on_export_geometry_csv)
             with dpg.child_window(border=False, autosize_x=True,
                                   autosize_y=True):
-                with dpg.plot(tag="geom_plot", height=-300, width=-1):
+                with dpg.plot(tag="geom_plot", height=-300, width=-1,
+                              equal_aspects=True):
+                    dpg.add_plot_legend()
                     dpg.add_plot_axis(dpg.mvXAxis, label="x, м",
                                       tag="geom_x")
                     dpg.add_plot_axis(dpg.mvYAxis, label="r, м",
@@ -1067,28 +1074,57 @@ class MainWindow:
             dpg.set_value("rb_cea", False)
         self._solver = "cea" if cea else "own"
 
-    def _on_chamber_size_mode_changed(self):
-        use_len = dpg.get_value("rb_chamber_len")
-        use_lstar = dpg.get_value("rb_chamber_lstar")
-        if not use_len and not use_lstar:
-            dpg.set_value("rb_chamber_len", True)
-            use_len = True
-        if use_len and use_lstar:
-            dpg.set_value("rb_chamber_lstar", False)
+    @staticmethod
+    def _enforce_radio(group_tags, clicked_tag=None):
+        """Поведение «выбрать один из» для набора чекбоксов.
 
-    def _on_calc_geom_type_changed(self):
-        conical = dpg.get_value("rb_calc_conical")
-        profiled = dpg.get_value("rb_calc_profiled")
-        rpa = dpg.get_value("rb_calc_rpa")
-        if conical:
-            self._calc_geom_type = "conical"
-            self._calc_use_rpa = False
-        elif rpa:
-            self._calc_geom_type = "rpa"
-            self._calc_use_rpa = True
+        Гарантирует, что ровно один чекбокс из group_tags включён.
+        clicked_tag — тег чекбокса, по которому только что кликнули
+        (если задан, именно он остаётся включённым).
+        """
+        checked = [t for t in group_tags
+                   if dpg.does_item_exist(t) and dpg.get_value(t)]
+        if clicked_tag is not None and dpg.get_value(clicked_tag):
+            # Кликнули по чекбоксу и он стал включён → выключаем остальные
+            for t in group_tags:
+                if dpg.does_item_exist(t):
+                    dpg.set_value(t, t == clicked_tag)
+            return clicked_tag
+        if not checked:
+            # Запретили снять последний — возвращаем кликнутый (или первый)
+            keep = clicked_tag if clicked_tag in group_tags else group_tags[0]
+            dpg.set_value(keep, True)
+            for t in group_tags:
+                if dpg.does_item_exist(t) and t != keep:
+                    dpg.set_value(t, False)
+            return keep
+        if len(checked) > 1:
+            keep = checked[0]
+            for t in checked[1:]:
+                dpg.set_value(t, False)
+            return keep
+        return checked[0]
+
+    def _on_chamber_size_mode_changed(self, clicked_tag=None):
+        # Размер камеры сгорания: «выбрать один из» (длина / характ. L*)
+        self._enforce_radio(["rb_chamber_len", "rb_chamber_lstar"], clicked_tag)
+
+    def _on_fraction_mode_changed(self, clicked_tag=None):
+        # Мольные / массовые доли: «выбрать один из»
+        self._enforce_radio(["rb_mole", "rb_mass"], clicked_tag)
+        self._refresh_species_view()
+
+    def _on_calc_geom_type_changed(self, clicked_tag=None):
+        # Тип сопла для оси X основного расчёта — единственная ось координат,
+        # поэтому здесь «выбрать один из».
+        self._enforce_radio(
+            ["rb_calc_conical", "rb_calc_profiled", "rb_calc_rpa"], clicked_tag)
+        if dpg.get_value("rb_calc_conical"):
+            self._calc_geom_type, self._calc_use_rpa = "conical", False
+        elif dpg.get_value("rb_calc_rpa"):
+            self._calc_geom_type, self._calc_use_rpa = "rpa", True
         else:
-            self._calc_geom_type = "profiled"
-            self._calc_use_rpa = False
+            self._calc_geom_type, self._calc_use_rpa = "profiled", False
 
     def _update_overall_efficiency(self):
         try:
@@ -1693,61 +1729,124 @@ class MainWindow:
 
     # ─── Геометрия ───────────────────────────────────────────────────────
 
+    # Цвета профилей сопла на графике геометрии (по типу)
+    GEOM_TYPE_COLORS = {
+        "conical": (106, 176, 255),   # синий
+        "profiled": (204, 120, 92),   # акцент (оранжевый)
+        "rpa": (130, 210, 122),       # зелёный
+    }
+    GEOM_TYPE_LABELS = {
+        "conical": "Коническое",
+        "profiled": "Профилированное",
+        "rpa": "RPA (bell)",
+    }
+
+    def _build_single_geometry(self, geom_type, R_throat, ar, R_cham):
+        """Строит одну геометрию заданного типа."""
+        if geom_type == "conical":
+            return build_conical_nozzle(
+                R_throat, ar, R_chamber_m=R_cham,
+                theta_exit_deg=float(dpg.get_value("sp_geom_theta_exit") or 15.0),
+                theta_in_deg=float(dpg.get_value("sp_geom_theta_in") or 30.0))
+        if geom_type == "rpa":
+            return build_rpa_parabolic_nozzle(
+                R_throat, ar, R_chamber_m=R_cham,
+                contraction_angle_deg=30.0)
+        return build_profiled_nozzle(
+            R_throat, ar, R_chamber_m=R_cham,
+            theta_exit_deg=float(dpg.get_value("sp_geom_theta_exit") or 15.0),
+            theta_in_deg=float(dpg.get_value("sp_geom_theta_in") or 30.0))
+
     def on_build_geometry(self):
+        # Какие типы отмечены (можно несколько)
+        selected = []
+        if dpg.get_value("rb_geom_conical"):
+            selected.append("conical")
+        if dpg.get_value("rb_geom_profiled"):
+            selected.append("profiled")
+        if dpg.get_value("rb_geom_rpa"):
+            selected.append("rpa")
+        if not selected:
+            dpg.set_value("txt_geom_summary",
+                          "Выберите хотя бы один тип сопла (галочкой).")
+            self._last_geometries = {}
+            self._last_geometry = None
+            self._render_geometry({})
+            return
         try:
             R_throat = float(dpg.get_value("sp_geom_Rthroat") or 0.05)
             ar = float(dpg.get_value("sp_geom_AR") or 16.0)
             R_cham = float(dpg.get_value("sp_geom_Rcham_factor") or 2.5) * R_throat
-            # Определяем тип
-            if dpg.get_value("rb_geom_conical"):
-                geom = build_conical_nozzle(
-                    R_throat, ar, R_chamber_m=R_cham,
-                    theta_exit_deg=float(dpg.get_value("sp_geom_theta_exit") or 15.0),
-                    theta_in_deg=float(dpg.get_value("sp_geom_theta_in") or 30.0))
-            elif dpg.get_value("rb_geom_rpa"):
-                geom = build_rpa_parabolic_nozzle(
-                    R_throat, ar, R_chamber_m=R_cham,
-                    contraction_angle_deg=30.0)
-            else:
-                geom = build_profiled_nozzle(
-                    R_throat, ar, R_chamber_m=R_cham,
-                    theta_exit_deg=float(dpg.get_value("sp_geom_theta_exit") or 15.0),
-                    theta_in_deg=float(dpg.get_value("sp_geom_theta_in") or 30.0))
-            self._last_geometry = geom
-            self._render_geometry(geom)
-            self._update_geometry_summary(geom)
+            geometries = {}
+            errors = {}
+            for gtype in selected:
+                try:
+                    geometries[gtype] = self._build_single_geometry(
+                        gtype, R_throat, ar, R_cham)
+                except Exception as e:
+                    errors[gtype] = str(e)
+            self._last_geometries = geometries
+            # Совместимость: «текущая» геометрия — первая успешная
+            self._last_geometry = next(iter(geometries.values()), None)
+            self._render_geometry(geometries)
+            self._update_geometry_summary(geometries, errors)
         except Exception as e:
             dpg.set_value("txt_geom_summary", f"Ошибка: {e}")
 
-    def _render_geometry(self, geom):
-        x_arr, r_arr = geom.as_xy_arrays()
-        # Очищаем plot
+    def _render_geometry(self, geometries):
+        """Отрисовка одного или нескольких профилей сопла.
+
+        geometries — dict {geom_type: NozzleGeometry}. Каждый профиль рисуется
+        своим цветом (верхняя и нижняя ветви контура).
+        """
+        # Очищаем plot (все серии оси Y)
         if dpg.does_item_exist("geom_y"):
-            for child in list(dpg.get_item_info("geom_y")["children"][1]):
+            children = dpg.get_item_info("geom_y").get("children", {})
+            series = children.get(1, []) if isinstance(children, dict) else []
+            for child in list(series):
                 dpg.delete_item(child)
-        ls_pos = dpg.add_line_series(list(x_arr), list(r_arr),
-                                      parent="geom_y")
-        ls_neg = dpg.add_line_series(list(x_arr), list(-r_arr),
-                                      parent="geom_y")
-        with dpg.theme() as geom_theme:
-            with dpg.theme_component(dpg.mvLineSeries):
-                dpg.add_theme_color(dpg.mvPlotCol_Line, C_ACCENT)
-                dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 200)
-        dpg.bind_item_theme(ls_pos, geom_theme)
-        dpg.bind_item_theme(ls_neg, geom_theme)
+        if not geometries:
+            return
+        for gtype, geom in geometries.items():
+            if geom is None:
+                continue
+            x_arr, r_arr = geom.as_xy_arrays()
+            color = self.GEOM_TYPE_COLORS.get(gtype, C_ACCENT)
+            label = self.GEOM_TYPE_LABELS.get(gtype, gtype)
+            ls_pos = dpg.add_line_series(list(x_arr), list(r_arr),
+                                         parent="geom_y", label=label)
+            ls_neg = dpg.add_line_series(list(x_arr), list(-np.asarray(r_arr)),
+                                         parent="geom_y")
+            with dpg.theme() as geom_theme:
+                with dpg.theme_component(dpg.mvLineSeries):
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color)
+                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 200)
+            dpg.bind_item_theme(ls_pos, geom_theme)
+            dpg.bind_item_theme(ls_neg, geom_theme)
         dpg.fit_axis_data("geom_x")
         dpg.fit_axis_data("geom_y")
 
-    def _update_geometry_summary(self, geom):
-        s = []
-        s.append(f"Тип: {geom.method}")
-        s.append(f"Rкр = {geom.R_throat_m*1e3:.3f} мм")
-        s.append(f"Ra = {geom.R_exit_m*1e3:.3f} мм")
-        s.append(f"Fa/Fкр = {geom.area_ratio:.4f}")
-        s.append(f"θa = {geom.theta_exit_deg:.2f}°")
-        s.append(f"φрас = {geom.phi_dispersion:.4f}")
-        s.append(f"Длина полная = {geom.length_total_m*1e3:.2f} мм")
-        dpg.set_value("txt_geom_summary", "\n".join(s))
+    def _update_geometry_summary(self, geometries, errors=None):
+        errors = errors or {}
+        blocks = []
+        for gtype, geom in geometries.items():
+            if geom is None:
+                continue
+            label = self.GEOM_TYPE_LABELS.get(gtype, gtype)
+            s = [f"━━ {label} ━━"]
+            s.append(f"Тип: {geom.method}")
+            s.append(f"Rкр = {geom.R_throat_m*1e3:.3f} мм")
+            s.append(f"Ra = {geom.R_exit_m*1e3:.3f} мм")
+            s.append(f"Fa/Fкр = {geom.area_ratio:.4f}")
+            s.append(f"θa = {geom.theta_exit_deg:.2f}°")
+            s.append(f"φрас = {geom.phi_dispersion:.4f}")
+            s.append(f"Длина полная = {geom.length_total_m*1e3:.2f} мм")
+            blocks.append("\n".join(s))
+        for gtype, err in errors.items():
+            label = self.GEOM_TYPE_LABELS.get(gtype, gtype)
+            blocks.append(f"━━ {label} ━━\nОшибка: {err}")
+        dpg.set_value("txt_geom_summary",
+                      "\n\n".join(blocks) if blocks else "Нет данных.")
 
     def on_geometry_from_perf(self):
         if self.perf is None:
@@ -1764,20 +1863,29 @@ class MainWindow:
             pass
 
     def on_export_geometry_csv(self):
-        if self._last_geometry is None:
+        geometries = self._last_geometries or (
+            {"profiled": self._last_geometry} if self._last_geometry else {})
+        if not geometries:
             ActionLogger.warning("Экспорт геометрии прерван — контур не построен")
             dpg.set_value("status_text", "Сначала постройте контур сопла.")
             return
-        ActionLogger.info("Экспорт контура сопла в CSV")
-        geom = self._last_geometry
-        path = os.path.join(os.path.expanduser("~"), "nozzle_contour.csv")
+        ActionLogger.info("Экспорт контура сопла в CSV",
+                          types=",".join(geometries.keys()))
         try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                wr = csv.writer(f, delimiter=";")
-                wr.writerow(["x_m", "r_m"])
-                for p in geom.points:
-                    wr.writerow([f"{p.x_m:.6f}", f"{p.r_m:.6f}"])
-            dpg.set_value("status_text", f"Контур сохранён: {path}")
+            saved = []
+            for gtype, geom in geometries.items():
+                if geom is None:
+                    continue
+                fname = f"nozzle_contour_{gtype}.csv"
+                path = os.path.join(os.path.expanduser("~"), fname)
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    wr = csv.writer(f, delimiter=";")
+                    wr.writerow(["x_m", "r_m"])
+                    for p in geom.points:
+                        wr.writerow([f"{p.x_m:.6f}", f"{p.r_m:.6f}"])
+                saved.append(fname)
+            dpg.set_value("status_text",
+                          "Контур(ы) сохранены: " + ", ".join(saved))
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка экспорта: {e}")
 
