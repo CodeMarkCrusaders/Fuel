@@ -1977,9 +1977,8 @@ def _load_cyrillic_font():
         return
     with dpg.font_registry():
         font = dpg.add_font(path, 15)
-        dpg.add_font_range_hint(dpg.mvFontRangeHint_Cyrillic, parent=font)
-        dpg.add_font_range_hint(dpg.mvFontRangeHint_Default, parent=font)
-        dpg.add_font_range_hint(dpg.mvFontRangeHint_Latin1Supplement, parent=font)
+        # В новых версиях Dear PyGui диапазоны символов добавляются автоматически,
+        # поэтому add_font_range_hint не нужен и может отсутствовать.
         dpg.add_font_range(0x0370, 0x03FF, parent=font)
         dpg.add_font_range(0x2080, 0x209F, parent=font)
     dpg.bind_font(font)
