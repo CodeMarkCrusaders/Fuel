@@ -405,12 +405,17 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
     labels = [labels[i] for i in iu]
 
-    gs = hampel_filter(gs, window=3, n_sigma=2.0)
-    gs = hampel_filter(gs, window=2, n_sigma=2.0)
-    a = hampel_filter(a, window=2, n_sigma=2.5)
+    # Решатель газодинамики (rocket/nozzle_flow.py) теперь выдаёт гладкие
+    # профили gamma_s/a/M (производные считаются с жёстким допуском и
+    # относительными шагами, см. equilibrium_cp_and_sound_speed). Поэтому
+    # агрессивное медианное сглаживание больше не нужно: оставляем лишь
+    # мягкий «предохранитель» от единичных грубых выбросов (n_sigma высокий),
+    # чтобы показывать пользователю настоящий результат расчёта, а не маску.
+    gs = hampel_filter(gs, window=2, n_sigma=5.0)
+    a = hampel_filter(a, window=2, n_sigma=5.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         M = np.where(a > 0, V / a, 0.0)
-    M = hampel_filter(M, window=2, n_sigma=3.0)
+    M = hampel_filter(M, window=2, n_sigma=5.0)
     try:
         i_throat = int(np.nanargmin(np.abs(M - 1.0)))
     except Exception:
@@ -449,7 +454,7 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     with np.errstate(divide="ignore", invalid="ignore"):
         lam2 = ((k_ref + 1.0) / 2.0 * M * M) / (1.0 + (k_ref - 1.0) / 2.0 * M * M)
     lam = np.sqrt(np.clip(lam2, 0.0, None))
-    lam = hampel_filter(lam, window=2, n_sigma=2.5)
+    lam = hampel_filter(lam, window=2, n_sigma=5.0)
     lam_max = math.sqrt((k_ref + 1.0) / (k_ref - 1.0))
     lam = np.clip(lam, 0.0, lam_max - 1e-6)
 

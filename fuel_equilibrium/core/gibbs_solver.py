@@ -190,6 +190,7 @@ def solve_equilibrium(
     outer_index: int = -1,
     n0_warm: Optional[np.ndarray] = None,
     use_cache: bool = True,
+    ftol: float = 1e-6,
 ) -> EquilibriumResult:
     """
     Находит равновесный состав минимизацией G/RT при заданных T и P.
@@ -347,7 +348,7 @@ def solve_equilibrium(
     # (1e-6) гарантирует физическую корректность решения.
     res = minimize(gibbs, n0, method='SLSQP', jac=grad,
                    bounds=bounds, constraints=constraints,
-                   options={'maxiter': 2000, 'ftol': 1e-6, 'disp': False},
+                   options={'maxiter': 2000, 'ftol': ftol, 'disp': False},
                    callback=cb)
 
     n_sol = res.x

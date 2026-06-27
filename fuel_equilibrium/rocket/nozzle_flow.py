@@ -252,6 +252,24 @@ def mixture_gamma_frozen(
     return cp, cv, cp / cv
 
 
+# Точность конечно-разностных под-задач для производных. Главный (и
+# единственный реальный) источник «артефактов» на профиле M по соплу —
+# это шум численных производных d ln n_gas / d ln T (и по P): при штатном
+# допуске SLSQP ftol=1e-6 число молей n_gas сходится лишь до уровня, который,
+# будучи поделён на малый шаг 2·ΔT, даёт «зубья» на gamma_s → a → M=V/a.
+# Поэтому именно под-задачи для производных решаем с жёстким допуском.
+_FD_FTOL = 1e-11
+
+
+def _solve_fd_point(species_list, element_abundances, T, P, n_warm):
+    """Под-задача равновесия для конечной разности (жёсткий допуск, тёплый старт)."""
+    return solve_equilibrium(
+        species_list, element_abundances, T, P,
+        include_condensed=True, verbose=False,
+        n0_warm=n_warm, ftol=_FD_FTOL,
+    )
+
+
 def equilibrium_cp_and_sound_speed(
     species_list: List[Species],
     element_abundances: Dict[str, float],
@@ -262,7 +280,7 @@ def equilibrium_cp_and_sound_speed(
 ) -> Tuple[float, float, float, float, float]:
     """Численная оценка равновесных Cp_eq, Cv_eq, gamma_s, a_eq.
 
-    Использует малые конечные разности по T и P вблизи текущего состояния
+    Использует конечные разности по T и P вблизи текущего состояния
     (по формулам NASA RP-1311, том I, §7).
 
     Возвращает: (Cp_eq, Cv_eq, gamma_s, a_eq, dlnV_dlnT_P)
@@ -273,58 +291,90 @@ def equilibrium_cp_and_sound_speed(
                    gamma_s = -1 / [ (d lnV/d lnP)_T
                                     - n_gas R (d lnV/d lnT)_P^2 / Cp_eq ]
         a_eq     — равновесная скорость звука: a^2 = gamma_s * R_spec * T
+
+    Численная устойчивость (исправление артефактов профиля M):
+        1) под-задачи производных решаются с жёстким допуском _FD_FTOL —
+           иначе шум n_gas (на уровне ftol камеры) делится на малый шаг и
+           порождает «зубья» на gamma_s/a/M;
+        2) шаги конечных разностей берутся относительными и достаточно
+           крупными (ΔT ≈ 0.5%·T, ΔP ≈ 0.5%·P) — это резко снижает
+           усиление округления при делении на 2·шаг, оставаясь в области,
+           где gamma_s(T,P) гладкая (смещение пренебрежимо);
+        3) производные и gamma_s ограничены физически осмысленными рамками;
+           при любом сбое возвращается «замороженное» приближение.
     """
-    # «Тёплый старт»: четыре конечно-разностных решения берутся в малой
-    # окрестности уже сошедшегося состояния (T±1 K, P±0.01%), поэтому
-    # moles_at_state — отличное начальное приближение. Это резко сокращает
-    # число итераций SLSQP (типично в 2–3 раза) без потери точности производных.
     n_warm = np.asarray(moles_at_state, dtype=float)
+    gas_idx = [i for i, sp in enumerate(species_list) if sp.is_gas]
+
+    def _n_gas(moles):
+        s = 0.0
+        for i in gas_idx:
+            s += moles[i]
+        return max(s, 1e-300)
+
+    # ── относительные шаги конечных разностей ─────────────────────────
+    # ΔT: 0.5% от T, но не меньше переданного delta_T и не меньше 2 K.
+    dT = max(0.005 * T, delta_T, 2.0)
+    # держим точки T±dT строго положительными
+    dT = min(dT, 0.45 * T)
+    # ΔP: 0.5% от P (центрированно), не меньше 1 Па.
+    dP = max(0.005 * P, 1.0)
+    dP = min(dP, 0.45 * P)
 
     # ── 1) производные по T при P = const ─────────────────────────────
-    r_plus  = solve_equilibrium(species_list, element_abundances, T + delta_T, P,
-                                include_condensed=True, verbose=False,
-                                n0_warm=n_warm)
-    r_minus = solve_equilibrium(species_list, element_abundances, T - delta_T, P,
-                                include_condensed=True, verbose=False,
-                                n0_warm=n_warm)
-    cp_eq = (r_plus.enthalpy - r_minus.enthalpy) / (2 * delta_T)
+    r_plus  = _solve_fd_point(species_list, element_abundances, T + dT, P, n_warm)
+    r_minus = _solve_fd_point(species_list, element_abundances, T - dT, P, n_warm)
+    cp_eq = (r_plus.enthalpy - r_minus.enthalpy) / (2.0 * dT)
 
-    n_gas_plus  = sum(r_plus.moles[i]  for i, sp in enumerate(species_list) if sp.is_gas)
-    n_gas_minus = sum(r_minus.moles[i] for i, sp in enumerate(species_list) if sp.is_gas)
+    n_gas_plus  = _n_gas(r_plus.moles)
+    n_gas_minus = _n_gas(r_minus.moles)
     # ln V = ln n_gas + ln T - ln P  =>  d lnV/d lnT |_P = (d ln n_gas / d ln T) + 1
-    dlnV_dlnT_P = T * (math.log(n_gas_plus) - math.log(n_gas_minus)) / (2 * delta_T) + 1.0
+    dln_ngas_dlnT = T * (math.log(n_gas_plus) - math.log(n_gas_minus)) / (2.0 * dT)
+    dlnV_dlnT_P = dln_ngas_dlnT + 1.0
 
     # ── 2) производные по P при T = const ────────────────────────────
-    dP = max(P * 1e-4, 1.0)
-    r_pP = solve_equilibrium(species_list, element_abundances, T, P + dP,
-                             include_condensed=True, verbose=False,
-                             n0_warm=n_warm)
-    r_mP = solve_equilibrium(species_list, element_abundances, T, P - dP,
-                             include_condensed=True, verbose=False,
-                             n0_warm=n_warm)
-    n_gas_pP = sum(r_pP.moles[i] for i, sp in enumerate(species_list) if sp.is_gas)
-    n_gas_mP = sum(r_mP.moles[i] for i, sp in enumerate(species_list) if sp.is_gas)
+    r_pP = _solve_fd_point(species_list, element_abundances, T, P + dP, n_warm)
+    r_mP = _solve_fd_point(species_list, element_abundances, T, P - dP, n_warm)
+    n_gas_pP = _n_gas(r_pP.moles)
+    n_gas_mP = _n_gas(r_mP.moles)
     # d lnV/d lnP |_T = (d ln n_gas / d ln P) - 1
-    dlnV_dlnP_T = P * (math.log(n_gas_pP) - math.log(n_gas_mP)) / (2 * dP) - 1.0
+    dln_ngas_dlnP = P * (math.log(n_gas_pP) - math.log(n_gas_mP)) / (2.0 * dP)
+    dlnV_dlnP_T = dln_ngas_dlnP - 1.0
+
+    # ── 2a) физические рамки производных ──────────────────────────────
+    # (d lnV/d lnT)_P ≥ 1 (рекомбинация при охлаждении не уменьшает объём
+    #  быстрее идеального газа); шум иногда даёт чуть меньше 1.
+    dlnV_dlnT_P = max(dlnV_dlnT_P, 1.0)
+    # (d lnV/d lnP)_T ≤ −1 для идеального газа; диссоциация делает его ещё
+    #  более отрицательным. Значение > −1 нефизично — ограничиваем сверху.
+    dlnV_dlnP_T = min(dlnV_dlnP_T, -1.0)
 
     # ── 3) равновесные Cv_eq и gamma_s по CEA-формулам ───────────────
-    n_gas_now = sum(moles_at_state[i] for i, sp in enumerate(species_list) if sp.is_gas)
+    n_gas_now = _n_gas(moles_at_state)
     nR = n_gas_now * R_UNIVERSAL
+
+    # «Замороженное» приближение gamma_s как запасной/опорный ориентир.
+    cp_frozen = mixture_cp_frozen(species_list, moles_at_state, T)
+    gamma_frozen = (cp_frozen / max(cp_frozen - nR, 1e-30)) if cp_frozen > nR else 1.2
 
     if abs(dlnV_dlnP_T) > 1e-30:
         # NASA RP-1311 (7.21):  Cv_eq = Cp_eq + nR * (dlnV/dlnT)_P^2 / (dlnV/dlnP)_T
-        # (dlnV/dlnP)_T отрицателен, поэтому формула даёт Cv_eq < Cp_eq.
         cv_eq = cp_eq + nR * dlnV_dlnT_P**2 / dlnV_dlnP_T
     else:
         cv_eq = cp_eq * 0.9
 
-    if cp_eq > 1e-30 and abs(dlnV_dlnP_T) > 1e-30:
+    if cp_eq > 1e-30:
         # NASA SP-273 (2.61):  gamma_s = -1 / [(dlnV/dlnP)_T + nR*(dlnV/dlnT)_P^2 / Cp_eq]
-        # Знак «+» внутри скобок — даёт gamma_s ~ 1.13 для горячего H2/O2.
         denom = dlnV_dlnP_T + nR * dlnV_dlnT_P**2 / cp_eq
-        gamma_s = -1.0 / denom if denom < -1e-30 else 1.4
+        gamma_s = -1.0 / denom if denom < -1e-30 else gamma_frozen
     else:
-        gamma_s = 1.4
+        gamma_s = gamma_frozen
+
+    # gamma_s изэнтропический физически в диапазоне ~(1.05 … gamma_frozen].
+    # Равновесный показатель всегда ≤ замороженного. Любой выброс за рамки —
+    # это остаточный численный шум, обрезаем к опорному значению.
+    if not (1.05 <= gamma_s <= gamma_frozen + 1e-6) or not math.isfinite(gamma_s):
+        gamma_s = min(max(gamma_s, 1.05), gamma_frozen) if math.isfinite(gamma_s) else gamma_frozen
 
     # ── 4) равновесная скорость звука ────────────────────────────────
     mass_g = sum(moles_at_state[i] * species_list[i].mol_weight
