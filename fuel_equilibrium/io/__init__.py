@@ -16,10 +16,12 @@ fuel_equilibrium.io — I/O-слой: логирование итераций, b
 """
 
 from .iteration_logger import IterationLogger, NullLogger
+from .action_logger import ActionLogger
 
 __all__ = [
     "IterationLogger",
     "NullLogger",
+    "ActionLogger",
     "print_result",
     "print_nozzle_table",
     "print_of_sweep_table",

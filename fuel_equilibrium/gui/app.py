@@ -51,6 +51,7 @@ from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
 from ..core.equilibrium_cache import clear_cache as clear_equilibrium_cache
 from ..io.iteration_logger import IterationLogger, NullLogger
+from ..io.action_logger import ActionLogger
 from .component_selector_dpg import (
     MixturePropellantWidgetDPG,
     is_ion, classify_role, allowed_for_mode,
@@ -533,6 +534,7 @@ class MainWindow:
 
         self._build()
 
+        ActionLogger.info("Приложение запущено")
     # ─── Построение UI ───────────────────────────────────────────────────
 
     def _build(self):
@@ -784,7 +786,7 @@ class MainWindow:
             # Группа 1: Газодинамика
             with dpg.tab(label="Газодинамика"):
                 with dpg.tab_bar():
-                    with dpg.tab(label="Параметры по сечениям"):
+                    with dpg.tab(label="Параметры по сечениям", tag="tab_stations"):
                         with dpg.table(tag="tbl_stations", header_row=True,
                                        resizable=True, policy=dpg.mvTable_SizingStretchProp):
                             dpg.add_table_column(label="Параметр")
@@ -798,7 +800,7 @@ class MainWindow:
             # Группа 2: Равновесный состав
             with dpg.tab(label="Равновесный состав"):
                 with dpg.tab_bar():
-                    with dpg.tab(label="Состав продуктов сгорания"):
+                    with dpg.tab(label="Состав продуктов сгорания", tag="tab_species_container"):
                         with dpg.group(horizontal=True):
                             dpg.add_text("Показывать:")
                             dpg.add_checkbox(label="Мольные доли",
@@ -1279,6 +1281,14 @@ class MainWindow:
         dpg.configure_item("btn_calc", enabled=False)
         dpg.set_value("status_text", f"Расчёт ({self._solver})... подождите.")
         dpg.set_value("progress_text", "⏳ Выполняется расчёт...")
+        of_desc = f"of={of_ratio:.3f}" if of_ratio is not None else "optimize"
+        ActionLogger.info(
+            "Расчёт запущен",
+            solver=self._solver,
+            P_chamber_Mpa=f"{params['P_chamber']/1e6:.3f}",
+            P_exit_Mpa=f"{params['P_exit']/1e6:.3f}",
+            of=of_desc,
+        )
 
         self.worker = NozzleSolverWorker(params, self._solver, self.species_db)
         self.worker.start()
@@ -1294,7 +1304,13 @@ class MainWindow:
             if msg["type"] == "progress":
                 dpg.set_value("progress_text", f"⏳ {msg['msg']}")
             elif msg["type"] == "ok":
-                self._on_calc_done(msg["perf"])
+                try:
+                    self._on_calc_done(msg["perf"])
+                except Exception as e:
+                    ActionLogger.error("Краш в _on_calc_done", detail=str(e))
+                    import traceback
+                    ActionLogger.error("Traceback", detail=traceback.format_exc())
+                    dpg.set_value("status_text", f"Ошибка отображения: {e}")
                 self.worker = None
                 break
             elif msg["type"] == "error":
@@ -1311,28 +1327,53 @@ class MainWindow:
                       f"Готово. Tкамеры = {st0.T_K:.1f} К, "
                       f"Isp = {perf.Isp_s:.2f} с, "
                       f"C* = {perf.Cstar_m_per_s:.1f} м/с")
-        self._fill_stations_table(perf)
-        self._fill_perf_text(perf)
-        self._refresh_species_view()
-        self._redraw_plots()
+        ActionLogger.info(
+            "Расчёт завершён",
+            T_chamber_K=f"{st0.T_K:.1f}",
+            Isp_s=f"{perf.Isp_s:.2f}",
+            Cstar_ms=f"{perf.Cstar_m_per_s:.1f}",
+            O_F=f"{perf.O_F:.4f}",
+            stations_count=len(perf.stations),
+        )
+        try:
+            ActionLogger.info("Шаг 1: таблица станций")
+            self._fill_stations_table(perf)
+            ActionLogger.info("Шаг 2: текст характеристик")
+            self._fill_perf_text(perf)
+            ActionLogger.info("Шаг 3: состав")
+            self._refresh_species_view()
+            ActionLogger.info("Шаг 4: графики")
+            self._redraw_plots()
+            ActionLogger.info("Все шаги отображения завершены")
+        except Exception as e:
+            ActionLogger.error("Ошибка отображения результатов", detail=str(e))
+            import traceback
+            ActionLogger.error("Traceback", detail=traceback.format_exc())
+            dpg.set_value("status_text", f"Ошибка отображения: {e}")
 
     def _on_calc_failed(self, msg: str):
         dpg.configure_item("btn_calc", enabled=True)
         dpg.set_value("progress_text", "")
         dpg.set_value("status_text", "Ошибка расчёта.")
         dpg.set_value("txt_perf", f"Ошибка расчёта:\n{msg[:2000]}")
+        ActionLogger.error("Расчёт завершился ошибкой", detail=msg[:500])
 
     # ─── Заполнение таблиц ───────────────────────────────────────────────
 
     def _fill_stations_table(self, perf: RocketPerformance):
+        ActionLogger.info("Заполнение таблицы станций")
         stations = perf.stations
-        # Очищаем таблицу
-        for child in list(dpg.get_item_info("tbl_stations")["children"][1]):
-            dpg.delete_item(child)
+        # Очищаем таблицу (DPG 2.x: children — dict, удаляем безопасно)
+        if dpg.does_item_exist("tbl_stations"):
+            children = dpg.get_item_info("tbl_stations").get("children", {})
+            if isinstance(children, dict):
+                for child_list in children.values():
+                    for child in child_list:
+                        dpg.delete_item(child)
+            dpg.delete_item("tbl_stations")
         # Перестраиваем колонки: параметр + по станциям + ед.изм.
         # (DPG не поддерживает динамическое добавление колонок в существующую
         #  таблицу — пересоздаём таблицу целиком.)
-        dpg.delete_item("tbl_stations")
         with dpg.table(tag="tbl_stations", header_row=True,
                        resizable=True, policy=dpg.mvTable_SizingStretchProp,
                        parent=self._stations_parent()):
@@ -1362,14 +1403,12 @@ class MainWindow:
                         dpg.add_text(fn(s))
                     dpg.add_text(unit)
 
-    def _stations_parent(self) -> int:
+    def _stations_parent(self) -> str:
         """Родительский тег для таблицы станций (вкладка)."""
-        # Таблица создаётся внутри tab "Параметры по сечениям"
-        # Находим родителя динамически
-        return dpg.get_item_info("tbl_stations").get("parent", "main_window") \
-            if dpg.does_item_exist("tbl_stations") else "main_window"
+        return "tab_stations"
 
     def _fill_perf_text(self, perf: RocketPerformance):
+        ActionLogger.info("Заполнение текста тяговых характеристик")
         lines = []
         lines.append("═" * 70)
         lines.append("  ТЯГОВЫЕ ХАРАКТЕРИСТИКИ")
@@ -1415,7 +1454,9 @@ class MainWindow:
         return sorted(indices)
 
     def _refresh_species_view(self):
+        ActionLogger.info("Обновление таблицы состава")
         if self.perf is None:
+            ActionLogger.warning("_refresh_species_view: perf is None")
             return
         stations = self.perf.stations
         comp_idx = self._get_composition_station_indices(stations)
@@ -1439,7 +1480,7 @@ class MainWindow:
             dpg.delete_item("tbl_species")
         with dpg.table(tag="tbl_species", header_row=True,
                        resizable=True, policy=dpg.mvTable_SizingStretchProp,
-                       parent="main_tabs"):
+                       parent="tab_species_container"):
             dpg.add_table_column(label="Компонент")
             for st in comp_stations:
                 dpg.add_table_column(label=st.label)
@@ -1464,7 +1505,9 @@ class MainWindow:
         }
 
     def _redraw_plots(self):
+        ActionLogger.info("Перерисовка графиков")
         if self.perf is None:
+            ActionLogger.warning("_redraw_plots: perf is None")
             return
         ser = section_series(self.perf, self._chamber_length_m(),
                              self._auto_conv_div_lengths())
@@ -1473,8 +1516,11 @@ class MainWindow:
         # Очищаем контейнер графиков
         grp = "plots_group"
         if dpg.does_item_exist(grp):
-            for child in list(dpg.get_item_info(grp)["children"][1]):
-                dpg.delete_item(child)
+            children = dpg.get_item_info(grp).get("children", {})
+            if isinstance(children, dict):
+                for child_list in children.values():
+                    for child in child_list:
+                        dpg.delete_item(child)
 
         x = ser["x_m"]
         keys = [k for k in self._plot_keys if plot_param_value(k, ser) is not None]
@@ -1504,20 +1550,49 @@ class MainWindow:
                 dpg.set_axis_limits(y_axis,
                                     ymin=float(np.nanmin(y)),
                                     ymax=float(np.nanmax(y)))
+                # Theme for line series with color and weight
+                line_series_tag = f"ls_{key}"
+                scatter_series_tag = f"ss_{key}"
                 dpg.add_line_series(list(x), list(y),
-                                    parent=y_axis,
-                                    color=color, weight=int(lw * 100))
+                                    parent=y_axis, tag=line_series_tag)
+                with dpg.theme() as line_theme:
+                    with dpg.theme_component(dpg.mvLineSeries):
+                        dpg.add_theme_color(dpg.mvPlotCol_Line, color)
+                        dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, int(lw * 100))
+                dpg.bind_item_theme(line_series_tag, line_theme)
                 if style["markers"]:
                     dpg.add_scatter_series(list(x), list(y),
-                                           parent=y_axis,
-                                           color=color, weight=1)
+                                           parent=y_axis, tag=scatter_series_tag)
+                    with dpg.theme() as scatter_theme:
+                        with dpg.theme_component(dpg.mvScatterSeries):
+                            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color)
+                            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color)
+                    dpg.bind_item_theme(scatter_series_tag, scatter_theme)
                 if key == "M":
-                    dpg.add_hline_series([1.0], parent=y_axis,
-                                         color=C_MUTED, weight=1)
+                    hl_tag = f"hl_M_{key}"
+                    try:
+                        dpg.add_inf_line_series([1.0], parent=y_axis, tag=hl_tag, horizontal=True)
+                    except Exception as e_inf:
+                        ActionLogger.warning("add_inf_line_series (M) failed", detail=str(e_inf))
+                        hl_tag = None
+                    if hl_tag:
+                        with dpg.theme() as hl_theme:
+                            with dpg.theme_component(dpg.mvLineSeries):
+                                dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                        dpg.bind_item_theme(hl_tag, hl_theme)
                 x_thr = ser.get("x_throat_m")
                 if x_thr is not None:
-                    dpg.add_vline_series([x_thr], parent=y_axis,
-                                         color=C_MUTED, weight=1)
+                    vl_tag = f"vl_throat_{key}"
+                    try:
+                        dpg.add_inf_line_series([x_thr], parent=y_axis, tag=vl_tag, horizontal=False)
+                    except Exception as e_inf:
+                        ActionLogger.warning("add_inf_line_series (throat) failed", detail=str(e_inf))
+                        vl_tag = None
+                    if vl_tag:
+                        with dpg.theme() as vl_theme:
+                            with dpg.theme_component(dpg.mvLineSeries):
+                                dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                        dpg.bind_item_theme(vl_tag, vl_theme)
                 dpg.fit_axis_data(x_axis)
                 dpg.fit_axis_data(y_axis)
 
@@ -1605,10 +1680,16 @@ class MainWindow:
         if dpg.does_item_exist("geom_y"):
             for child in list(dpg.get_item_info("geom_y")["children"][1]):
                 dpg.delete_item(child)
-        dpg.add_line_series(list(x_arr), list(r_arr),
-                            parent="geom_y", color=C_ACCENT, weight=200)
-        dpg.add_line_series(list(x_arr), list(-r_arr),
-                            parent="geom_y", color=C_ACCENT, weight=200)
+        ls_pos = dpg.add_line_series(list(x_arr), list(r_arr),
+                                      parent="geom_y")
+        ls_neg = dpg.add_line_series(list(x_arr), list(-r_arr),
+                                      parent="geom_y")
+        with dpg.theme() as geom_theme:
+            with dpg.theme_component(dpg.mvLineSeries):
+                dpg.add_theme_color(dpg.mvPlotCol_Line, C_ACCENT)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 200)
+        dpg.bind_item_theme(ls_pos, geom_theme)
+        dpg.bind_item_theme(ls_neg, geom_theme)
         dpg.fit_axis_data("geom_x")
         dpg.fit_axis_data("geom_y")
 
@@ -1625,7 +1706,9 @@ class MainWindow:
 
     def on_geometry_from_perf(self):
         if self.perf is None:
+            ActionLogger.warning("Перенос геометрии из расчёта прерван — нет расчёта")
             return
+        ActionLogger.info("Геометрия из расчёта")
         try:
             ar = float(self.perf.stations[-1].Ae_At)
             if math.isfinite(ar) and ar > 1.0:
@@ -1637,8 +1720,10 @@ class MainWindow:
 
     def on_export_geometry_csv(self):
         if self._last_geometry is None:
+            ActionLogger.warning("Экспорт геометрии прерван — контур не построен")
             dpg.set_value("status_text", "Сначала постройте контур сопла.")
             return
+        ActionLogger.info("Экспорт контура сопла в CSV")
         geom = self._last_geometry
         path = os.path.join(os.path.expanduser("~"), "nozzle_contour.csv")
         try:
@@ -1654,6 +1739,7 @@ class MainWindow:
     # ─── Аналитический расчёт ────────────────────────────────────────────
 
     def _on_analytic_compute(self):
+        ActionLogger.info("Аналитический расчёт запущен")
         try:
             inp = AnalyticSizingInput(
                 thrust_vac_N=float(dpg.get_value("sp_an_thrust") or 7.77e6),
@@ -1771,8 +1857,10 @@ class MainWindow:
 
     def on_export_csv(self):
         if self.perf is None:
+            ActionLogger.warning("Экспорт CSV прерван — нет данных расчёта")
             return
         path = os.path.join(os.path.expanduser("~"), "nozzle_export.csv")
+        ActionLogger.info("Экспорт CSV", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
             stations, L_chamber=self._chamber_length_m(),
@@ -1798,8 +1886,10 @@ class MainWindow:
 
     def on_export_amesim(self):
         if self.perf is None:
+            ActionLogger.warning("Экспорт Amesim прерван — нет данных расчёта")
             return
         path = os.path.join(os.path.expanduser("~"), "nozzle_amesim.data")
+        ActionLogger.info("Экспорт Amesim", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
             stations, L_chamber=self._chamber_length_m(),
@@ -1833,7 +1923,9 @@ class MainWindow:
 
     def on_save_config(self):
         if self.mixture_widget is None:
+            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
             return
+        ActionLogger.info("Сохранение конфигурации")
         path = os.path.join(os.path.expanduser("~"), "rpa_config.json")
         cfg = {
             "mixture": self.mixture_widget.get_mixture(),
@@ -1871,6 +1963,7 @@ class MainWindow:
 
     def on_load_config(self):
         path = os.path.join(os.path.expanduser("~"), "rpa_config.json")
+        ActionLogger.info("Загрузка конфигурации", path=path)
         if not os.path.exists(path):
             # Поиск в текущей директории
             path = "rpa_config.json"
@@ -1910,6 +2003,7 @@ class MainWindow:
             dpg.set_value("status_text", f"Ошибка: {e}")
 
     def _about(self):
+        ActionLogger.info("Вызван диалог \"О программе\"")
         dpg.set_value("status_text",
                       f"{APP_NAME} v{APP_VERSION}. "
                       f"Расчёт газодинамики ракетного сопла в равновесном приближении. "
@@ -1949,13 +2043,16 @@ class MainWindow:
         """Проверка загрузки базы (вызывается каждый кадр)."""
         if getattr(self, "_db_loaded", False):
             self._db_loaded = False
+            db_count = len(self.species_db) if self.species_db else 0
+            ActionLogger.info("База NASA-9 загружена", species_count=db_count)
             dpg.set_value("status_text",
                           f"База NASA-9 загружена: "
-                          f"{len(self.species_db) if self.species_db else 0} веществ. Готово.")
+                          f"{db_count} веществ. Готово.")
             self._update_of_from_mixture()
         if getattr(self, "_db_error", None):
             err = self._db_error
             self._db_error = None
+            ActionLogger.error("Ошибка загрузки базы NASA-9", detail=err)
             dpg.set_value("status_text", f"Ошибка загрузки базы: {err}")
 
 
@@ -1977,10 +2074,7 @@ def _load_cyrillic_font():
         return
     with dpg.font_registry():
         font = dpg.add_font(path, 15)
-        # В новых версиях Dear PyGui диапазоны символов добавляются автоматически,
-        # поэтому add_font_range_hint не нужен и может отсутствовать.
-        dpg.add_font_range(0x0370, 0x03FF, parent=font)
-        dpg.add_font_range(0x2080, 0x209F, parent=font)
+        # Диапазоны символов в новых версиях Dear PyGui добавляются автоматически.
     dpg.bind_font(font)
 
 
@@ -1992,8 +2086,18 @@ def _frame_callback(main_win: MainWindow):
     return _cb
 
 
+def _global_excepthook(exc_type, exc_value, exc_traceback):
+    import traceback
+    ActionLogger.error("Необработанное исключение", detail=str(exc_value))
+    ActionLogger.error("Traceback", detail="".join(traceback.format_tb(exc_traceback)))
+
+
 def main():
     """Точка входа GUI на Dear PyGui."""
+    import sys
+    import threading
+    sys.excepthook = _global_excepthook
+    threading.excepthook = _global_excepthook
     dpg.create_context()
 
     # Шрифт с кириллицей — ДО создания виджетов!
@@ -2002,6 +2106,8 @@ def main():
     apply_dark_theme()
 
     main_win = MainWindow()
+    dpg.create_viewport(title=APP_NAME)
+    dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main_window", True)
 

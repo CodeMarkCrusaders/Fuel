@@ -58,6 +58,7 @@ from .core import (
     run_batch, run_interactive, find_thermo_db,
 )
 from .io import IterationLogger, NullLogger
+from .io import IterationLogger, NullLogger, ActionLogger
 from .rocket import (
     Propellant, StationResult, RocketPerformance,
     solve_rocket_nozzle, stoichiometric_OF,
