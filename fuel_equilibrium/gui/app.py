@@ -538,6 +538,9 @@ class MainWindow:
     # ─── Построение UI ───────────────────────────────────────────────────
 
     def _build(self):
+        # Тема акцентных (primary) кнопок создаётся заранее — на неё
+        # ссылаются как кнопка расчёта, так и кнопки во вкладках результатов.
+        self._primary_theme = make_primary_button_theme()
         # Главное окно на весь вьюпорт
         with dpg.window(tag="main_window", label=APP_NAME,
                         no_title_bar=True, no_resize=True,
@@ -573,7 +576,7 @@ class MainWindow:
         при перетаскивании. Благодаря GPU-рендерингу DPG перерисовка
         мгновенна — никакого лага при ресайзе (в отличие от PyQt+Plotly).
         """
-        with dpg.group(parent="main_window", horizontal=True):
+        with dpg.group(parent="main_window", horizontal=True, tag="split_root"):
             # Левая колонка — панель ввода (сплиттер: перетаскиваемая граница)
             dpg.add_child_window(tag="left_panel",
                                  width=self._left_width,
@@ -582,8 +585,9 @@ class MainWindow:
                                  horizontal_scrollbar=False)
             self._build_input_panel()
 
-            # Сплиттер (перетаскиваемая граница)
-            dpg.add_button(tag="vsplit", label="║", width=6, height=-1)
+            # Сплиттер (перетаскиваемая граница). Кнопка-ручка: пока удерживается
+            # ЛКМ (is_item_active), курсор задаёт новую ширину левой панели.
+            dpg.add_button(tag="vsplit", label="|", width=8, height=-1)
             with dpg.theme() as split_theme:
                 with dpg.theme_component(dpg.mvButton):
                     dpg.add_theme_color(dpg.mvThemeCol_Button, C_BORDER)
@@ -592,32 +596,79 @@ class MainWindow:
                     dpg.add_theme_color(dpg.mvThemeCol_Text, C_MUTED)
             dpg.bind_item_theme("vsplit", split_theme)
 
-            # Правая колонка — результаты (вкладки)
-            with dpg.child_window(border=False, autosize_x=True, autosize_y=True):
-                self._build_results_tabs()
+            # Правая колонка — результаты (вкладки) + кнопка расчёта внизу.
+            with dpg.child_window(tag="right_panel", border=False,
+                                  autosize_x=True, autosize_y=True):
+                # Контейнер вкладок занимает всё пространство, кроме нижней
+                # полосы с кнопкой «Рассчитать сопло» (высота отрицательная —
+                # «всё, кроме зарезервированных снизу пикселей»).
+                with dpg.child_window(tag="results_container", border=False,
+                                      autosize_x=True, height=-92):
+                    self._build_results_tabs()
+                # Нижняя панель действий правой колонки
+                self._build_action_bar()
 
-        # Глобальный обработчик перетаскивания сплиттера
-        self._splitter_dragging = False
+        # Глобальные обработчики перетаскивания сплиттеров.
+        # Используем is_item_active (кнопка «активна», пока удерживается ЛКМ —
+        # даже если курсор ушёл с самой кнопки), что делает drag устойчивым.
         with dpg.handler_registry():
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left,
                                        threshold=0,
                                        callback=self._on_splitter_drag)
-            dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left,
-                                          callback=self._on_splitter_release)
 
     def _on_splitter_drag(self):
-        """Перетаскивание вертикального сплиттера — изменение ширины левой панели."""
-        if dpg.is_item_hovered("vsplit") or self._splitter_dragging:
-            self._splitter_dragging = True
+        """Перетаскивание сплиттеров мышью.
+
+        Вертикальный (vsplit): ширина левой панели = X-координата курсора
+        относительно левого края корневой группы.
+        Горизонтальный (hsplit): ширина боковой панели стиля графиков =
+        правый край контейнера графиков − X-координата курсора.
+        """
+        # ── Вертикальный сплиттер: ширина левой панели ──
+        if dpg.does_item_exist("vsplit") and dpg.is_item_active("vsplit"):
             mx = dpg.get_mouse_pos(local=False)[0]
-            # Абсолютная X мыши → новая ширина левой панели
-            new_w = max(320, min(int(mx), 900))
+            try:
+                root_x = dpg.get_item_rect_min("split_root")[0]
+            except Exception:
+                root_x = 0
+            new_w = int(mx - root_x)
+            new_w = max(300, min(new_w, 1100))
             if new_w != self._left_width:
                 self._left_width = new_w
                 dpg.set_item_width("left_panel", self._left_width)
+            return
 
-    def _on_splitter_release(self):
-        self._splitter_dragging = False
+        # ── Горизонтальный сплиттер: ширина панели стиля графиков ──
+        if dpg.does_item_exist("hsplit") and dpg.is_item_active("hsplit"):
+            mx = dpg.get_mouse_pos(local=False)[0]
+            try:
+                cont_min = dpg.get_item_rect_min("plots_row")[0]
+                cont_w = dpg.get_item_rect_size("plots_row")[0]
+                right_edge = cont_min + cont_w
+            except Exception:
+                return
+            new_w = int(right_edge - mx)
+            new_w = max(180, min(new_w, 600))
+            if new_w != self._side_width:
+                self._side_width = new_w
+                if dpg.does_item_exist("style_panel"):
+                    dpg.set_item_width("style_panel", self._side_width)
+                if dpg.does_item_exist("plots_container"):
+                    dpg.set_item_width("plots_container",
+                                       -(self._side_width + 14))
+            return
+
+    def _build_action_bar(self):
+        """Нижняя панель правой колонки: кнопка расчёта + статус/прогресс."""
+        dpg.add_separator()
+        dpg.add_button(tag="btn_calc", label="▶  Рассчитать сопло",
+                       width=-1, height=40,
+                       callback=self.on_calculate)
+        dpg.bind_item_theme("btn_calc", self._primary_theme)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Готово. Введите параметры и нажмите «Рассчитать».",
+                         tag="status_text", color=C_MUTED, wrap=0)
+            dpg.add_text("", tag="progress_text", color=C_ACCENT)
 
     # ─── Панель ввода ────────────────────────────────────────────────────
 
@@ -715,19 +766,8 @@ class MainWindow:
             dpg.add_text("Суммарный ηобщ = 1.0000", tag="lbl_eff_overall",
                          color=C_ACCENT)
 
-        # Кнопка расчёта
-        dpg.add_button(tag="btn_calc", label="▶  Рассчитать сопло",
-                       width=-1, height=40,
-                       callback=self.on_calculate)
-        # Apply primary theme to button
-        self._primary_theme = make_primary_button_theme()
-        dpg.bind_item_theme("btn_calc", self._primary_theme)
-
-        # Статус
-        dpg.add_text("Готово. Введите параметры и нажмите «Рассчитать».",
-                     tag="status_text", color=C_MUTED, wrap=380)
-        # Прогресс-индикатор (скрыт до расчёта)
-        dpg.add_text("", tag="progress_text", color=C_ACCENT)
+        # Кнопка расчёта и статус перенесены в нижнюю панель правой колонки
+        # (_build_action_bar). Здесь больше ничего не добавляем.
 
     def _build_geometry_input(self):
         """Панель геометрии сопла (для оси X и профиля)."""
@@ -828,11 +868,17 @@ class MainWindow:
                 self._build_analytic_tab()
 
     def _build_plots_tab(self):
-        """Вкладка графиков: DPG plot вместо Plotly/matplotlib."""
-        # Панель настройки стиля (сплиттер: графики | настройки)
-        with dpg.group(horizontal=True):
+        """Вкладка графиков: DPG plot вместо Plotly/matplotlib.
+
+        Слева — графики (растягиваются), справа — панель оформления, между
+        ними вертикальный сплиттер (hsplit), ширину которого можно тянуть.
+        """
+        with dpg.group(horizontal=True, tag="plots_row"):
+            # Контейнер графиков растягивается на всё свободное место
+            # (отрицательная ширина = «всё, кроме зарезервированного справа»).
             with dpg.child_window(tag="plots_container",
-                                  border=False, autosize_x=True,
+                                  border=False,
+                                  width=-(self._side_width + 14),
                                   autosize_y=True):
                 # Заголовок-индикатор
                 dpg.add_text("Выполните расчёт сопла, чтобы построить графики.",
@@ -840,22 +886,21 @@ class MainWindow:
                 # Контейнер для plot-виджетов (создаются динамически)
                 with dpg.group(tag="plots_group"):
                     pass
-            # Боковая панель настроек (сплиттер через фиксированную ширину)
+
+            # Вертикальный сплиттер между графиками и панелью стиля
+            dpg.add_button(tag="hsplit", label="|", width=8, height=-1)
+            with dpg.theme() as hsplit_theme:
+                with dpg.theme_component(dpg.mvButton):
+                    dpg.add_theme_color(dpg.mvThemeCol_Button, C_BORDER)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, C_ACCENT)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
+                    dpg.add_theme_color(dpg.mvThemeCol_Text, C_MUTED)
+            dpg.bind_item_theme("hsplit", hsplit_theme)
+
+            # Боковая панель настроек (фиксированная ширина, меняется drag-ом)
             with dpg.child_window(tag="style_panel", border=True,
                                   width=self._side_width, autosize_y=True):
                 self._build_style_panel()
-
-        # Сплиттер между графиками и панелью стиля
-        dpg.add_button(tag="hsplit", label="═", width=-1, height=6)
-        with dpg.theme() as hsplit_theme:
-            with dpg.theme_component(dpg.mvButton):
-                dpg.add_theme_color(dpg.mvThemeCol_Button, C_BORDER)
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, C_ACCENT)
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
-        dpg.bind_item_theme("hsplit", hsplit_theme)
-
-        # Обработчик перетаскивания сплиттера стиля
-        self._hsplit_dragging = False
 
     def _build_style_panel(self):
         """Панель оформления графиков (сплиттер вместо слайдера)."""
