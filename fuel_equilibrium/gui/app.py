@@ -73,6 +73,13 @@ except ImportError:
 APP_NAME = "Rocket Nozzle Calculator"
 APP_VERSION = "2.0"
 
+# Отображаемое имя профиля точности -> внутренний ключ решателя.
+PRECISION_MAP = {
+    "Быстро (грубо)": "fast",
+    "Сбалансировано": "balanced",
+    "Точно (медленно)": "precise",
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Тема (Claude.ai dark)
@@ -234,6 +241,8 @@ class NozzleSolverWorker:
                 chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
                 verbose=False,
                 logger=NullLogger(),
+                precision=p.get("precision", "balanced"),
+                progress_cb=lambda s: self._emit({"type": "progress", "msg": s}),
             )
         return perf
 
@@ -675,6 +684,7 @@ class MainWindow:
             dpg.add_text("Готово. Введите параметры и нажмите «Рассчитать».",
                          tag="status_text", color=C_MUTED, wrap=0)
             dpg.add_text("", tag="progress_text", color=C_ACCENT)
+            dpg.add_text("", tag="iter_text", color=C_MUTED)
 
     # ─── Панель ввода ────────────────────────────────────────────────────
 
@@ -735,6 +745,13 @@ class MainWindow:
                                     min_value=0, max_value=1048)
                 dpg.add_text("Промежуточные сечения распределяются равномерно\n"
                              "по длине сопла (дозвук → горловина → сверхзвук).",
+                             color=C_MUTED, wrap=380)
+                dpg.add_text("Точность расчёта:")
+                dpg.add_combo(
+                    ["Быстро (грубо)", "Сбалансировано", "Точно (медленно)"],
+                    tag="cb_precision", default_value="Сбалансировано", width=-1)
+                dpg.add_text("Грубее точность → меньше итераций и быстрее расчёт.\n"
+                             "«Точно» — максимум итераций, максимальная точность.",
                              color=C_MUTED, wrap=380)
             # Геометрия (для оси X)
             with dpg.collapsing_header(label="Геометрия (Size & Geometry)",
@@ -1356,6 +1373,7 @@ class MainWindow:
             "include_condensed": bool(dpg.get_value("chk_condensed")),
             "injection_velocity": float(dpg.get_value("sp_inj_velocity") or 0.0),
             "chamber_pressure_drop_frac": float(dpg.get_value("sp_chamber_dp") or 0.0) / 100.0,
+            "precision": PRECISION_MAP.get(dpg.get_value("cb_precision"), "balanced"),
         }
 
         self._solver = "cea" if dpg.get_value("rb_cea") else "own"
@@ -1367,6 +1385,7 @@ class MainWindow:
         dpg.configure_item("btn_calc", enabled=False)
         dpg.set_value("status_text", f"Расчёт ({self._solver})... подождите.")
         dpg.set_value("progress_text", "⏳ Выполняется расчёт...")
+        dpg.set_value("iter_text", "")
         of_desc = f"of={of_ratio:.3f}" if of_ratio is not None else "optimize"
         ActionLogger.info(
             "Расчёт запущен",
@@ -1388,7 +1407,14 @@ class MainWindow:
             if msg is None:
                 break
             if msg["type"] == "progress":
-                dpg.set_value("progress_text", f"⏳ {msg['msg']}")
+                m = msg['msg']
+                if "·" in m:
+                    stage, detail = m.split("·", 1)
+                    dpg.set_value("progress_text", f"⏳ {stage.strip()}")
+                    dpg.set_value("iter_text", detail.strip())
+                else:
+                    dpg.set_value("progress_text", f"⏳ {m}")
+                    dpg.set_value("iter_text", "")
             elif msg["type"] == "ok":
                 try:
                     self._on_calc_done(msg["perf"])
@@ -1408,6 +1434,7 @@ class MainWindow:
         self.perf = perf
         dpg.configure_item("btn_calc", enabled=True)
         dpg.set_value("progress_text", "")
+        dpg.set_value("iter_text", "")
         st0 = perf.stations[0]
         dpg.set_value("status_text",
                       f"Готово. Tкамеры = {st0.T_K:.1f} К, "
@@ -1440,6 +1467,7 @@ class MainWindow:
     def _on_calc_failed(self, msg: str):
         dpg.configure_item("btn_calc", enabled=True)
         dpg.set_value("progress_text", "")
+        dpg.set_value("iter_text", "")
         dpg.set_value("status_text", "Ошибка расчёта.")
         dpg.set_value("txt_perf", f"Ошибка расчёта:\n{msg[:2000]}")
         ActionLogger.error("Расчёт завершился ошибкой", detail=msg[:500])
@@ -2098,6 +2126,7 @@ class MainWindow:
             "injection_velocity": float(dpg.get_value("sp_inj_velocity") or 0.0),
             "chamber_pressure_drop": float(dpg.get_value("sp_chamber_dp") or 0.0),
             "solver": self._solver,
+            "precision": dpg.get_value("cb_precision") or "Сбалансировано",
             "L_chamber": float(dpg.get_value("sp_L_chamber") or 0.1),
             "L_star": float(dpg.get_value("sp_L_star") or 1.0),
             "losses": {
@@ -2140,6 +2169,7 @@ class MainWindow:
             dpg.set_value("cb_Pc_unit", cfg.get("Pc_unit", "МПа"))
             dpg.set_value("cb_Pe_unit", cfg.get("Pe_unit", "МПа"))
             dpg.set_value("sp_n_inter", int(cfg.get("n_inter", 8)))
+            dpg.set_value("cb_precision", cfg.get("precision", "Сбалансировано"))
             dpg.set_value("chk_condensed", bool(cfg.get("include_condensed", True)))
             dpg.set_value("sp_inj_velocity", float(cfg.get("injection_velocity", 0.0)))
             dpg.set_value("sp_chamber_dp", float(cfg.get("chamber_pressure_drop", 0.0)))
