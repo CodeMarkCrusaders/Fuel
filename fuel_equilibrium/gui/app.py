@@ -385,8 +385,17 @@ def hampel_filter(y, window=2, n_sigma=3.0):
     return out
 
 
-def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
-    """Единый расчёт параметров газа по сечениям (очищенных от шума)."""
+def section_series(perf, chamber_length_m, conv_div_lengths,
+                   geometry=None) -> dict:
+    """Единый расчёт параметров газа по сечениям (очищенных от шума).
+
+    Если передан ``geometry`` (NozzleGeometry выбранного типа), ось X и
+    нормированный профиль ``r_rel`` берутся С РЕАЛЬНОГО контура этой
+    геометрии (через NozzleGeometry.map_area_ratios). Тогда профиль на
+    графиках газодинамики и кривые параметров соответствуют тому же
+    контуру, что и на вкладке «Геометрия». Без geometry — прежняя
+    обобщённая разбивка (build_axial_coordinates + sqrt(Ae/At)).
+    """
     if perf is None or not getattr(perf, "stations", None):
         return {}
     stations = list(perf.stations)
@@ -404,15 +413,38 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     Ae = np.array([float(getattr(s, "Ae_At", float("inf"))) for s in stations])
     labels = [getattr(s, "label", "") for s in stations]
 
+    # Профиль/ось X по РЕАЛЬНОЙ геометрии выбранного типа: каждому сечению
+    # сопоставляем точку (x, r) на фактическом контуре по Ae/At; ветвь
+    # выбираем по числу Маха станции (V/a > 1 → сверхзвук).
+    geom_r_rel = None
+    if geometry is not None:
+        try:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                M_raw = np.where(a > 0, V / a, 0.0)
+            sup_flags = M_raw > 1.0
+            gx, gr = geometry.map_area_ratios(Ae, supersonic_flags=sup_flags)
+            R_thr = float(getattr(geometry, "R_throat_m", 0.0)) or 1.0
+            gx = np.asarray(gx, dtype=float)
+            gr = np.asarray(gr, dtype=float)
+            if np.all(np.isfinite(gx)) and np.all(np.isfinite(gr)):
+                x = gx
+                geom_r_rel = gr / R_thr
+        except Exception:
+            geom_r_rel = None
+
     order = np.argsort(x, kind="stable")
     x = x[order]; P = P[order]; T = T[order]; rho = rho[order]
     V = V[order]; a = a[order]; gs = gs[order]; Ae = Ae[order]
     labels = [labels[i] for i in order]
+    if geom_r_rel is not None:
+        geom_r_rel = geom_r_rel[order]
     _, iu = np.unique(np.round(x, 9), return_index=True)
     iu = np.sort(iu)
     x = x[iu]; P = P[iu]; T = T[iu]; rho = rho[iu]
     V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
     labels = [labels[i] for i in iu]
+    if geom_r_rel is not None:
+        geom_r_rel = geom_r_rel[iu]
 
     # Решатель газодинамики (rocket/nozzle_flow.py) теперь выдаёт гладкие
     # профили gamma_s/a/M (производные считаются с жёстким допуском и
@@ -430,11 +462,18 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     except Exception:
         i_throat = 0
 
-    with np.errstate(invalid="ignore"):
-        r_rel = np.sqrt(np.clip(Ae, 0.0, None))
-    finite = r_rel[np.isfinite(r_rel)]
-    r_cap = float(np.nanmax(finite)) if finite.size else 1.0
-    r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
+    if geom_r_rel is not None and geom_r_rel.size == Ae.size:
+        # Профиль с реального контура выбранной геометрии (r/R_кр).
+        r_rel = np.asarray(geom_r_rel, dtype=float)
+        finite = r_rel[np.isfinite(r_rel)]
+        r_cap = float(np.nanmax(finite)) if finite.size else 1.0
+        r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
+    else:
+        with np.errstate(invalid="ignore"):
+            r_rel = np.sqrt(np.clip(Ae, 0.0, None))
+        finite = r_rel[np.isfinite(r_rel)]
+        r_cap = float(np.nanmax(finite)) if finite.size else 1.0
+        r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
 
     S = np.array([float(getattr(s, "S_J_per_kgK", float("nan"))) for s in stations])
     H = np.array([float(getattr(s, "H_J_per_kg", float("nan"))) for s in stations])
@@ -541,6 +580,10 @@ class MainWindow:
         # задавалась числовым полем, теперь регулируется перетаскиваемым
         # сплиттером под областью графиков (self._on_plot_height_splitter_drag).
         self._plot_row_h = 280
+        # Ширина одного графика (px). Регулируется вертикальным сплиттером
+        # между колонками. 0 — делить строку поровну (старое поведение);
+        # как только потянут сплиттер ширины, значение фиксируется в px.
+        self._plot_col_w = 0
         self._plot_keys = list(PLOT_DEFAULT_KEYS)
         self._show_profile_1d = False
         self._last_geometry: Optional[NozzleGeometry] = None
@@ -697,24 +740,37 @@ class MainWindow:
                 new_h = max(140, min(new_h, 900))
                 if new_h != self._plot_row_h:
                     self._plot_row_h = new_h
-                    # Меняем высоту уже созданных графиков «на лету» —
-                    # без полной перерисовки, чтобы тянуть было плавно.
-                    grp = "plots_group"
-                    if dpg.does_item_exist(grp):
-                        info = dpg.get_item_info(grp).get("children", {})
-                        if isinstance(info, dict):
-                            for child_list in info.values():
-                                for child in child_list:
-                                    try:
-                                        if dpg.get_item_type(child) == "mvAppItemType::mvPlot":
-                                            dpg.set_item_height(child, self._plot_row_h)
-                                    except Exception:
-                                        pass
+                    # Высота графиков и сплиттеров ширины «на лету».
+                    self._apply_plot_row_height(self._plot_row_h)
             return
         else:
             # Сбрасываем якорь, когда полоса отпущена.
             if getattr(self, "_plot_h_last_y", None) is not None:
                 self._plot_h_last_y = None
+
+        # ── Сплиттер(ы) ширины графиков: граница между колонками ──
+        active_wsplit = self._active_width_splitter()
+        if active_wsplit is not None:
+            mx = dpg.get_mouse_pos(local=False)[0]
+            last = getattr(self, "_plot_w_last_x", None)
+            if last is None:
+                self._plot_w_last_x = mx
+                return
+            dx = mx - last
+            if abs(dx) >= 1.0:
+                self._plot_w_last_x = mx
+                base = int(self._plot_col_w or 0)
+                if base <= 0:
+                    base = self._current_plot_pixel_width()
+                new_w = int(base + dx)
+                new_w = max(220, min(new_w, 1400))
+                if new_w != self._plot_col_w:
+                    self._plot_col_w = new_w
+                    self._apply_plot_col_width(self._plot_col_w)
+            return
+        else:
+            if getattr(self, "_plot_w_last_x", None) is not None:
+                self._plot_w_last_x = None
 
         # ── Горизонтальный сплиттер: ширина панели стиля графиков ──
         if dpg.does_item_exist("hsplit") and dpg.is_item_active("hsplit"):
@@ -735,6 +791,101 @@ class MainWindow:
                     dpg.set_item_width("plots_container",
                                        -(self._side_width + 14))
             return
+
+    # ─── Хелперы сплиттеров графиков ─────────────────────────────────
+    def _iter_plot_items(self):
+        """Генератор всех plot-виджетов в контейнере графиков."""
+        grp = "plots_group"
+        if not dpg.does_item_exist(grp):
+            return
+        info = dpg.get_item_info(grp).get("children", {})
+        if not isinstance(info, dict):
+            return
+        for child_list in info.values():
+            for row in child_list:
+                try:
+                    if dpg.get_item_type(row) == "mvAppItemType::mvPlot":
+                        yield row
+                        continue
+                except Exception:
+                    pass
+                row_info = dpg.get_item_info(row).get("children", {})
+                if isinstance(row_info, dict):
+                    for sub_l in row_info.values():
+                        for item in sub_l:
+                            try:
+                                if dpg.get_item_type(item) == "mvAppItemType::mvPlot":
+                                    yield item
+                            except Exception:
+                                pass
+
+    def _iter_width_splitters(self):
+        """Генератор тегов вертикальных сплиттеров ширины графиков."""
+        grp = "plots_group"
+        if not dpg.does_item_exist(grp):
+            return
+        info = dpg.get_item_info(grp).get("children", {})
+        if not isinstance(info, dict):
+            return
+        for child_list in info.values():
+            for row in child_list:
+                row_info = dpg.get_item_info(row).get("children", {})
+                if isinstance(row_info, dict):
+                    for sub_l in row_info.values():
+                        for item in sub_l:
+                            try:
+                                alias = dpg.get_item_alias(item)
+                            except Exception:
+                                alias = None
+                            if alias and str(alias).startswith("plot_wsplit_"):
+                                yield alias
+
+    def _active_width_splitter(self):
+        """Тег активного (зажатого ЛКМ) сплиттера ширины или None."""
+        for tag in self._iter_width_splitters():
+            try:
+                if dpg.does_item_exist(tag) and dpg.is_item_active(tag):
+                    return tag
+            except Exception:
+                pass
+        return None
+
+    def _current_plot_pixel_width(self):
+        """Фактическая ширина первого графика в px (старт драга)."""
+        for item in self._iter_plot_items():
+            try:
+                w = int(dpg.get_item_rect_size(item)[0])
+                if w > 0:
+                    return w
+            except Exception:
+                pass
+        return 480
+
+    def _apply_plot_row_height(self, h):
+        """Высота всех графиков и сплиттеров ширины на лету."""
+        for item in self._iter_plot_items():
+            try:
+                dpg.set_item_height(item, int(h))
+            except Exception:
+                pass
+        for tag in self._iter_width_splitters():
+            try:
+                dpg.set_item_height(tag, int(h))
+            except Exception:
+                pass
+
+    def _apply_plot_col_width(self, w):
+        """Фиксированная ширина всех графиков на лету."""
+        for item in self._iter_plot_items():
+            try:
+                dpg.set_item_width(item, int(w))
+            except Exception:
+                pass
+
+    def _reset_plot_width(self):
+        """Сброс ширины графиков к авто-доле строки."""
+        self._plot_col_w = 0
+        self._redraw_plots()
 
     def _build_action_bar(self):
         """Нижняя панель правой колонки: кнопка расчёта + статус/прогресс."""
@@ -1026,12 +1177,16 @@ class MainWindow:
         dpg.add_checkbox(label="Профиль сопла на графиках",
                          tag="chk_show_profile", default_value=False,
                          callback=self._on_toggle_profile_1d)
-        dpg.add_text("Высота графиков регулируется сплиттером\n"
-                     "(полоса под графиками — тяните вверх/вниз).",
+        dpg.add_text("Размер каждого графика — сплиттерами:\n"
+                     "• высота: полоса «═» под графиками (вверх/вниз);\n"
+                     "• ширина: вертикальная полоса «|» между колонками\n"
+                     "  (в 2-колоночной раскладке — тяните влево/вправо).",
                      color=C_MUTED, wrap=0)
         dpg.add_combo(["Авто", "1 колонка", "2 колонки"],
                       tag="cb_plot_cols", default_value="Авто",
                       callback=lambda: self._redraw_plots())
+        dpg.add_button(label="↺ Сбросить ширину графиков", width=-1,
+                       callback=self._reset_plot_width)
         dpg.add_separator()
         dpg.add_text("Шрифт/стиль:")
         dpg.add_input_float(label="Толщ. линий", tag="sp_lw",
@@ -1409,6 +1564,20 @@ class MainWindow:
         except Exception:
             return None
 
+    def _series_geometry(self):
+        """Геометрия выбранного типа для согласования профиля и параметров.
+
+        Источник оси X и профиля r/R_кр в section_series, чтобы кривые
+        газодинамики и наложенный профиль соответствовали тому же контуру,
+        что и на вкладке «Геометрия». None → обобщённая разбивка.
+        """
+        if self.perf is None:
+            return None
+        try:
+            return self._build_calc_geometry(self.perf)
+        except Exception:
+            return None
+
     # ─── Расчёт ──────────────────────────────────────────────────────────
 
     def on_calculate(self):
@@ -1727,7 +1896,8 @@ class MainWindow:
             ActionLogger.warning("_redraw_plots: perf is None")
             return
         ser = section_series(self.perf, self._chamber_length_m(),
-                             self._auto_conv_div_lengths())
+                             self._auto_conv_div_lengths(),
+                             geometry=self._series_geometry())
         if not ser:
             return
         # Очищаем контейнер графиков
@@ -1760,17 +1930,47 @@ class MainWindow:
         # Раскладка по колонкам: размещаем графики в строки по ncols штук.
         # Каждая строка — горизонтальная группа; ширина каждого графика
         # делится поровну (-1 «на всю оставшуюся ширину» внутри группы).
+        # Ширина каждого графика: если задан сплиттер ширины
+        # (self._plot_col_w > 0) — фиксированные px одинаково для всех;
+        # иначе старое поведение (1 колонка → -1, иначе делить поровну).
+        col_w = int(getattr(self, "_plot_col_w", 0) or 0)
+        if col_w > 0:
+            plot_w = col_w
+        else:
+            plot_w = -1 if ncols <= 1 else 0
+
         rows = [keys[i:i + ncols] for i in range(0, len(keys), ncols)]
         for r_i, row_keys in enumerate(rows):
             row_tag = f"plot_row_{r_i}"
             with dpg.group(parent=grp, tag=row_tag, horizontal=(ncols > 1)):
-                for key in row_keys:
+                for c_i, key in enumerate(row_keys):
                     self._draw_single_plot(key, ser, x, style, lw, row_h,
-                                           ncols, show_profile, r_rel)
+                                           plot_w, show_profile, r_rel)
+                    # Вертикальный сплиттер ширины между колонками
+                    # (только при 2+ колонках и не после последнего графика).
+                    if ncols > 1 and c_i < len(row_keys) - 1:
+                        wsplit_tag = f"plot_wsplit_{r_i}_{c_i}"
+                        dpg.add_button(tag=wsplit_tag, label="|",
+                                       width=8, height=row_h)
+                        with dpg.theme() as ws_theme:
+                            with dpg.theme_component(dpg.mvButton):
+                                dpg.add_theme_color(dpg.mvThemeCol_Button,
+                                                    C_BORDER)
+                                dpg.add_theme_color(
+                                    dpg.mvThemeCol_ButtonHovered, C_ACCENT)
+                                dpg.add_theme_color(
+                                    dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
+                                dpg.add_theme_color(dpg.mvThemeCol_Text,
+                                                    C_MUTED)
+                        dpg.bind_item_theme(wsplit_tag, ws_theme)
 
-    def _draw_single_plot(self, key, ser, x, style, lw, row_h, ncols,
+    def _draw_single_plot(self, key, ser, x, style, lw, row_h, plot_w,
                           show_profile, r_rel):
-        """Отрисовка одного графика газодинамического параметра."""
+        """Отрисовка одного графика газодинамического параметра.
+
+        ``plot_w`` — ширина графика в px (или -1/0 для авто-доли строки),
+        вычисляется в _redraw_plots с учётом сплиттера ширины.
+        """
         label, unit, color = next((l, u, c) for k, l, u, c in PLOT_PARAM_DEFS if k == key)
         y = plot_param_value(key, ser)
         if y is None:
@@ -1779,8 +1979,6 @@ class MainWindow:
         x_axis = f"plot_{key}_x"
         y_axis = f"plot_{key}_y"
         y2_axis = f"plot_{key}_y2"
-        # При нескольких колонках ширина каждого графика — равная доля строки.
-        plot_w = -1 if ncols <= 1 else 0
         # Флаги сеток: основная/доп. реализуются через no_gridlines у осей и
         # толщину линий (MajorGridSize / MinorGridSize) в теме плота.
         no_grid = not (style["grid_major"] or style["grid_minor"])
@@ -1815,16 +2013,21 @@ class MainWindow:
                                 parent=y_axis, tag=line_series_tag)
             with dpg.theme() as line_theme:
                 with dpg.theme_component(dpg.mvLineSeries):
-                    dpg.add_theme_color(dpg.mvPlotCol_Line, color)
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, int(lw * 100))
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight,
+                                        float(lw),
+                                        category=dpg.mvThemeCat_Plots)
             dpg.bind_item_theme(line_series_tag, line_theme)
             if style["markers"]:
                 dpg.add_scatter_series(list(x), list(y),
                                        parent=y_axis, tag=scatter_series_tag)
                 with dpg.theme() as scatter_theme:
                     with dpg.theme_component(dpg.mvScatterSeries):
-                        dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color)
-                        dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color)
+                        dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color,
+                                            category=dpg.mvThemeCat_Plots)
+                        dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color,
+                                            category=dpg.mvThemeCat_Plots)
                 dpg.bind_item_theme(scatter_series_tag, scatter_theme)
             if key == "M":
                 hl_tag = f"hl_M_{key}"
@@ -1836,7 +2039,8 @@ class MainWindow:
                 if hl_tag:
                     with dpg.theme() as hl_theme:
                         with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
+                                                category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(hl_tag, hl_theme)
             x_thr = ser.get("x_throat_m")
             if x_thr is not None:
@@ -1849,7 +2053,8 @@ class MainWindow:
                 if vl_tag:
                     with dpg.theme() as vl_theme:
                         with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
+                                                category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(vl_tag, vl_theme)
 
             # ── Наложение профиля сопла (r/r_кр) на отдельной правой оси ──
@@ -1869,8 +2074,12 @@ class MainWindow:
                                         parent=y2_axis, tag=prof_bot)
                     with dpg.theme() as prof_theme:
                         with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line, (130, 130, 128, 160))
-                            dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 150)
+                            dpg.add_theme_color(dpg.mvPlotCol_Line,
+                                                (130, 130, 128, 160),
+                                                category=dpg.mvThemeCat_Plots)
+                            dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight,
+                                                1.5,
+                                                category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(prof_top, prof_theme)
                     dpg.bind_item_theme(prof_bot, prof_theme)
                 except Exception as e_prof:
@@ -1894,7 +2103,8 @@ class MainWindow:
             dpg.set_value("status_text", "matplotlib недоступен для экспорта.")
             return
         ser = section_series(self.perf, self._chamber_length_m(),
-                             self._auto_conv_div_lengths())
+                             self._auto_conv_div_lengths(),
+                             geometry=self._series_geometry())
         if not ser:
             return
         # Простой экспорт: все выбранные графики в один PNG
@@ -2022,10 +2232,17 @@ class MainWindow:
                                          parent="geom_y", label=label)
             ls_neg = dpg.add_line_series(list(x_arr), list(-np.asarray(r_arr)),
                                          parent="geom_y")
+            # ВАЖНО: цвет линии серии в ImPlot применяется только с
+            # категорией mvThemeCat_Plots. Без неё серия (и маркер в
+            # легенде) берёт цвет из дефолтной палитры ImPlot — отсюда
+            # расхождение легенды и линий. Цвет в легенде = цвет линии той
+            # серии, у которой задан label (положительная ветвь).
             with dpg.theme() as geom_theme:
                 with dpg.theme_component(dpg.mvLineSeries):
-                    dpg.add_theme_color(dpg.mvPlotCol_Line, color)
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 200)
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 2.0,
+                                        category=dpg.mvThemeCat_Plots)
             dpg.bind_item_theme(ls_pos, geom_theme)
             dpg.bind_item_theme(ls_neg, geom_theme)
         dpg.fit_axis_data("geom_x")
@@ -2365,6 +2582,7 @@ class MainWindow:
                 "show_profile": bool(dpg.get_value("chk_show_profile")),
                 "plot_cols": dpg.get_value("cb_plot_cols") or "Авто",
                 "plot_row_h": int(self._plot_row_h),
+                "plot_col_w": int(self._plot_col_w),
             },
         }
         try:
@@ -2412,6 +2630,7 @@ class MainWindow:
             if dpg.does_item_exist("cb_plot_cols"):
                 dpg.set_value("cb_plot_cols", st.get("plot_cols", "Авто"))
             self._plot_row_h = int(st.get("plot_row_h", self._plot_row_h))
+            self._plot_col_w = int(st.get("plot_col_w", self._plot_col_w))
             self._update_of_from_mixture()
             self._update_overall_efficiency()
             if self.perf is not None:
