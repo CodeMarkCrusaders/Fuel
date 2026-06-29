@@ -584,6 +584,11 @@ class MainWindow:
         # между колонками. 0 — делить строку поровну (старое поведение);
         # как только потянут сплиттер ширины, значение фиксируется в px.
         self._plot_col_w = 0
+        # Темы графиков создаются в корне (Dear PyGui не делает их детьми
+        # plot-виджета), поэтому при удалении графиков они «утекают».
+        # Накапливаем их id здесь и чистим в начале каждой перерисовки —
+        # иначе после нескольких добавлений/переключений рендер деградирует.
+        self._plot_theme_ids: List[int] = []
         self._plot_keys = list(PLOT_DEFAULT_KEYS)
         self._show_profile_1d = False
         self._last_geometry: Optional[NozzleGeometry] = None
@@ -860,6 +865,36 @@ class MainWindow:
             except Exception:
                 pass
         return 480
+
+    def _even_split_plot_width(self, ncols):
+        """Ширина одного графика (px) при равномерном делении строки.
+
+        В горизонтальной группе Dear PyGui не делит ширину автоматически:
+        ``width=0`` даёт график нулевой ширины (графики «исчезают» при
+        переходе в 2-колоночную раскладку). Поэтому вычисляем ширину явно
+        из доступной ширины контейнера графиков с учётом разделителей.
+        """
+        ncols = max(1, int(ncols))
+        avail = 0
+        for tag in ("plots_container", "plots_group"):
+            if dpg.does_item_exist(tag):
+                try:
+                    w = int(dpg.get_item_rect_size(tag)[0])
+                except Exception:
+                    w = 0
+                if w > 0:
+                    avail = w
+                    break
+        if avail <= 0:
+            # Контейнер ещё не отрисован (первый расчёт) — оценка по окну.
+            try:
+                avail = int(dpg.get_viewport_client_width()) - self._side_width - 60
+            except Exception:
+                avail = 900
+        # Вычитаем ширину вертикальных сплиттеров (≈10 px) между колонками.
+        splitters = (ncols - 1) * 10
+        per = int((avail - splitters - 12) / ncols)
+        return max(180, per)
 
     def _apply_plot_row_height(self, h):
         """Высота всех графиков и сплиттеров ширины на лету."""
@@ -1908,6 +1943,15 @@ class MainWindow:
                 for child_list in children.values():
                     for child in child_list:
                         dpg.delete_item(child)
+        # Чистим темы графиков прошлой перерисовки (они живут в корне и не
+        # удаляются вместе с графиками — иначе утечка и деградация рендера).
+        for tid in self._plot_theme_ids:
+            try:
+                if dpg.does_item_exist(tid):
+                    dpg.delete_item(tid)
+            except Exception:
+                pass
+        self._plot_theme_ids = []
 
         x = ser["x_m"]
         keys = [k for k in self._plot_keys if plot_param_value(k, ser) is not None]
@@ -1936,8 +1980,13 @@ class MainWindow:
         col_w = int(getattr(self, "_plot_col_w", 0) or 0)
         if col_w > 0:
             plot_w = col_w
+        elif ncols <= 1:
+            plot_w = -1
         else:
-            plot_w = -1 if ncols <= 1 else 0
+            # 2+ колонки без ручного сплиттера: явно делим доступную ширину
+            # контейнера поровну. Передавать width=0 нельзя — Dear PyGui
+            # отрисует график нулевой ширины, и добавленные графики «не видны».
+            plot_w = self._even_split_plot_width(ncols)
 
         rows = [keys[i:i + ncols] for i in range(0, len(keys), ncols)]
         for r_i, row_keys in enumerate(rows):
@@ -1963,6 +2012,7 @@ class MainWindow:
                                 dpg.add_theme_color(dpg.mvThemeCol_Text,
                                                     C_MUTED)
                         dpg.bind_item_theme(wsplit_tag, ws_theme)
+                        self._plot_theme_ids.append(ws_theme)
 
     def _draw_single_plot(self, key, ser, x, style, lw, row_h, plot_w,
                           show_profile, r_rel):
@@ -1997,6 +2047,7 @@ class MainWindow:
                     dpg.add_theme_style(dpg.mvPlotStyleVar_MinorGridSize,
                                         minor, category=dpg.mvThemeCat_Plots)
             dpg.bind_item_theme(plot_tag, plot_theme)
+            self._plot_theme_ids.append(plot_theme)
 
             dpg.add_plot_axis(dpg.mvXAxis, label="x, м", tag=x_axis,
                               no_gridlines=no_grid)
@@ -2019,6 +2070,7 @@ class MainWindow:
                                         float(lw),
                                         category=dpg.mvThemeCat_Plots)
             dpg.bind_item_theme(line_series_tag, line_theme)
+            self._plot_theme_ids.append(line_theme)
             if style["markers"]:
                 dpg.add_scatter_series(list(x), list(y),
                                        parent=y_axis, tag=scatter_series_tag)
@@ -2029,6 +2081,7 @@ class MainWindow:
                         dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color,
                                             category=dpg.mvThemeCat_Plots)
                 dpg.bind_item_theme(scatter_series_tag, scatter_theme)
+                self._plot_theme_ids.append(scatter_theme)
             if key == "M":
                 hl_tag = f"hl_M_{key}"
                 try:
@@ -2042,6 +2095,7 @@ class MainWindow:
                             dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
                                                 category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(hl_tag, hl_theme)
+                    self._plot_theme_ids.append(hl_theme)
             x_thr = ser.get("x_throat_m")
             if x_thr is not None:
                 vl_tag = f"vl_throat_{key}"
@@ -2056,6 +2110,7 @@ class MainWindow:
                             dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
                                                 category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(vl_tag, vl_theme)
+                    self._plot_theme_ids.append(vl_theme)
 
             # ── Наложение профиля сопла (r/r_кр) на отдельной правой оси ──
             if show_profile and r_rel is not None:
@@ -2082,6 +2137,7 @@ class MainWindow:
                                                 category=dpg.mvThemeCat_Plots)
                     dpg.bind_item_theme(prof_top, prof_theme)
                     dpg.bind_item_theme(prof_bot, prof_theme)
+                    self._plot_theme_ids.append(prof_theme)
                 except Exception as e_prof:
                     ActionLogger.warning("Наложение профиля сопла не удалось",
                                          detail=str(e_prof))
