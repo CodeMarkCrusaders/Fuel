@@ -158,6 +158,67 @@ def make_primary_button_theme() -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Диалоговые окна проводника Windows (tkinter)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _save_file_dialog(title: str, default_name: str, file_types: list) -> Optional[str]:
+    """Открывает диалог сохранения файла через проводник Windows.
+
+    Args:
+        title: Заголовок окна.
+        default_name: Имя файла по умолчанию.
+        file_types: Список кортежей (описание, маска), например
+                    [("CSV files", "*.csv"), ("All files", "*.*")].
+
+    Returns:
+        Путь к выбранному файлу или None, если пользователь отменил диалог.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()  # Скрываем главное окно tkinter
+        root.attributes('-topmost', True)  # Поверх всех окон
+        path = filedialog.asksaveasfilename(
+            title=title,
+            initialfile=default_name,
+            defaultextension=file_types[0][1].replace("*", "") if file_types else "",
+            filetypes=file_types,
+        )
+        root.destroy()
+        return path if path else None
+    except Exception:
+        return None
+
+
+def _open_file_dialog(title: str, file_types: list) -> Optional[str]:
+    """Открывает диалог открытия файла через проводник Windows.
+
+    Args:
+        title: Заголовок окна.
+        file_types: Список кортежей (описание, маска), например
+                    [("JSON files", "*.json"), ("All files", "*.*")].
+
+    Returns:
+        Путь к выбранному файлу или None, если пользователь отменил диалог.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askopenfilename(
+            title=title,
+            filetypes=file_types,
+        )
+        root.destroy()
+        return path if path else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Worker для асинхронного расчёта (threading.Thread вместо QThread)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1727,7 +1788,17 @@ class MainWindow:
             row, col = i // ncols, i % ncols
             axes[row][col].set_visible(False)
         fig.tight_layout()
-        path = os.path.join(os.path.expanduser("~"), "nozzle_plots.png")
+
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Сохранить рисунки как PNG",
+            "nozzle_plots.png",
+            [("PNG files", "*.png"), ("All files", "*.*")],
+        )
+        if path is None:
+            plt.close(fig)
+            return
+
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         dpg.set_value("status_text", f"Рисунок сохранён: {path}")
@@ -1881,16 +1952,25 @@ class MainWindow:
             for gtype, geom in geometries.items():
                 if geom is None:
                     continue
-                fname = f"nozzle_contour_{gtype}.csv"
-                path = os.path.join(os.path.expanduser("~"), fname)
+                # Диалог выбора файла через проводник Windows
+                path = _save_file_dialog(
+                    f"Сохранить контур сопла ({gtype}) как CSV",
+                    f"nozzle_contour_{gtype}.csv",
+                    [("CSV files", "*.csv"), ("All files", "*.*")],
+                )
+                if path is None:
+                    continue
                 with open(path, "w", newline="", encoding="utf-8-sig") as f:
                     wr = csv.writer(f, delimiter=";")
                     wr.writerow(["x_m", "r_m"])
                     for p in geom.points:
                         wr.writerow([f"{p.x_m:.6f}", f"{p.r_m:.6f}"])
-                saved.append(fname)
-            dpg.set_value("status_text",
-                          "Контур(ы) сохранены: " + ", ".join(saved))
+                saved.append(os.path.basename(path))
+            if saved:
+                dpg.set_value("status_text",
+                              "Контур(ы) сохранены: " + ", ".join(saved))
+            else:
+                dpg.set_value("status_text", "Экспорт отменён.")
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка экспорта: {e}")
 
@@ -2017,7 +2097,14 @@ class MainWindow:
         if self.perf is None:
             ActionLogger.warning("Экспорт CSV прерван — нет данных расчёта")
             return
-        path = os.path.join(os.path.expanduser("~"), "nozzle_export.csv")
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Экспорт данных в CSV",
+            "nozzle_export.csv",
+            [("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Экспорт CSV", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
@@ -2046,7 +2133,14 @@ class MainWindow:
         if self.perf is None:
             ActionLogger.warning("Экспорт Amesim прерван — нет данных расчёта")
             return
-        path = os.path.join(os.path.expanduser("~"), "nozzle_amesim.data")
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Экспорт данных в формат Amesim",
+            "nozzle_amesim.data",
+            [("Amesim data files", "*.data"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Экспорт Amesim", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
@@ -2084,7 +2178,14 @@ class MainWindow:
             ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
             return
         ActionLogger.info("Сохранение конфигурации")
-        path = os.path.join(os.path.expanduser("~"), "rpa_config.json")
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Сохранить конфигурацию",
+            "rpa_config.json",
+            [("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         cfg = {
             "mixture": self.mixture_widget.get_mixture(),
             "mix_mode": self._mix_mode(),
@@ -2120,14 +2221,15 @@ class MainWindow:
             dpg.set_value("status_text", f"Ошибка: {e}")
 
     def on_load_config(self):
-        path = os.path.join(os.path.expanduser("~"), "rpa_config.json")
+        ActionLogger.info("Загрузка конфигурации")
+        # Диалог выбора файла через проводник Windows
+        path = _open_file_dialog(
+            "Загрузить конфигурацию",
+            [("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Загрузка конфигурации", path=path)
-        if not os.path.exists(path):
-            # Поиск в текущей директории
-            path = "rpa_config.json"
-            if not os.path.exists(path):
-                dpg.set_value("status_text", "Файл конфигурации не найден.")
-                return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
