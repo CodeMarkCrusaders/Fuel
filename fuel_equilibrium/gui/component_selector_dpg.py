@@ -105,6 +105,7 @@ class ComponentListWidgetDPG:
         self._on_change = on_change  # callback(components_list)
         self._parent = parent_tag
         self._table_tag = f"clw_table_{mode}_{id(self)}"
+        self._selector_dialog: Optional[ComponentSelectorDialogDPG] = None
         self._build()
 
     def _build(self):
@@ -179,6 +180,7 @@ class ComponentListWidgetDPG:
     def _add_component(self, *_):
         """Открыть диалог выбора компонента."""
         if not self.species_db:
+            ActionLogger.warning("Справочник компонентов не загружен", mode=self.mode)
             return
         ActionLogger.info("Открыт диалог выбора компонента",
                           mode="окислитель" if self.mode == "oxidizer" else "горючее")
@@ -190,6 +192,7 @@ class ComponentListWidgetDPG:
 
     def _on_component_selected(self, name: Optional[str]):
         """Колбэк, вызываемый после закрытия диалога выбора компонента."""
+        self._selector_dialog = None
         if name:
             ActionLogger.info("Компонент добавлен", name=name, mode=self.mode)
             self.components.append({"name": name, "mass": 1.0, "T": 0.0})
@@ -332,7 +335,9 @@ class ComponentSelectorDialogDPG:
                            f"Сост.: {sp.aggregate_state_ru}")
                     dpg.set_value(self._tag_details, txt)
                 self._result = name
-                ActionLogger.debug("Компонент выделен в диалоге", name=name, mode=self.mode)
+                ActionLogger.info("Компонент выбран в диалоге", name=name, mode=self.mode)
+                # Один клик по компоненту = подтверждение выбора.
+                self._accept()
         return _cb
 
     def _filter(self, *args):

@@ -239,10 +239,10 @@ class ActionLogger:
         return _LOGGER_INIT_ERROR or ""
 
     @staticmethod
-    def get_entries(limit: int = 300, min_level: str = "INFO", contains: str = "") -> List[LogEntry]:
+    def get_entries(limit: int = 300, min_level: str = "DEBUG", contains: str = "") -> List[LogEntry]:
         """Вернуть записи журнала из памяти (фильтр по уровню и подстроке)."""
         _get_logger()
-        level_no = logging._nameToLevel.get((min_level or "INFO").upper(), logging.INFO)
+        level_no = logging._nameToLevel.get((min_level or "DEBUG").upper(), logging.DEBUG)
         needle = (contains or "").strip().lower()
 
         data = _SINK.get_all()
@@ -262,7 +262,7 @@ class ActionLogger:
         return filtered
 
     @staticmethod
-    def render_entries(limit: int = 300, min_level: str = "INFO", contains: str = "") -> str:
+    def render_entries(limit: int = 300, min_level: str = "DEBUG", contains: str = "") -> str:
         """Вернуть записи журнала одной строкой для текстового виджета."""
         entries = ActionLogger.get_entries(limit=limit, min_level=min_level, contains=contains)
         if not entries:
