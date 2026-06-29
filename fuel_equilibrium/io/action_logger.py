@@ -15,7 +15,7 @@ import logging
 import logging.handlers
 from typing import Optional
 
-_LOG_DIR = os.path.expanduser("~")
+_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 _LOG_FILE = os.path.join(_LOG_DIR, "rpa_action.log")
 _MAX_BYTES = 1_048_576  # 1 МБ
 _BACKUP_COUNT = 1
