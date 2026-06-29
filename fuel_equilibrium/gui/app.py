@@ -1505,6 +1505,8 @@ class MainWindow:
             import traceback
             ActionLogger.error("Traceback", detail=traceback.format_exc())
             dpg.set_value("status_text", f"Ошибка отображения: {e}")
+        finally:
+            ActionLogger.flush("после успешного расчёта")
 
     def _on_calc_failed(self, msg: str):
         dpg.configure_item("btn_calc", enabled=True)
@@ -1512,6 +1514,7 @@ class MainWindow:
         dpg.set_value("status_text", "Ошибка расчёта.")
         dpg.set_value("txt_perf", f"Ошибка расчёта:\n{msg[:2000]}")
         ActionLogger.error("Расчёт завершился ошибкой", detail=msg[:500])
+        ActionLogger.flush("после ошибки расчёта")
 
     # ─── Заполнение таблиц ───────────────────────────────────────────────
 
@@ -2424,11 +2427,14 @@ def main():
 
     # Главный цикл: рендер + опрос фоновых задач
     frame_cb = _frame_callback(main_win)
-    while dpg.is_dearpygui_running():
-        dpg.render_dearpygui_frame()
-        frame_cb()
-
-    dpg.destroy_context()
+    try:
+        while dpg.is_dearpygui_running():
+            dpg.render_dearpygui_frame()
+            frame_cb()
+    finally:
+        ActionLogger.info("Приложение закрывается")
+        ActionLogger.shutdown("закрытие программы")
+        dpg.destroy_context()
 
 
 if __name__ == "__main__":

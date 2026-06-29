@@ -13,7 +13,8 @@ ActionLogger — журнал действий пользователя в GUI.
 import os
 import logging
 import logging.handlers
-from typing import Optional
+import threading
+from typing import Optional, List, Tuple
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 _LOG_FILE = os.path.join(_LOG_DIR, "rpa_action.log")
@@ -21,6 +22,8 @@ _MAX_BYTES = 1_048_576  # 1 МБ
 _BACKUP_COUNT = 1
 
 _LOGGER: Optional[logging.Logger] = None
+_PENDING_RECORDS: List[Tuple[int, str]] = []
+_LOCK = threading.RLock()
 
 
 def _get_logger() -> logging.Logger:
@@ -70,14 +73,14 @@ class ActionLogger:
 
     @staticmethod
     def _log(level: int, action: str, **details) -> None:
-        """Записать сообщение в лог с дополнительными полями."""
-        logger = _get_logger()
+        """Положить сообщение в буфер; запись в файл — через flush()."""
         if details:
             parts = [f"{k}={v!r}" for k, v in details.items()]
             msg = f"{action}  ({'; '.join(parts)})"
         else:
             msg = action
-        logger.log(level, msg)
+        with _LOCK:
+            _PENDING_RECORDS.append((level, msg))
 
     # ── публичные методы ──────────────────────────────────────────────────
 
@@ -100,3 +103,35 @@ class ActionLogger:
     def log_path() -> str:
         """Вернуть путь к текущему файлу лога."""
         return _LOG_FILE
+
+    @staticmethod
+    def flush(reason: str = "") -> None:
+        """Сбросить буфер действий в файл.
+
+        Запись откладывается до ключевых точек:
+        - после завершения расчёта;
+        - при закрытии программы.
+        """
+        with _LOCK:
+            if not _PENDING_RECORDS:
+                return
+            records = list(_PENDING_RECORDS)
+            _PENDING_RECORDS.clear()
+
+        logger = _get_logger()
+        if reason:
+            logger.info("Сброс буфера журнала (%s)", reason)
+        for level, msg in records:
+            logger.log(level, msg)
+
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+
+    @staticmethod
+    def shutdown(reason: str = "") -> None:
+        """Сбросить буфер и завершить подсистему logging."""
+        ActionLogger.flush(reason=reason)
+        logging.shutdown()
