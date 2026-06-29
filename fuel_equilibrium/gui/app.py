@@ -983,7 +983,7 @@ class MainWindow:
                 label=label + (f", {unit}" if unit else ""),
                 tag=f"chk_plot_{key}",
                 default_value=(key in PLOT_DEFAULT_KEYS),
-                callback=lambda s, a, k=key: self._on_plot_param_toggle(k, a),
+                callback=lambda s=None, a=None, u=None, k=key: self._on_plot_param_toggle(k, a),
             )
         dpg.add_separator()
         dpg.add_checkbox(label="Профиль сопла на графиках",
@@ -991,33 +991,33 @@ class MainWindow:
                          callback=self._on_toggle_profile_1d)
         dpg.add_input_int(label="Высота графика (px)", tag="sp_plot_row_h",
                           default_value=280, min_value=160, max_value=600,
-                          callback=lambda: self._redraw_plots())
+                          callback=lambda *_: self._redraw_plots())
         dpg.add_combo(["Авто", "1 колонка", "2 колонки"],
                       tag="cb_plot_cols", default_value="Авто",
-                      callback=lambda: self._redraw_plots())
+                      callback=lambda *_: self._redraw_plots())
         dpg.add_separator()
         dpg.add_text("Шрифт/стиль:")
         dpg.add_input_float(label="Толщ. линий", tag="sp_lw",
                             default_value=1.8, min_value=0.1,
                             max_value=10.0, format="%.1f",
-                            callback=lambda: self._redraw_plots())
+                            callback=lambda *_: self._redraw_plots())
         dpg.add_checkbox(label="Маркеры", tag="chk_markers",
                          default_value=True,
-                         callback=lambda: self._redraw_plots())
+                         callback=lambda *_: self._redraw_plots())
         dpg.add_checkbox(label="Сглаживание", tag="chk_smooth",
                          default_value=False,
-                         callback=lambda: self._redraw_plots())
+                         callback=lambda *_: self._redraw_plots())
         dpg.add_checkbox(label="Основная сетка", tag="chk_grid_major",
                          default_value=True,
-                         callback=lambda: self._redraw_plots())
+                         callback=lambda *_: self._redraw_plots())
         dpg.add_checkbox(label="Доп. сетка", tag="chk_grid_minor",
                          default_value=True,
-                         callback=lambda: self._redraw_plots())
+                         callback=lambda *_: self._redraw_plots())
         dpg.add_checkbox(label="Тёмный фон", tag="chk_dark_plot",
                          default_value=True,
-                         callback=lambda: self._redraw_plots())
+                         callback=lambda *_: self._redraw_plots())
         dpg.add_button(label="↻ Обновить", width=-1,
-                       callback=lambda: self._redraw_plots())
+                       callback=lambda *_: self._redraw_plots())
         dpg.add_button(label="⬇ Сохранить рисунки (PNG)", width=-1,
                        callback=self._save_figures)
 
@@ -1204,14 +1204,17 @@ class MainWindow:
             return
         dpg.set_value("lbl_eff_overall", f"Суммарный ηобщ = {eta_r*eta_n:.4f}")
 
-    def _on_plot_param_toggle(self, key, checked):
+    def _on_plot_param_toggle(self, key, checked=None, *_):
+        if checked is None:
+            checked = bool(dpg.get_value(f"chk_plot_{key}"))
+        checked = bool(checked)
         if checked and key not in self._plot_keys:
             self._plot_keys.append(key)
         elif not checked and key in self._plot_keys:
             self._plot_keys.remove(key)
         self._redraw_plots()
 
-    def _on_toggle_profile_1d(self):
+    def _on_toggle_profile_1d(self, *_):
         self._show_profile_1d = bool(dpg.get_value("chk_show_profile"))
         self._redraw_plots()
 
@@ -1655,7 +1658,7 @@ class MainWindow:
             "dark": bool(dpg.get_value("chk_dark_plot")),
         }
 
-    def _redraw_plots(self):
+    def _redraw_plots(self, *_):
         ActionLogger.info("Перерисовка графиков")
         if self.perf is None:
             ActionLogger.warning("_redraw_plots: perf is None")
@@ -1698,9 +1701,19 @@ class MainWindow:
                 dpg.add_plot_axis(dpg.mvXAxis, label="x, м", tag=x_axis)
                 dpg.add_plot_axis(dpg.mvYAxis,
                                   label=(unit if unit else label), tag=y_axis)
-                dpg.set_axis_limits(y_axis,
-                                    ymin=float(np.nanmin(y)),
-                                    ymax=float(np.nanmax(y)))
+                y_min = float(np.nanmin(y))
+                y_max = float(np.nanmax(y))
+                if not np.isfinite(y_min) or not np.isfinite(y_max):
+                    y_min, y_max = -1.0, 1.0
+                if abs(y_max - y_min) < 1e-12:
+                    pad = max(1e-6, abs(y_min) * 0.05)
+                    y_min -= pad
+                    y_max += pad
+                else:
+                    pad = (y_max - y_min) * 0.03
+                    y_min -= pad
+                    y_max += pad
+                dpg.set_axis_limits(y_axis, ymin=y_min, ymax=y_max)
                 # Theme for line series with color and weight
                 line_series_tag = f"ls_{key}"
                 scatter_series_tag = f"ss_{key}"
@@ -1745,7 +1758,6 @@ class MainWindow:
                                 dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
                         dpg.bind_item_theme(vl_tag, vl_theme)
                 dpg.fit_axis_data(x_axis)
-                dpg.fit_axis_data(y_axis)
 
     def _save_figures(self):
         """Сохранение графиков через matplotlib (экспорт в PNG)."""

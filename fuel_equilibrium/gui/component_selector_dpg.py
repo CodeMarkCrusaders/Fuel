@@ -12,6 +12,20 @@ import dearpygui.dearpygui as dpg
 from ..core.nasa9_parser import Species
 
 
+def _get_slot_children(item_tag: str, slot: int = 1) -> List[int]:
+    """Возвращает детей item_tag из нужного slot для разных версий DPG."""
+    try:
+        info = dpg.get_item_info(item_tag) or {}
+    except Exception:
+        return []
+    children = info.get("children", {})
+    if isinstance(children, dict):
+        return list(children.get(slot, []) or [])
+    if isinstance(children, (list, tuple)) and len(children) > slot:
+        return list(children[slot] or [])
+    return []
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Классификация веществ (перенесено из component_selector.py)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,7 +130,7 @@ class ComponentListWidgetDPG:
     def _refresh_table(self):
         """Перестроить строки таблицы."""
         # Удаляем все дочерние элементы таблицы (строки)
-        for child in list(dpg.get_item_info(self._table_tag)["children"][1]):
+        for child in _get_slot_children(self._table_tag, slot=1):
             dpg.delete_item(child)
 
         for i, comp in enumerate(self.components):
@@ -136,21 +150,21 @@ class ComponentListWidgetDPG:
                                callback=self._make_remove_cb(i))
 
     def _make_mass_cb(self, i):
-        def _cb(s, a):
+        def _cb(s, a, *_):
             if i < len(self.components):
                 self.components[i]["mass"] = float(a)
                 self._notify()
         return _cb
 
     def _make_T_cb(self, i):
-        def _cb(s, a):
+        def _cb(s, a, *_):
             if i < len(self.components):
                 self.components[i]["T"] = float(a)
                 self._notify()
         return _cb
 
     def _make_remove_cb(self, i):
-        def _cb():
+        def _cb(*_):
             if 0 <= i < len(self.components):
                 self.components.pop(i)
                 self._refresh_table()
@@ -161,11 +175,11 @@ class ComponentListWidgetDPG:
         if self._on_change:
             self._on_change(self.get_components())
 
-    def _add_component(self):
+    def _add_component(self, *_):
         """Открыть диалог выбора компонента."""
         if not self.species_db:
             return
-        ComponentSelectorDialogDPG(
+        self._selector_dialog = ComponentSelectorDialogDPG(
             self.species_db, mode=self.mode,
             selected=[c["name"] for c in self.components],
             callback=self._on_component_selected,
@@ -178,14 +192,14 @@ class ComponentListWidgetDPG:
             self._refresh_table()
             self._notify()
 
-    def _remove_selected(self):
+    def _remove_selected(self, *_):
         # В DPG выбор строки через клик; здесь удаляем последнюю как fallback.
         if self.components:
             self.components.pop()
             self._refresh_table()
             self._notify()
 
-    def _normalize_masses(self):
+    def _normalize_masses(self, *_):
         total = sum(c["mass"] for c in self.components)
         if total > 1e-9:
             for c in self.components:
@@ -251,15 +265,15 @@ class ComponentSelectorDialogDPG:
             dpg.add_text("", tag="__cs_details", wrap=580)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="✓ Выбрать",
-                               callback=lambda: self._accept())
+                               callback=lambda *_: self._accept())
                 dpg.add_button(label="✗ Отмена",
-                               callback=lambda: self._cancel())
+                               callback=lambda *_: self._cancel())
         self._populate()
 
     def _populate(self):
         """Заполнить таблицу отфильтрованными компонентами."""
         table = "__cs_table"
-        for child in list(dpg.get_item_info(table)["children"][1]):
+        for child in _get_slot_children(table, slot=1):
             dpg.delete_item(child)
         search = (dpg.get_value("__cs_search") or "").lower().strip()
         fstate = dpg.get_value("__cs_filter") or "Все"
@@ -286,7 +300,7 @@ class ComponentSelectorDialogDPG:
                 dpg.add_text(sp.aggregate_state_ru)
 
     def _make_select_cb(self, name):
-        def _cb(s, a):
+        def _cb(s, a, *_):
             if a:
                 sp = self.species_db.get(name)
                 if sp:
@@ -302,14 +316,14 @@ class ComponentSelectorDialogDPG:
     def _filter(self, *args):
         self._populate()
 
-    def _accept(self):
+    def _accept(self, *_):
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
         if self._callback:
             self._callback(self._result)
 
-    def _cancel(self):
+    def _cancel(self, *_):
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
