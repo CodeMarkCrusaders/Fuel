@@ -24,6 +24,7 @@ import csv
 import math
 import threading
 import queue
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -600,6 +601,9 @@ class MainWindow:
         self._solver = "own"
         # Путь к текущему файлу конфигурации (для быстрого сохранения)
         self._config_path: Optional[str] = None
+        # Журнал в интерфейсе
+        self._last_log_refresh_ts = 0.0
+        self._log_refresh_period_s = 0.35
 
         self._build()
 
@@ -937,6 +941,71 @@ class MainWindow:
             # Группа 4: Аналитический расчёт
             with dpg.tab(label="Аналитический расчёт"):
                 self._build_analytic_tab()
+
+            # Группа 5: Журнал
+            with dpg.tab(label="Логи"):
+                self._build_logs_tab()
+
+    def _build_logs_tab(self):
+        """Вкладка просмотра журналов приложения."""
+        dpg.add_text("Журнал приложения", color=C_ACCENT)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Обновить", callback=lambda: self._refresh_log_view(force=True))
+            dpg.add_button(label="Очистить", callback=self._clear_logs)
+            dpg.add_checkbox(label="Автообновление", tag="chk_logs_autorefresh",
+                             default_value=True, callback=lambda: self._refresh_log_view(force=True))
+            dpg.add_checkbox(label="Показывать DEBUG", tag="chk_logs_debug",
+                             default_value=False, callback=lambda: self._refresh_log_view(force=True))
+        with dpg.group(horizontal=True):
+            dpg.add_input_text(label="Фильтр", tag="ed_logs_filter", width=320,
+                               callback=lambda: self._refresh_log_view(force=True))
+            dpg.add_slider_int(label="Строк", tag="sp_logs_lines", default_value=300,
+                               min_value=50, max_value=5000, width=250,
+                               callback=lambda: self._refresh_log_view(force=True))
+        dpg.add_text("Файл: —", tag="lbl_log_file", color=C_MUTED, wrap=1000)
+        with dpg.child_window(tag="logs_output_child", autosize_x=True, autosize_y=True, border=True):
+            dpg.add_input_text(tag="txt_logs_view", multiline=True, readonly=True,
+                               width=-1, height=-1, default_value="")
+        self._refresh_log_view(force=True)
+
+    def _clear_logs(self):
+        ActionLogger.clear_memory()
+        ActionLogger.info("Журнал очищен пользователем")
+        self._refresh_log_view(force=True)
+
+    def _refresh_log_view(self, force: bool = False):
+        if not dpg.does_item_exist("txt_logs_view"):
+            return
+        if not force and dpg.does_item_exist("chk_logs_autorefresh"):
+            if not bool(dpg.get_value("chk_logs_autorefresh")):
+                return
+
+        limit = int(dpg.get_value("sp_logs_lines") or 300) if dpg.does_item_exist("sp_logs_lines") else 300
+        needle = (dpg.get_value("ed_logs_filter") or "") if dpg.does_item_exist("ed_logs_filter") else ""
+        show_debug = bool(dpg.get_value("chk_logs_debug")) if dpg.does_item_exist("chk_logs_debug") else False
+        min_level = "DEBUG" if show_debug else "INFO"
+
+        text = ActionLogger.render_entries(limit=limit, min_level=min_level, contains=needle)
+        dpg.set_value("txt_logs_view", text)
+
+        if dpg.does_item_exist("lbl_log_file"):
+            dpg.set_value("lbl_log_file", f"Файл: {ActionLogger.log_path()}")
+
+        try:
+            if dpg.does_item_exist("logs_output_child"):
+                dpg.set_y_scroll("logs_output_child", dpg.get_y_scroll_max("logs_output_child"))
+        except Exception:
+            pass
+
+    def _poll_log_view(self):
+        if not dpg.does_item_exist("chk_logs_autorefresh"):
+            return
+        if not bool(dpg.get_value("chk_logs_autorefresh")):
+            return
+        now = time.monotonic()
+        if now - self._last_log_refresh_ts >= self._log_refresh_period_s:
+            self._last_log_refresh_ts = now
+            self._refresh_log_view(force=True)
 
     def _build_plots_tab(self):
         """Вкладка графиков: DPG plot вместо Plotly/matplotlib.
@@ -1458,6 +1527,7 @@ class MainWindow:
                 break
             if msg["type"] == "progress":
                 dpg.set_value("progress_text", f"⏳ {msg['msg']}")
+                ActionLogger.debug("Прогресс расчёта", message=msg["msg"])
             elif msg["type"] == "ok":
                 try:
                     self._on_calc_done(msg["perf"])
@@ -2394,6 +2464,7 @@ def _frame_callback(main_win: MainWindow):
     def _cb():
         main_win._poll_worker()
         main_win._poll_db_load()
+        main_win._poll_log_view()
     return _cb
 
 
