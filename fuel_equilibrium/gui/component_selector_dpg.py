@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import dearpygui.dearpygui as dpg
 
 from ..core.nasa9_parser import Species
+from ..io.action_logger import ActionLogger
 
 
 def _get_slot_children(item_tag: str, slot: int = 1) -> List[int]:
@@ -179,6 +180,8 @@ class ComponentListWidgetDPG:
         """Открыть диалог выбора компонента."""
         if not self.species_db:
             return
+        ActionLogger.info("Открыт диалог выбора компонента",
+                          mode="окислитель" if self.mode == "oxidizer" else "горючее")
         self._selector_dialog = ComponentSelectorDialogDPG(
             self.species_db, mode=self.mode,
             selected=[c["name"] for c in self.components],
@@ -188,18 +191,24 @@ class ComponentListWidgetDPG:
     def _on_component_selected(self, name: Optional[str]):
         """Колбэк, вызываемый после закрытия диалога выбора компонента."""
         if name:
+            ActionLogger.info("Компонент добавлен", name=name, mode=self.mode)
             self.components.append({"name": name, "mass": 1.0, "T": 0.0})
             self._refresh_table()
             self._notify()
+        else:
+            ActionLogger.info("Выбор компонента отменён", mode=self.mode)
 
     def _remove_selected(self, *_):
         # В DPG выбор строки через клик; здесь удаляем последнюю как fallback.
         if self.components:
+            removed = self.components[-1]["name"]
+            ActionLogger.info("Компонент удалён", name=removed, mode=self.mode)
             self.components.pop()
             self._refresh_table()
             self._notify()
 
     def _normalize_masses(self, *_):
+        ActionLogger.info("Нормализация масс компонентов", mode=self.mode)
         total = sum(c["mass"] for c in self.components)
         if total > 1e-9:
             for c in self.components:

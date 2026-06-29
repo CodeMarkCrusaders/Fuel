@@ -1378,6 +1378,7 @@ class MainWindow:
     # ─── Расчёт ──────────────────────────────────────────────────────────
 
     def on_calculate(self):
+        ActionLogger.info("Нажат расчёт сопла")
         if self.mixture_widget is None:
             return
         mixture = self.mixture_widget.get_mixture()
@@ -2110,6 +2111,7 @@ class MainWindow:
     # ─── Экспорт ─────────────────────────────────────────────────────────
 
     def on_export_csv(self):
+        ActionLogger.info("Запущен экспорт CSV")
         if self.perf is None:
             ActionLogger.warning("Экспорт CSV прерван — нет данных расчёта")
             return
@@ -2142,8 +2144,10 @@ class MainWindow:
                          else f"{s.Ae_At:.5f}"),
                     ])
             dpg.set_value("status_text", f"CSV сохранён: {path}")
+            ActionLogger.info("CSV экспортирован успешно", path=path)
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка: {e}")
+            ActionLogger.error("Ошибка экспорта CSV", error=str(e))
 
     def on_export_amesim(self):
         if self.perf is None:
