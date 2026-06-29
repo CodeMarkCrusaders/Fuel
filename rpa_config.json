@@ -9,16 +9,16 @@
     ],
     "fuel_components": [
       {
-        "name": "CH4(L)",
+        "name": "H2(L)",
         "mass": 1.0,
-        "T": 0.0
+        "T": 0
       }
     ]
   },
   "mix_mode": "km",
-  "mix_value": "3,462",
-  "Pc_field": "13,4",
-  "Pe_field": "0,0486",
+  "mix_value": "",
+  "Pc_field": "",
+  "Pe_field": "",
   "Pc_unit": "МПа",
   "Pe_unit": "МПа",
   "n_inter": 8,

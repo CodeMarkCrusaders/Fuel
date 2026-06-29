@@ -2240,8 +2240,8 @@ class MainWindow:
         ActionLogger.info("Сохранение конфигурации как…")
         path = _save_file_dialog(
             "Сохранить конфигурацию как",
-            "rpa_config.json",
-            [("JSON files", "*.json"), ("All files", "*.*")],
+            "config.vika",
+            [("VIKA files", "*.vika"), ("All files", "*.*")],
         )
         if path is None:
             return
@@ -2256,7 +2256,7 @@ class MainWindow:
         ActionLogger.info("Загрузка конфигурации")
         path = _open_file_dialog(
             "Загрузить конфигурацию",
-            [("JSON files", "*.json"), ("All files", "*.*")],
+            [("VIKA files", "*.vika"), ("All files", "*.*")],
         )
         if path is None:
             return
