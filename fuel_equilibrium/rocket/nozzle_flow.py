@@ -776,7 +776,7 @@ def solve_rocket_nozzle(
             T_init=T_chamber * 0.9,
             include_condensed=include_condensed,
             verbose=False,
-            logger=NullLogger(),  # внутрь не пишем — иначе захламит лог
+            logger=logger,
             tol_S=1e-6,
         )
         st = _make_station('throat?', species_list, elements, r, P_try,
@@ -853,7 +853,7 @@ def solve_rocket_nozzle(
             T_init=T_chamber * 0.98,
             include_condensed=include_condensed,
             verbose=False,
-            logger=NullLogger(),
+            logger=logger,
             tol_S=1e-6,
         )
         station_inlet = _make_station(
@@ -900,7 +900,7 @@ def solve_rocket_nozzle(
                 T_init=station_throat.T_K * 0.8,
                 include_condensed=include_condensed,
                 verbose=False,
-                logger=NullLogger(),
+                logger=logger,
                 tol_S=1e-6,
             )
             st = _make_station(

@@ -51,7 +51,7 @@ from ..io.reporting import print_nozzle_table
 from ..core.nasa9_parser import parse_thermo_file
 from ..core.equilibrium import find_thermo_db
 from ..core.equilibrium_cache import clear_cache as clear_equilibrium_cache
-from ..io.iteration_logger import IterationLogger, NullLogger
+from ..io.iteration_logger import IterationLogger
 from ..io.action_logger import ActionLogger
 from .component_selector_dpg import (
     MixturePropellantWidgetDPG,
@@ -73,6 +73,93 @@ except ImportError:
 
 APP_NAME = "Rocket Nozzle Calculator"
 APP_VERSION = "2.0"
+
+
+class ActionIterationLogger(IterationLogger):
+    """Прокси-логгер итераций: пишет все шаги в ActionLogger."""
+
+    def __init__(self, context: str = ""):
+        # Не открываем файловый лог IterationLogger; используем ActionLogger.
+        self.path = None
+        self.also_stdout = False
+        self._fp = None
+        self._t_start = 0.0
+        self._context = context.strip()
+
+    @property
+    def enabled(self) -> bool:  # type: ignore[override]
+        return True
+
+    def _prefix(self) -> str:
+        return f"[{self._context}] " if self._context else ""
+
+    def log(self, message: str = ""):  # type: ignore[override]
+        txt = str(message).rstrip()
+        if txt:
+            ActionLogger.info(f"{self._prefix()}{txt}")
+
+    def section(self, title: str):  # type: ignore[override]
+        self.log(f"===== {title} =====")
+
+    def header_problem(self, problem_type: str, reactants: str,
+                       elements: Dict[str, float], T: Optional[float] = None,
+                       P: Optional[float] = None, H: Optional[float] = None,
+                       S: Optional[float] = None):
+        self.log(
+            f"Постановка: type={problem_type}; reactants={reactants}; "
+            f"T={T}; P={P}; H={H}; S={S}; elements={elements}"
+        )
+
+    def log_species_list(self, names: List[str], n_gas: int, n_cond: int):
+        self.log(f"Кандидаты веществ: gas={n_gas}, condensed={n_cond}, names={names}")
+
+    def inner_iter(self, outer: int, inner: int, gibbs: float, n_vec: np.ndarray,
+                   names: List[str], residual: float = None, top_k: int = 10):
+        top = []
+        if n_vec is not None and names:
+            idx = np.argsort(-n_vec)[:top_k]
+            for k in idx:
+                ni = float(n_vec[k])
+                if ni > 1e-15:
+                    top.append(f"{names[k]}={ni:.6e}")
+        self.log(
+            f"Итерация равновесия: outer={outer}, inner={inner}, G_RT={gibbs:.8e}, "
+            f"residual={residual}, top={', '.join(top)}"
+        )
+
+    def outer_iter(self, outer: int, T: float, target_name: str,
+                   target_value: float, current_value: float, residual_T: float):
+        self.log(
+            f"Внешняя итерация: outer={outer}, T={T:.6f}, target={target_name}, "
+            f"target_value={target_value:.8e}, current_value={current_value:.8e}, "
+            f"delta={residual_T:.8e}"
+        )
+
+    def result_summary(self, converged: bool, iterations: int, T: float, P: float,
+                       H: Optional[float] = None, S: Optional[float] = None,
+                       residual: float = None, gibbs: float = None):
+        self.log(
+            f"Итог равновесия: converged={converged}, iterations={iterations}, "
+            f"T={T:.6f}, P={P:.6f}, H={H}, S={S}, residual={residual}, gibbs={gibbs}"
+        )
+
+    def log_composition(self, names, moles, total_moles, top_k: int = 30):
+        pairs = []
+        if moles is not None and names is not None:
+            arr = np.asarray(moles)
+            idx = np.argsort(-arr)[:top_k]
+            for k in idx:
+                ni = float(arr[k])
+                if ni > 1e-12:
+                    xi = (ni / total_moles) if total_moles > 0 else 0.0
+                    pairs.append(f"{names[k]}: n={ni:.6e}, x={xi:.6e}")
+        self.log(
+            f"Состав смеси: total_moles={total_moles:.6e}, "
+            f"components={'; '.join(pairs)}"
+        )
+
+    def close(self):  # type: ignore[override]
+        return
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -295,7 +382,9 @@ class NozzleSolverWorker:
                 injection_velocity=p.get("injection_velocity", 0.0),
                 chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
                 verbose=False,
-                logger=NullLogger(),
+                logger=ActionIterationLogger(
+                    context=f"solver=own; of={of_ratio:.6f}"
+                ),
             )
         return perf
 
@@ -1456,6 +1545,11 @@ class MainWindow:
         if not mixture.get("ox_components") or not mixture.get("fuel_components"):
             dpg.set_value("status_text",
                           "Укажите хотя бы один компонент окислителя и горючего.")
+            ActionLogger.error(
+                "Расчёт не запущен: отсутствуют компоненты",
+                has_oxidizer=bool(mixture.get("ox_components")),
+                has_fuel=bool(mixture.get("fuel_components")),
+            )
             return
 
         mix_mode = self._mix_mode()
@@ -1480,8 +1574,12 @@ class MainWindow:
         if not optimize_of and of_ratio is None:
             missing.append("соотношение компонентов")
         if missing:
-            dpg.set_value("status_text",
-                          "Не заданы: " + ", ".join(missing))
+            missing_txt = ", ".join(missing)
+            dpg.set_value("status_text", "Не заданы: " + missing_txt)
+            ActionLogger.error(
+                "Расчёт не запущен: отсутствуют входные данные",
+                missing=missing_txt,
+            )
             return
 
         params = {
@@ -1502,6 +1600,10 @@ class MainWindow:
         if self._solver == "own" and self.species_db is None:
             dpg.set_value("status_text",
                           "База NASA-9 ещё не загружена. Подождите 1-2 секунды.")
+            ActionLogger.error(
+                "Расчёт не запущен: база NASA-9 не загружена",
+                solver=self._solver,
+            )
             return
 
         dpg.configure_item("btn_calc", enabled=False)
@@ -1563,6 +1665,7 @@ class MainWindow:
             stations_count=len(perf.stations),
         )
         try:
+            self._log_station_parameters(perf)
             ActionLogger.info("Шаг 1: таблица станций")
             self._fill_stations_table(perf)
             ActionLogger.info("Шаг 2: текст характеристик")
@@ -1571,7 +1674,6 @@ class MainWindow:
             self._refresh_species_view()
             ActionLogger.info("Шаг 4: графики")
             self._redraw_plots()
-            ActionLogger.info("Все шаги отображения завершены")
         except Exception as e:
             ActionLogger.error("Ошибка отображения результатов", detail=str(e))
             import traceback
@@ -1587,6 +1689,36 @@ class MainWindow:
         dpg.set_value("txt_perf", f"Ошибка расчёта:\n{msg[:2000]}")
         ActionLogger.error("Расчёт завершился ошибкой", detail=msg[:500])
         ActionLogger.flush("после ошибки расчёта")
+
+    def _log_station_parameters(self, perf: RocketPerformance):
+        ActionLogger.info("Параметры расчётных сечений")
+        for idx, st in enumerate(perf.stations):
+            ActionLogger.info(
+                "Сечение",
+                index=idx,
+                label=st.label,
+                P_Pa=f"{st.P_Pa:.8e}",
+                T_K=f"{st.T_K:.8e}",
+                H_J_per_kg=f"{st.H_J_per_kg:.8e}",
+                S_J_per_kgK=f"{st.S_J_per_kgK:.8e}",
+                U_J_per_kg=f"{st.U_J_per_kg:.8e}",
+                cp_frozen_J_per_kgK=f"{st.cp_frozen_J_per_kgK:.8e}",
+                cv_frozen_J_per_kgK=f"{st.cv_frozen_J_per_kgK:.8e}",
+                gamma_frozen=f"{st.gamma_frozen:.8e}",
+                cp_eq_J_per_kgK=f"{st.cp_eq_J_per_kgK:.8e}",
+                cv_eq_J_per_kgK=f"{st.cv_eq_J_per_kgK:.8e}",
+                gamma_eq=f"{st.gamma_eq:.8e}",
+                gamma_s=f"{st.gamma_s:.8e}",
+                a_m_per_s=f"{st.a_m_per_s:.8e}",
+                V_m_per_s=f"{st.V_m_per_s:.8e}",
+                M=f"{st.M:.8e}",
+                rho_kg_per_m3=f"{st.rho_kg_per_m3:.8e}",
+                n_moles=f"{st.n_moles:.8e}",
+                mw_g_per_mol=f"{st.mw_g_per_mol:.8e}",
+                R_specific_J_per_kgK=f"{st.R_specific_J_per_kgK:.8e}",
+                Ae_At=f"{st.Ae_At:.8e}",
+                mass_flux_kg_per_m2_s=f"{st.mass_flux_kg_per_m2_s:.8e}",
+            )
 
     # ─── Заполнение таблиц ───────────────────────────────────────────────
 
