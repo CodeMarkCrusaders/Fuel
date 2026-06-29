@@ -15,16 +15,6 @@
 #
 # Замечание о массе:
 #   в расчёте равновесия число молей не сохраняется (диссоциация/рекомбинация),
-#   3) Газодинамика в остальных сечениях — ПО ИЗВЕСТНОЙ ГЕОМЕТРИИ: для каждой
-#      точки контура известна ε = A/A_t; решается SP-задача равновесия при
-#      давлении, обращающем в нуль (ρ_t·V_t)/(ρ·V) − ε (дозв./св.-зв. ветвь).
-#      V = sqrt(2·(H_кам − H)/m), M = V/a, ρ из PV=nRT, Ae/At = ε.
-#
-# Модель: «равновесное» (Equilibrium) течение — состав пересчитывается в
-# каждой точке. Это эталон CEA для idealized rocket performance.
-#
-# Замечание о массе:
-#   в расчёте равновесия число молей не сохраняется (диссоциация/рекомбинация),
 #   а масса сохраняется. Все «удельные» величины пересчитываются на 1 кг смеси.
 
 import math
@@ -32,7 +22,7 @@ import os
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from scipy.optimize import brentq
 
 from ..core.nasa9_parser import Species, parse_thermo_file, get_products_for_elements
@@ -47,7 +37,6 @@ from ..core.gibbs_solver import (
 )
 from ..io.iteration_logger import IterationLogger, NullLogger
 from ..core.formula_parser import parse_formula
-from .nozzle_geometry import build_nozzle_geometry, NozzleGeometry
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +103,6 @@ class RocketPerformance:
     Isp_vac_s: float               # вакуумный удельный импульс
     CF: float                      # коэффициент тяги
     stations: List[StationResult]
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -271,27 +259,6 @@ def mixture_gamma_frozen(
 # будучи поделён на малый шаг 2·ΔT, даёт «зубья» на gamma_s → a → M=V/a.
 # Поэтому именно под-задачи для производных решаем с жёстким допуском.
 _FD_FTOL = 1e-11
-
-# Профили точности расчёта (оптимизация по скорости/детализации):
-#   fast     — грубо, минимум итераций (быстрый предпросмотр);
-#   balanced — по умолчанию (ранее зашитые допуски);
-#   precise  — жёсткие допуски, максимум итераций (макс. точность, медленнее).
-# Под-задачи численных производных всегда решаются с жёстким _FD_FTOL
-# независимо от профиля (иначе на профиле M появляются «зубья»).
-PRECISION_PROFILES = {
-    'fast':     {'ftol': 1e-4,  'tol_H': 1e-3, 'tol_S': 1e-3},
-    'balanced': {'ftol': 1e-6,  'tol_H': 1e-5, 'tol_S': 1e-6},
-    'precise':  {'ftol': 1e-10, 'tol_H': 1e-7, 'tol_S': 1e-8},
-}
-
-
-def _precision_profile(precision):
-    if precision not in PRECISION_PROFILES:
-        raise ValueError(
-            f"Неизвестный профиль точности '{precision}'. "
-            f"Доступные: {sorted(PRECISION_PROFILES)}"
-        )
-    return PRECISION_PROFILES[precision]
 
 
 def _solve_fd_point(species_list, element_abundances, T, P, n_warm):
@@ -534,127 +501,6 @@ def _make_station(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Замороженный (frozen) состав для промежуточных сечений.
-#
-# Между ОСНОВНЫМИ опорными сечениями (Инжектор / Горловина / Срез) состав НЕ
-# пересчитывается равновесно — он «замораживается»:
-#   • дозвук (Инжектор → Горловина): состав = состав КАМЕРЫ;
-#   • сверхзвук (Горловина → Срез):  состав = состав ГОРЛОВИНЫ.
-# Это физически оправдано (химическая «заморозка» при быстром расширении) и
-# кратно ускоряет расчёт: вместо SLSQP-минимизации Гиббса в каждой точке
-# решается лишь одномерный поиск T по изэнтропе S_frozen(T,P)=S_target.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _frozen_isentropic_temperature(
-    species_list, moles, S_target, P, T_init,
-):
-    """T, при которой замороженный состав даёт энтропию S_target.
-
-    S_frozen(T,P) монотонно растёт по T (dS/dT = Cp/T > 0), поэтому корень
-    ищется методом Брента над расширяющимся интервалом вокруг T_init.
-    Возвращает None, если не удалось зажать корень.
-    """
-    moles = np.asarray(moles, dtype=float)
-
-    def dS(T):
-        return mixture_entropy(species_list, moles, T, P) - S_target
-
-    T_lo = max(T_init * 0.5, 50.0)
-    T_hi = T_init * 1.5
-    f_lo = dS(T_lo)
-    f_hi = dS(T_hi)
-    expand = 0
-    while f_lo * f_hi > 0 and expand < 30:
-        if f_hi < 0:
-            T_hi *= 1.15
-            f_hi = dS(T_hi)
-        elif f_lo > 0:
-            T_lo *= 0.9
-            f_lo = dS(T_lo)
-        else:
-            break
-        expand += 1
-    if f_lo * f_hi > 0:
-        return None
-    try:
-        return brentq(dS, T_lo, T_hi, xtol=1e-3, rtol=1e-7, maxiter=100)
-    except Exception:
-        return None
-
-
-def _make_frozen_station(
-    label, species_list, moles, T, P, total_mass_g, H_chamber_per_kg,
-):
-    """Сечение с ЗАМОРОЖЕННЫМ составом при (T, P).
-
-    Все теплофизические свойства — замороженные (Cp/Cv/gamma_frozen); скорость
-    звука a = sqrt(gamma_frozen · R_spec · T). Равновесные поля для
-    согласованности интерфейса приравнены к замороженным.
-    """
-    sp_list = species_list
-    n = np.asarray(moles, dtype=float)
-    mass_g = sum(n[i] * sp_list[i].mol_weight for i in range(len(sp_list)))
-    mass_kg = mass_g / 1000.0
-    n_total = float(n.sum())
-    n_gas = sum(n[i] for i, sp in enumerate(sp_list) if sp.is_gas)
-    mw_g_per_mol = mass_g / max(n_total, 1e-30)
-
-    H = mixture_enthalpy(sp_list, n, T)
-    S = mixture_entropy(sp_list, n, T, P)
-    H_per_kg = H / mass_kg
-    S_per_kg = S / mass_kg
-
-    R_spec = R_UNIVERSAL / (mw_g_per_mol / 1000.0)
-    rho = P / (R_spec * T)
-
-    cp_f, cv_f, gamma_f = mixture_gamma_frozen(sp_list, n, T, P)
-    cp_f_per_kg = cp_f / mass_kg
-    cv_f_per_kg = cv_f / mass_kg
-
-    a_eq = math.sqrt(gamma_f * R_spec * T)
-    dh = H_chamber_per_kg - H_per_kg
-    V = math.sqrt(max(2.0 * dh, 0.0))
-    M = V / a_eq if a_eq > 0 else 0.0
-    U_per_kg = H_per_kg - P / rho if rho > 0 else H_per_kg
-
-    xi = np.zeros(len(sp_list))
-    if n_gas > 0:
-        for i, sp in enumerate(sp_list):
-            if sp.is_gas:
-                xi[i] = n[i] / n_gas
-    mf = np.zeros(len(sp_list))
-    for i, sp in enumerate(sp_list):
-        mf[i] = n[i] * sp_list[i].mol_weight / max(mass_g, 1e-30)
-
-    return StationResult(
-        label=label,
-        P_Pa=P, T_K=T,
-        H_J_per_kg=H_per_kg, S_J_per_kgK=S_per_kg,
-        U_J_per_kg=U_per_kg,
-        cp_frozen_J_per_kgK=cp_f_per_kg,
-        cv_frozen_J_per_kgK=cv_f_per_kg,
-        gamma_frozen=gamma_f,
-        cp_eq_J_per_kgK=cp_f_per_kg,
-        cv_eq_J_per_kgK=cv_f_per_kg,
-        gamma_eq=gamma_f,
-        gamma_s=gamma_f,
-        a_m_per_s=a_eq,
-        V_m_per_s=V,
-        M=M,
-        rho_kg_per_m3=rho,
-        n_moles=n_total / mass_kg,
-        mw_g_per_mol=mw_g_per_mol,
-        R_specific_J_per_kgK=R_spec,
-        Ae_At=float('nan'),
-        mass_flux_kg_per_m2_s=rho * V,
-        moles=n.copy(),
-        mole_fractions=xi,
-        mass_fractions=mf,
-        species_names=[sp.name for sp in sp_list],
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Распределение промежуточных сечений по зонам сопла
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -777,292 +623,6 @@ def _resolve_worker_count(n_tasks: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Расчёт сечений по ИЗВЕСТНОЙ ГЕОМЕТРИИ (метод «площадь → состояние»)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Для каждой точки контура сопла известна ε = A/A_t (из геометрии). Состояние
-# газа определяется из сохранения массового расхода:
-#     m_dot = ρ·V·A = ρ_t·V_t·A_t   ⇒   A/A_t = (ρ_t·V_t)/(ρ·V) = ε.
-# Для заданного ε решается SP-задача равновесного расширения (S = S_камеры) при
-# давлении P, обращающем (ρ_t·V_t)/(ρ(P)·V(P)) − ε в ноль. Уравнение A/A_t=f(P)
-# имеет минимум 1 в горловине и две ветви:
-#   • дозвуковая (P > P_throat);
-#   • сверхзвуковая (P < P_throat).
-# Корень ищется методом Брента на нужной ветви.
-
-
-def _solve_station_for_area_ratio_frozen(
-    eps_target, branch,
-    species_list,
-    S_target_total, H_chamber_per_kg,
-    flux_throat, P_throat, P_exit, P_chamber,
-    mass_total_g,
-    n_ref,            # замороженный состав (моли) для данной ветви
-    T_init,
-    label='Section',
-):
-    """Замороженный аналог _solve_station_for_area_ratio.
-
-    Для заданной ε = A/A_t на нужной ветви (sub/sup) ищется давление P, при
-    котором массовый поток ρ·V даёт требуемую ε. В каждой пробной точке
-    состояние строится по ЗАМОРОЖЕННОМУ составу n_ref (без SLSQP).
-    """
-    if flux_throat <= 1e-30:
-        return None
-    eps_target = max(float(eps_target), 1.0 + 1e-4)
-    n_ref = np.asarray(n_ref, dtype=float)
-    holder = {}
-
-    def _station_at(P):
-        T = _frozen_isentropic_temperature(
-            species_list, n_ref, S_target_total, float(P), T_init,
-        )
-        if T is None:
-            T = T_init
-        st = _make_frozen_station(
-            label, species_list, n_ref, T, float(P),
-            mass_total_g, H_chamber_per_kg,
-        )
-        holder['st'] = st
-        return st
-
-    def _residual(P):
-        st = _station_at(P)
-        eps_calc = flux_throat / max(st.mass_flux_kg_per_m2_s, 1e-30)
-        return eps_calc - eps_target
-
-    if branch == 'sub':
-        P_lo = P_throat * (1.0 + 1e-4)
-        P_hi = P_chamber * 0.9999
-    else:
-        P_lo = max(P_exit * (1.0 + 1e-5), 1.0)
-        P_hi = P_throat * (1.0 - 1e-4)
-    if P_lo >= P_hi:
-        return None
-
-    try:
-        f_lo = _residual(P_lo)
-        f_hi = _residual(P_hi)
-    except Exception:
-        return None
-
-    expand = 0
-    while f_lo * f_hi > 0 and expand < 6:
-        if branch == 'sub':
-            P_hi = min(P_hi * 1.05 + 1e3, P_chamber * 0.99999)
-        else:
-            P_lo = max(P_lo * 0.95, P_exit * 1.0001)
-        if P_lo >= P_hi:
-            break
-        try:
-            f_lo = _residual(P_lo)
-            f_hi = _residual(P_hi)
-        except Exception:
-            return None
-        expand += 1
-    if f_lo * f_hi > 0:
-        return None
-
-    try:
-        brentq(_residual, P_lo, P_hi,
-               xtol=max(P_chamber * 1e-7, 1e-3), rtol=1e-6, maxiter=80)
-    except Exception:
-        return None
-
-    return holder.get('st') if holder.get('st') is not None else _station_at(
-        0.5 * (P_lo + P_hi)
-    )
-
-
-def _sample_interior_indices(n_total, n_pick):
-    """Индексы строго между 0 и n_total-1, равномерно выбираемые из контура
-    (конечные точки — опорные сечения: горловина, срез/вход)."""
-    if n_total <= 2 or n_pick <= 0:
-        return []
-    n_pick = min(n_pick, n_total - 2)
-    return [int(round((i + 1) * (n_total - 1) / (n_pick + 1))) for i in range(n_pick)]
-
-
-def _solve_station_for_area_ratio(
-    eps_target, branch,
-    species_list, element_abundances,
-    S_target_total, H_chamber_per_kg,
-    flux_throat, P_throat, P_exit, P_chamber,
-    mass_total_g, include_condensed,
-    T_throat, T_chamber, label,
-    logger=None,
-    tol_S=1e-6,
-):
-    """Возвращает сечение с относительной площадью A/A_t = eps_target.
-
-    branch = 'sub' — дозвуковая ветвь (P ∈ (P_throat, P_chamber));
-    branch = 'sup' — сверхзвуковая ветвь (P ∈ (P_exit, P_throat)).
-    Состояние — SP-равновесие (S = S_камеры). При невозможности найти корень
-    (ε вне охвата ветви) возвращается None.
-    """
-    if logger is None:
-        logger = NullLogger()
-    if flux_throat <= 1e-30:
-        return None
-    eps_target = max(float(eps_target), 1.0 + 1e-4)
-    holder = {}
-
-    def _station_at(P):
-        r = solve_equilibrium_SP(
-            species_list=species_list,
-            element_abundances=element_abundances,
-            S_target=S_target_total, P=float(P),
-            T_init=(T_chamber * 0.97) if branch == 'sub' else (T_throat * 0.85),
-            include_condensed=include_condensed,
-            verbose=False, logger=NullLogger(), tol_S=tol_S,
-        )
-        st = _make_station(label, species_list, element_abundances, r, float(P),
-                           mass_total_g, H_chamber_per_kg)
-        holder['st'] = st
-        return st
-
-    def _residual(P):
-        st = _station_at(P)
-        eps_calc = flux_throat / max(st.mass_flux_kg_per_m2_s, 1e-30)
-        return eps_calc - eps_target
-
-    if branch == 'sub':
-        P_lo = P_throat * (1.0 + 1e-4)
-        P_hi = P_chamber * 0.9999
-    else:
-        P_lo = max(P_exit * (1.0 + 1e-5), 1.0)
-        P_hi = P_throat * (1.0 - 1e-4)
-    if P_lo >= P_hi:
-        return None
-
-    try:
-        f_lo = _residual(P_lo)
-        f_hi = _residual(P_hi)
-    except Exception:
-        return None
-
-    expand = 0
-    while f_lo * f_hi > 0 and expand < 6:
-        if branch == 'sub':
-            P_hi = min(P_hi * 1.05 + 1e3, P_chamber * 0.99999)
-        else:
-            P_lo = max(P_lo * 0.95, P_exit * 1.0001)
-        if P_lo >= P_hi:
-            break
-        try:
-            f_lo = _residual(P_lo)
-            f_hi = _residual(P_hi)
-        except Exception:
-            return None
-        expand += 1
-    if f_lo * f_hi > 0:
-        return None
-
-    try:
-        brentq(_residual, P_lo, P_hi,
-               xtol=max(P_chamber * 1e-7, 1e-3), rtol=1e-6, maxiter=80)
-    except Exception:
-        return None
-
-    st = holder.get('st')
-    if st is None:
-        return None
-    st.Ae_At = float(eps_target)
-    return st
-
-
-def _geometry_stations_from_contour(
-    geometry, n_intermediate_stations,
-    species_list, element_abundances,
-    S_target_total, H_chamber_per_kg,
-    flux_throat, P_throat, P_exit, P_chamber,
-    mass_total_g, include_condensed,
-    T_throat, T_chamber, logger,
-    tol_S=1e-6, progress_cb=None,
-    n_ref_sub=None, n_ref_sup=None,
-):
-    """По контуру сопла строит промежуточные сечения «по известной геометрии».
-
-    Возвращает (сечения_до_горловины, сечения_после_горловины, геометрия).
-    Каждое сечение соответствует точке контура с известной ε = (r/R_кр)².
-    """
-    sub_pts = list(getattr(geometry, 'points_subsonic', None) or [])
-    sup_pts = list(getattr(geometry, 'points_supersonic', None) or [])
-    R_t = geometry.R_throat_m
-    n_total = int(max(0, min(1048, n_intermediate_stations)))
-    if n_total <= 0 or (not sub_pts and not sup_pts):
-        return [], [], geometry
-
-    n_sub_side = len(sub_pts)
-    n_sup_side = len(sup_pts)
-    n_side_total = max(n_sub_side + n_sup_side, 1)
-    n_pick_sub = int(round(n_total * n_sub_side / n_side_total))
-    n_pick_sup = n_total - n_pick_sub
-    idx_sub = _sample_interior_indices(n_sub_side, n_pick_sub) if n_sub_side > 2 else []
-    idx_sup = _sample_interior_indices(n_sup_side, n_pick_sup) if n_sup_side > 2 else []
-
-    tasks = []
-    seq = 0
-    for i in idx_sub:
-        seq += 1
-        tasks.append((seq, (sub_pts[i].r_m / R_t) ** 2, 'sub'))
-    for i in idx_sup:
-        seq += 1
-        tasks.append((seq, (sup_pts[i].r_m / R_t) ** 2, 'sup'))
-
-    _done = [0]
-    _ntasks = len(tasks)
-
-    # Замороженный состав для ветвей: по умолчанию — состав камеры (дозвук)
-    # и состав горловины (сверхзвук). Это главный источник ускорения: ни в одной
-    # промежуточной точке не запускается SLSQP-минимизация Гиббса.
-    _n_ref = {'sub': n_ref_sub, 'sup': n_ref_sup}
-    _T_init = {'sub': T_chamber * 0.97, 'sup': T_throat * 0.85}
-
-    def _compute(args):
-        k, eps, branch = args
-        st = _solve_station_for_area_ratio_frozen(
-            eps_target=eps, branch=branch,
-            species_list=species_list,
-            S_target_total=S_target_total, H_chamber_per_kg=H_chamber_per_kg,
-            flux_throat=flux_throat, P_throat=P_throat,
-            P_exit=P_exit, P_chamber=P_chamber,
-            mass_total_g=mass_total_g,
-            n_ref=_n_ref[branch], T_init=_T_init[branch],
-            label=f'Section {k}',
-        )
-        _done[0] += 1
-        if progress_cb:
-            try:
-                progress_cb(f"Промежуточные сечения · готово {_done[0]}/{_ntasks}")
-            except Exception:
-                pass
-        return k, branch, st
-
-    n_workers = _resolve_worker_count(_ntasks)
-    if n_workers > 1 and len(tasks) > 1:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            results = list(pool.map(_compute, tasks))
-    else:
-        results = [_compute(t) for t in tasks]
-
-    pre_throat, post_throat = [], []
-    for k, branch, st in results:
-        if st is None:
-            continue
-        (pre_throat if branch == 'sub' else post_throat).append(st)
-
-    pre_throat.sort(key=lambda x: x.P_Pa, reverse=True)
-    post_throat.sort(key=lambda x: x.P_Pa, reverse=True)
-
-    if logger.enabled:
-        logger.log(f'Газодинамика по известной геометрии: '
-                   f'{len(pre_throat)} дозв. + {len(post_throat)} св./зв. сечений, '
-                   f'{n_workers} поток(ов)')
-    return pre_throat, post_throat, geometry
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Основная функция: расчёт сопла «от Pc до Pe» с произвольным числом сечений
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1082,12 +642,6 @@ def solve_rocket_nozzle(
     verbose: bool = False,
     logger: Optional[IterationLogger] = None,
     max_gas_species: int = 60,
-    geometry_method: str = "profiled",
-    R_throat_m: float = 1.0,
-    R_chamber_factor: float = 2.5,
-    geometry_kwargs: Optional[Dict[str, Any]] = None,
-    precision: str = "balanced",
-    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> RocketPerformance:
     """Полный расчёт ракетного сопла в равновесном приближении.
 
@@ -1108,29 +662,11 @@ def solve_rocket_nozzle(
                              на «Nozzle inlet» становится больше V_впр.
         species_db      — база NASA-9.
         logger          — куда писать журнал итераций.
-        precision       — 'fast' | 'balanced' | 'precise': профиль точности
-                          (допуски ftol/tol_H/tol_S); грубее → меньше итераций
-                          и быстрее расчёт.
-        progress_cb     — необязательный колбэк progress_cb(str): вызывается в
-                          ключевых точках с сообщением о текущем этапе и номере
-                          итерации (для индикации хода расчёта).
 
     Возвращает RocketPerformance со списком сечений и тяговыми характеристиками.
     """
     if logger is None:
         logger = NullLogger()
-
-    prof = _precision_profile(precision)
-
-    def _emit(msg):
-        if progress_cb:
-            try:
-                progress_cb(msg)
-            except Exception:
-                pass
-
-    _n_stages = 5 if n_intermediate_stations > 0 else 4
-    _emit(f"Этап 1/{_n_stages}: подготовка реагентов и элементного баланса…")
 
     n_intermediate_stations = int(max(0, min(1048, n_intermediate_stations)))
 
@@ -1167,7 +703,6 @@ def solve_rocket_nozzle(
         logger.log(f'Pc = {P_chamber:.0f} Па  ({P_chamber/1e6:.4f} МПа)')
         logger.log(f'Pe = {P_exit:.0f} Па  ({P_exit/1e6:.4f} МПа)')
 
-    _emit("Этап 2: отбор веществ-продуктов (кандидатов)…")
     # ── 2) Подбор веществ-продуктов ────────────────────────────────────
     candidates = get_products_for_elements(
         species_db, set(elements.keys()),
@@ -1188,7 +723,6 @@ def solve_rocket_nozzle(
     if logger.enabled:
         logger.section('Сечение 1/N: КАМЕРА (Injector) — HP-задача')
 
-    _emit(f"Этап 3/{_n_stages}: камера (HP-задача, профиль '{precision}')…")
     chamber = solve_equilibrium_HP(
         species_list=species_list,
         element_abundances=elements,
@@ -1198,8 +732,7 @@ def solve_rocket_nozzle(
         include_condensed=include_condensed,
         verbose=verbose,
         logger=logger,
-        tol_H=prof['tol_H'],
-        progress_cb=progress_cb,
+        tol_H=1e-5,
     )
     H_chamber_total = chamber.enthalpy
     H_chamber_static_per_kg = H_chamber_total / mass_total_kg
@@ -1234,12 +767,8 @@ def solve_rocket_nozzle(
     if logger.enabled:
         logger.section('Сечение: ГОРЛОВИНА (Throat) — поиск M=1')
 
-    _throat_iter = [0]
-
     def throat_residual(P_try: float) -> Tuple[float, EquilibriumResult]:
         """Для пробного P в горловине решаем SP-задачу и считаем M-1."""
-        _throat_iter[0] += 1
-        _emit(f"Горловина (Throat) · поиск M=1: итерация {_throat_iter[0]} (P={P_try/1e6:.4f} МПа)")
         r = solve_equilibrium_SP(
             species_list=species_list,
             element_abundances=elements,
@@ -1248,7 +777,7 @@ def solve_rocket_nozzle(
             include_condensed=include_condensed,
             verbose=False,
             logger=NullLogger(),  # внутрь не пишем — иначе захламит лог
-            tol_S=prof['tol_S'],
+            tol_S=1e-6,
         )
         st = _make_station('throat?', species_list, elements, r, P_try,
                            mass_total_g, H_chamber_per_kg)
@@ -1296,7 +825,6 @@ def solve_rocket_nozzle(
     if logger.enabled:
         logger.section('Сечение: СРЕЗ СОПЛА (Nozzle exit) — SP-задача')
 
-    _emit(f"Этап 4/{_n_stages}: срез сопла (SP-задача)…")
     exit_eq = solve_equilibrium_SP(
         species_list=species_list,
         element_abundances=elements,
@@ -1305,8 +833,7 @@ def solve_rocket_nozzle(
         include_condensed=include_condensed,
         verbose=verbose,
         logger=logger,
-        tol_S=prof['tol_S'],
-        progress_cb=progress_cb,
+        tol_S=1e-6,
     )
     station_exit = _make_station(
         'Nozzle exit', species_list, elements, exit_eq, P_exit,
@@ -1327,7 +854,7 @@ def solve_rocket_nozzle(
             include_condensed=include_condensed,
             verbose=False,
             logger=NullLogger(),
-            tol_S=prof['tol_S'],
+            tol_S=1e-6,
         )
         station_inlet = _make_station(
             'Nozzle inlet', species_list, elements, inlet_eq, P_inlet,
@@ -1339,66 +866,84 @@ def solve_rocket_nozzle(
             mass_total_g, H_chamber_per_kg,
         )
 
-    # ── 7) Геометрия сопла + газодинамика по ИЗВЕСТНОЙ ГЕОМЕТРИИ ────────
-    # Для 4 опорных точек равновесие уже посчитано выше (Инжектор, Вход в
-    # сопло, Горловина, Срез). Теперь строится контур сопла по Ae/At среза,
-    # а для точек контура с известной ε = A/A_t решается SP-задача равновесия,
-    # обращающая (ρ_t·V_t)/(ρ·V) − ε в ноль (метод «площадь → состояние»).
-    flux_throat = station_throat.mass_flux_kg_per_m2_s
-    intermediate_pre_throat: List[StationResult] = []
-    intermediate_post_throat: List[StationResult] = []
-    geometry: Optional[NozzleGeometry] = None
-    if n_intermediate_stations > 0 and flux_throat > 1e-30:
-        eps_exit = flux_throat / max(station_exit.mass_flux_kg_per_m2_s, 1e-30)
-        gkw = dict(geometry_kwargs or {})
-        gkw.setdefault('R_chamber_m', R_chamber_factor * R_throat_m)
-        try:
-            geometry = build_nozzle_geometry(
-                R_throat_m=R_throat_m, area_ratio=eps_exit,
-                method=geometry_method, **gkw,
+    # ── 7) Промежуточные сечения: до горловины и после горловины ────────
+    intermediate_pre_throat = []
+    intermediate_post_throat = []
+    if n_intermediate_stations > 0:
+        P_grid = _build_segmented_pressure_grid(
+            P_chamber=P_chamber,
+            P_throat=P_throat,
+            P_exit=P_exit,
+            n_total=n_intermediate_stations,
+            density_subsonic=section_density_subsonic,
+            density_critical=section_density_critical,
+            density_supersonic=section_density_supersonic,
+        )
+
+        eps = max(1e-6, 1e-8 * abs(P_throat))
+        P_pre = sorted([float(p) for p in P_grid if p > P_throat + eps], reverse=True)
+        P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
+
+        flow_pressures = [*P_pre, *P_post]
+
+        def _compute_section(args):
+            """Считает одно сечение (SP-задача + сборка параметров).
+
+            Полностью независимо от других сечений — пригодно для
+            параллельного выполнения в пуле потоков.
+            """
+            k, P_k = args
+            r_k = solve_equilibrium_SP(
+                species_list=species_list,
+                element_abundances=elements,
+                S_target=S_chamber_total, P=float(P_k),
+                T_init=station_throat.T_K * 0.8,
+                include_condensed=include_condensed,
+                verbose=False,
+                logger=NullLogger(),
+                tol_S=1e-6,
             )
-        except Exception as exc:
-            if logger.enabled:
-                logger.log(f'Построение геометрии не удалось ({exc!r}); '
-                           f'промежуточные сечения пропущены')
-            geometry = None
-        if geometry is not None:
-            if logger.enabled:
-                logger.section('ГЕОМЕТРИЯ СОПЛА')
-                logger.log(f'метод = {geometry.method},  Ae/At = {eps_exit:.4f},  '
-                           f'R_кр = {R_throat_m:.4f} м,  '
-                           f'R_к = {geometry.R_chamber_m:.4f} м,  '
-                           f'точек контура = {len(geometry.points)}')
-            _emit(f"Этап 5/5: промежуточные сечения по контуру ({n_intermediate_stations} шт.)…")
-            intermediate_pre_throat, intermediate_post_throat, geometry = \
-                _geometry_stations_from_contour(
-                    geometry=geometry,
-                    n_intermediate_stations=n_intermediate_stations,
-                    species_list=species_list,
-                    element_abundances=elements,
-                    S_target_total=S_chamber_total,
-                    H_chamber_per_kg=H_chamber_per_kg,
-                    flux_throat=flux_throat, P_throat=P_throat,
-                    P_exit=P_exit, P_chamber=P_chamber,
-                    mass_total_g=mass_total_g,
-                    include_condensed=include_condensed,
-                    T_throat=station_throat.T_K,
-                    T_chamber=station_chamber.T_K,
-                    logger=logger,
-                    tol_S=prof['tol_S'],
-                    progress_cb=progress_cb,
-                    n_ref_sub=chamber.moles,
-                    n_ref_sup=station_throat.moles,
-                )
+            st = _make_station(
+                f'Section {k}', species_list, elements, r_k, float(P_k),
+                mass_total_g, H_chamber_per_kg,
+            )
+            return k, P_k, st
+
+        tasks = list(enumerate(flow_pressures, start=1))
+        n_workers = _resolve_worker_count(len(tasks))
+
+        if n_workers > 1:
+            # параллельный расчёт сечений в пуле потоков (GIL освобождается
+            # внутри SLSQP/NumPy/Numba, поэтому потоки идут параллельно)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_compute_section, tasks))
+        else:
+            results = [_compute_section(t) for t in tasks]
+
+        # порядок сечений восстанавливаем по давлению (как и раньше),
+        # независимо от порядка завершения потоков
+        for k, P_k, st in results:
+            if P_k > P_throat:
+                intermediate_pre_throat.append(st)
+            else:
+                intermediate_post_throat.append(st)
+
+        intermediate_pre_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+        intermediate_post_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+
+        if logger.enabled:
+            logger.log(f'Газодинамика по сечениям: {len(tasks)} сечений, '
+                       f'{n_workers} поток(ов)')
+
     # ── 8) Ae/At — из сохранения массового расхода ────────────────────
     # m_dot = rho * V * A = const => A/At = (rho_t * V_t) / (rho * V)
-    # flux_throat вычислен на шаге 7; промежуточные сечения несут Ae/At из геометрии.
-    # Ae/At пересчитываем только для ОПОРНЫХ точек; у промежуточных сечений
-    # Ae/At уже задан геометрией (ε точки контура).
+    flux_throat = station_throat.mass_flux_kg_per_m2_s
     all_stations_for_area = [
         station_chamber,
         station_inlet,
+        *intermediate_pre_throat,
         station_throat,
+        *intermediate_post_throat,
         station_exit,
     ]
     for st in all_stations_for_area:
@@ -1455,7 +1000,6 @@ def solve_rocket_nozzle(
         Isp_vac_s=Isp_vac,
         CF=CF,
         stations=stations,
-        metadata={'geometry': geometry} if geometry is not None else {},
     )
 
 

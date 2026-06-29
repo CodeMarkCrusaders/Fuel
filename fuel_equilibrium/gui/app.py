@@ -73,13 +73,6 @@ except ImportError:
 APP_NAME = "Rocket Nozzle Calculator"
 APP_VERSION = "2.0"
 
-# Отображаемое имя профиля точности -> внутренний ключ решателя.
-PRECISION_MAP = {
-    "Быстро (грубо)": "fast",
-    "Сбалансировано": "balanced",
-    "Точно (медленно)": "precise",
-}
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Тема (Claude.ai dark)
@@ -165,6 +158,67 @@ def make_primary_button_theme() -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Диалоговые окна проводника Windows (tkinter)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _save_file_dialog(title: str, default_name: str, file_types: list) -> Optional[str]:
+    """Открывает диалог сохранения файла через проводник Windows.
+
+    Args:
+        title: Заголовок окна.
+        default_name: Имя файла по умолчанию.
+        file_types: Список кортежей (описание, маска), например
+                    [("CSV files", "*.csv"), ("All files", "*.*")].
+
+    Returns:
+        Путь к выбранному файлу или None, если пользователь отменил диалог.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()  # Скрываем главное окно tkinter
+        root.attributes('-topmost', True)  # Поверх всех окон
+        path = filedialog.asksaveasfilename(
+            title=title,
+            initialfile=default_name,
+            defaultextension=file_types[0][1].replace("*", "") if file_types else "",
+            filetypes=file_types,
+        )
+        root.destroy()
+        return path if path else None
+    except Exception:
+        return None
+
+
+def _open_file_dialog(title: str, file_types: list) -> Optional[str]:
+    """Открывает диалог открытия файла через проводник Windows.
+
+    Args:
+        title: Заголовок окна.
+        file_types: Список кортежей (описание, маска), например
+                    [("JSON files", "*.json"), ("All files", "*.*")].
+
+    Returns:
+        Путь к выбранному файлу или None, если пользователь отменил диалог.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askopenfilename(
+            title=title,
+            filetypes=file_types,
+        )
+        root.destroy()
+        return path if path else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Worker для асинхронного расчёта (threading.Thread вместо QThread)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -241,8 +295,6 @@ class NozzleSolverWorker:
                 chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
                 verbose=False,
                 logger=NullLogger(),
-                precision=p.get("precision", "balanced"),
-                progress_cb=lambda s: self._emit({"type": "progress", "msg": s}),
             )
         return perf
 
@@ -385,17 +437,8 @@ def hampel_filter(y, window=2, n_sigma=3.0):
     return out
 
 
-def section_series(perf, chamber_length_m, conv_div_lengths,
-                   geometry=None) -> dict:
-    """Единый расчёт параметров газа по сечениям (очищенных от шума).
-
-    Если передан ``geometry`` (NozzleGeometry выбранного типа), ось X и
-    нормированный профиль ``r_rel`` берутся С РЕАЛЬНОГО контура этой
-    геометрии (через NozzleGeometry.map_area_ratios). Тогда профиль на
-    графиках газодинамики и кривые параметров соответствуют тому же
-    контуру, что и на вкладке «Геометрия». Без geometry — прежняя
-    обобщённая разбивка (build_axial_coordinates + sqrt(Ae/At)).
-    """
+def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
+    """Единый расчёт параметров газа по сечениям (очищенных от шума)."""
     if perf is None or not getattr(perf, "stations", None):
         return {}
     stations = list(perf.stations)
@@ -413,38 +456,15 @@ def section_series(perf, chamber_length_m, conv_div_lengths,
     Ae = np.array([float(getattr(s, "Ae_At", float("inf"))) for s in stations])
     labels = [getattr(s, "label", "") for s in stations]
 
-    # Профиль/ось X по РЕАЛЬНОЙ геометрии выбранного типа: каждому сечению
-    # сопоставляем точку (x, r) на фактическом контуре по Ae/At; ветвь
-    # выбираем по числу Маха станции (V/a > 1 → сверхзвук).
-    geom_r_rel = None
-    if geometry is not None:
-        try:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                M_raw = np.where(a > 0, V / a, 0.0)
-            sup_flags = M_raw > 1.0
-            gx, gr = geometry.map_area_ratios(Ae, supersonic_flags=sup_flags)
-            R_thr = float(getattr(geometry, "R_throat_m", 0.0)) or 1.0
-            gx = np.asarray(gx, dtype=float)
-            gr = np.asarray(gr, dtype=float)
-            if np.all(np.isfinite(gx)) and np.all(np.isfinite(gr)):
-                x = gx
-                geom_r_rel = gr / R_thr
-        except Exception:
-            geom_r_rel = None
-
     order = np.argsort(x, kind="stable")
     x = x[order]; P = P[order]; T = T[order]; rho = rho[order]
     V = V[order]; a = a[order]; gs = gs[order]; Ae = Ae[order]
     labels = [labels[i] for i in order]
-    if geom_r_rel is not None:
-        geom_r_rel = geom_r_rel[order]
     _, iu = np.unique(np.round(x, 9), return_index=True)
     iu = np.sort(iu)
     x = x[iu]; P = P[iu]; T = T[iu]; rho = rho[iu]
     V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
     labels = [labels[i] for i in iu]
-    if geom_r_rel is not None:
-        geom_r_rel = geom_r_rel[iu]
 
     # Решатель газодинамики (rocket/nozzle_flow.py) теперь выдаёт гладкие
     # профили gamma_s/a/M (производные считаются с жёстким допуском и
@@ -462,18 +482,11 @@ def section_series(perf, chamber_length_m, conv_div_lengths,
     except Exception:
         i_throat = 0
 
-    if geom_r_rel is not None and geom_r_rel.size == Ae.size:
-        # Профиль с реального контура выбранной геометрии (r/R_кр).
-        r_rel = np.asarray(geom_r_rel, dtype=float)
-        finite = r_rel[np.isfinite(r_rel)]
-        r_cap = float(np.nanmax(finite)) if finite.size else 1.0
-        r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
-    else:
-        with np.errstate(invalid="ignore"):
-            r_rel = np.sqrt(np.clip(Ae, 0.0, None))
-        finite = r_rel[np.isfinite(r_rel)]
-        r_cap = float(np.nanmax(finite)) if finite.size else 1.0
-        r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
+    with np.errstate(invalid="ignore"):
+        r_rel = np.sqrt(np.clip(Ae, 0.0, None))
+    finite = r_rel[np.isfinite(r_rel)]
+    r_cap = float(np.nanmax(finite)) if finite.size else 1.0
+    r_rel = np.where(np.isfinite(r_rel), r_rel, r_cap)
 
     S = np.array([float(getattr(s, "S_J_per_kgK", float("nan"))) for s in stations])
     H = np.array([float(getattr(s, "H_J_per_kg", float("nan"))) for s in stations])
@@ -576,14 +589,6 @@ class MainWindow:
         self.mixture_widget: Optional[MixturePropellantWidgetDPG] = None
         self._side_width = 280
         self._left_width = 460
-        # Высота одного графика газодинамических параметров (px). Раньше
-        # задавалась числовым полем, теперь регулируется перетаскиваемым
-        # сплиттером под областью графиков (self._on_plot_height_splitter_drag).
-        self._plot_row_h = 280
-        # Ширина одного графика (px). Регулируется вертикальным сплиттером
-        # между колонками. 0 — делить строку поровну (старое поведение);
-        # как только потянут сплиттер ширины, значение фиксируется в px.
-        self._plot_col_w = 0
         self._plot_keys = list(PLOT_DEFAULT_KEYS)
         self._show_profile_1d = False
         self._last_geometry: Optional[NozzleGeometry] = None
@@ -593,6 +598,8 @@ class MainWindow:
         self._calc_geom_type = "profiled"
         self._calc_use_rpa = False
         self._solver = "own"
+        # Путь к текущему файлу конфигурации (для быстрого сохранения)
+        self._config_path: Optional[str] = None
 
         self._build()
 
@@ -609,32 +616,6 @@ class MainWindow:
                         no_move=True, no_close=True):
             self._build_menu_bar()
             self._build_splitter_layout()
-        # Диалоги выбора файла (проводник) для сохранения/загрузки
-        # конфигурации создаём один раз, скрытыми; показываем по требованию.
-        self._build_config_file_dialogs()
-
-    def _build_config_file_dialogs(self):
-        """Нативные диалоги выбора файла (проводник) для конфигурации JSON."""
-        default_dir = os.path.expanduser("~")
-        # ── Диалог сохранения ──
-        with dpg.file_dialog(tag="dlg_save_config", show=False, modal=True,
-                             directory_selector=False, width=720, height=480,
-                             default_path=default_dir,
-                             default_filename="rpa_config.json",
-                             callback=self._on_save_config_selected,
-                             cancel_callback=lambda *a: None):
-            dpg.add_file_extension(".json", color=(204, 120, 92, 255),
-                                   custom_text="[JSON]")
-            dpg.add_file_extension(".*")
-        # ── Диалог загрузки ──
-        with dpg.file_dialog(tag="dlg_load_config", show=False, modal=True,
-                             directory_selector=False, width=720, height=480,
-                             default_path=default_dir,
-                             callback=self._on_load_config_selected,
-                             cancel_callback=lambda *a: None):
-            dpg.add_file_extension(".json", color=(204, 120, 92, 255),
-                                   custom_text="[JSON]")
-            dpg.add_file_extension(".*")
 
     def _build_menu_bar(self):
         with dpg.menu_bar(parent="main_window"):
@@ -644,8 +625,10 @@ class MainWindow:
                 dpg.add_menu_item(label="Экспорт Amesim (.data)…",
                                   callback=self.on_export_amesim)
                 dpg.add_separator()
-                dpg.add_menu_item(label="Сохранить конфигурацию…",
+                dpg.add_menu_item(label="Сохранить конфигурацию",
                                   callback=self.on_save_config)
+                dpg.add_menu_item(label="Сохранить конфигурацию как…",
+                                  callback=self.on_save_config_as)
                 dpg.add_menu_item(label="Загрузить конфигурацию…",
                                   callback=self.on_load_config)
                 dpg.add_separator()
@@ -726,52 +709,6 @@ class MainWindow:
                 dpg.set_item_width("left_panel", self._left_width)
             return
 
-        # ── Сплиттер высоты графиков: тянем полосу вверх/вниз ──
-        if dpg.does_item_exist("plot_h_split") and dpg.is_item_active("plot_h_split"):
-            my = dpg.get_mouse_pos(local=False)[1]
-            last = getattr(self, "_plot_h_last_y", None)
-            if last is None:
-                self._plot_h_last_y = my
-                return
-            dy = my - last
-            if abs(dy) >= 1.0:
-                self._plot_h_last_y = my
-                new_h = int(self._plot_row_h + dy)
-                new_h = max(140, min(new_h, 900))
-                if new_h != self._plot_row_h:
-                    self._plot_row_h = new_h
-                    # Высота графиков и сплиттеров ширины «на лету».
-                    self._apply_plot_row_height(self._plot_row_h)
-            return
-        else:
-            # Сбрасываем якорь, когда полоса отпущена.
-            if getattr(self, "_plot_h_last_y", None) is not None:
-                self._plot_h_last_y = None
-
-        # ── Сплиттер(ы) ширины графиков: граница между колонками ──
-        active_wsplit = self._active_width_splitter()
-        if active_wsplit is not None:
-            mx = dpg.get_mouse_pos(local=False)[0]
-            last = getattr(self, "_plot_w_last_x", None)
-            if last is None:
-                self._plot_w_last_x = mx
-                return
-            dx = mx - last
-            if abs(dx) >= 1.0:
-                self._plot_w_last_x = mx
-                base = int(self._plot_col_w or 0)
-                if base <= 0:
-                    base = self._current_plot_pixel_width()
-                new_w = int(base + dx)
-                new_w = max(220, min(new_w, 1400))
-                if new_w != self._plot_col_w:
-                    self._plot_col_w = new_w
-                    self._apply_plot_col_width(self._plot_col_w)
-            return
-        else:
-            if getattr(self, "_plot_w_last_x", None) is not None:
-                self._plot_w_last_x = None
-
         # ── Горизонтальный сплиттер: ширина панели стиля графиков ──
         if dpg.does_item_exist("hsplit") and dpg.is_item_active("hsplit"):
             mx = dpg.get_mouse_pos(local=False)[0]
@@ -792,101 +729,6 @@ class MainWindow:
                                        -(self._side_width + 14))
             return
 
-    # ─── Хелперы сплиттеров графиков ─────────────────────────────────
-    def _iter_plot_items(self):
-        """Генератор всех plot-виджетов в контейнере графиков."""
-        grp = "plots_group"
-        if not dpg.does_item_exist(grp):
-            return
-        info = dpg.get_item_info(grp).get("children", {})
-        if not isinstance(info, dict):
-            return
-        for child_list in info.values():
-            for row in child_list:
-                try:
-                    if dpg.get_item_type(row) == "mvAppItemType::mvPlot":
-                        yield row
-                        continue
-                except Exception:
-                    pass
-                row_info = dpg.get_item_info(row).get("children", {})
-                if isinstance(row_info, dict):
-                    for sub_l in row_info.values():
-                        for item in sub_l:
-                            try:
-                                if dpg.get_item_type(item) == "mvAppItemType::mvPlot":
-                                    yield item
-                            except Exception:
-                                pass
-
-    def _iter_width_splitters(self):
-        """Генератор тегов вертикальных сплиттеров ширины графиков."""
-        grp = "plots_group"
-        if not dpg.does_item_exist(grp):
-            return
-        info = dpg.get_item_info(grp).get("children", {})
-        if not isinstance(info, dict):
-            return
-        for child_list in info.values():
-            for row in child_list:
-                row_info = dpg.get_item_info(row).get("children", {})
-                if isinstance(row_info, dict):
-                    for sub_l in row_info.values():
-                        for item in sub_l:
-                            try:
-                                alias = dpg.get_item_alias(item)
-                            except Exception:
-                                alias = None
-                            if alias and str(alias).startswith("plot_wsplit_"):
-                                yield alias
-
-    def _active_width_splitter(self):
-        """Тег активного (зажатого ЛКМ) сплиттера ширины или None."""
-        for tag in self._iter_width_splitters():
-            try:
-                if dpg.does_item_exist(tag) and dpg.is_item_active(tag):
-                    return tag
-            except Exception:
-                pass
-        return None
-
-    def _current_plot_pixel_width(self):
-        """Фактическая ширина первого графика в px (старт драга)."""
-        for item in self._iter_plot_items():
-            try:
-                w = int(dpg.get_item_rect_size(item)[0])
-                if w > 0:
-                    return w
-            except Exception:
-                pass
-        return 480
-
-    def _apply_plot_row_height(self, h):
-        """Высота всех графиков и сплиттеров ширины на лету."""
-        for item in self._iter_plot_items():
-            try:
-                dpg.set_item_height(item, int(h))
-            except Exception:
-                pass
-        for tag in self._iter_width_splitters():
-            try:
-                dpg.set_item_height(tag, int(h))
-            except Exception:
-                pass
-
-    def _apply_plot_col_width(self, w):
-        """Фиксированная ширина всех графиков на лету."""
-        for item in self._iter_plot_items():
-            try:
-                dpg.set_item_width(item, int(w))
-            except Exception:
-                pass
-
-    def _reset_plot_width(self):
-        """Сброс ширины графиков к авто-доле строки."""
-        self._plot_col_w = 0
-        self._redraw_plots()
-
     def _build_action_bar(self):
         """Нижняя панель правой колонки: кнопка расчёта + статус/прогресс."""
         dpg.add_separator()
@@ -898,7 +740,6 @@ class MainWindow:
             dpg.add_text("Готово. Введите параметры и нажмите «Рассчитать».",
                          tag="status_text", color=C_MUTED, wrap=0)
             dpg.add_text("", tag="progress_text", color=C_ACCENT)
-            dpg.add_text("", tag="iter_text", color=C_MUTED)
 
     # ─── Панель ввода ────────────────────────────────────────────────────
 
@@ -959,13 +800,6 @@ class MainWindow:
                                     min_value=0, max_value=1048)
                 dpg.add_text("Промежуточные сечения распределяются равномерно\n"
                              "по длине сопла (дозвук → горловина → сверхзвук).",
-                             color=C_MUTED, wrap=380)
-                dpg.add_text("Точность расчёта:")
-                dpg.add_combo(
-                    ["Быстро (грубо)", "Сбалансировано", "Точно (медленно)"],
-                    tag="cb_precision", default_value="Сбалансировано", width=-1)
-                dpg.add_text("Грубее точность → меньше итераций и быстрее расчёт.\n"
-                             "«Точно» — максимум итераций, максимальная точность.",
                              color=C_MUTED, wrap=380)
             # Геометрия (для оси X)
             with dpg.collapsing_header(label="Геометрия (Size & Geometry)",
@@ -1064,20 +898,11 @@ class MainWindow:
             with dpg.tab(label="Газодинамика"):
                 with dpg.tab_bar():
                     with dpg.tab(label="Параметры по сечениям", tag="tab_stations"):
-                        # Таблица помещена в прокручиваемый контейнер: при
-                        # большом числе сечений колонки сохраняют читаемую
-                        # ширину и прокручиваются ГОРИЗОНТАЛЬНО внутри панели,
-                        # а не «распирают» всю вкладку.
-                        with dpg.child_window(tag="stations_scroll", border=False,
-                                              autosize_x=True, autosize_y=True,
-                                              horizontal_scrollbar=True):
-                            with dpg.table(tag="tbl_stations", header_row=True,
-                                           resizable=True,
-                                           policy=dpg.mvTable_SizingFixedFit,
-                                           scrollX=True, scrollY=False):
-                                dpg.add_table_column(label="Параметр")
-                                dpg.add_table_column(label="Значение")
-                                dpg.add_table_column(label="Ед.изм.")
+                        with dpg.table(tag="tbl_stations", header_row=True,
+                                       resizable=True, policy=dpg.mvTable_SizingStretchProp):
+                            dpg.add_table_column(label="Параметр")
+                            dpg.add_table_column(label="Значение")
+                            dpg.add_table_column(label="Ед.изм.")
                     with dpg.tab(label="Графики по длине сопла"):
                         self._build_plots_tab()
                     with dpg.tab(label="Тяговые характеристики"):
@@ -1133,19 +958,6 @@ class MainWindow:
                 with dpg.group(tag="plots_group"):
                     pass
 
-                # ── Горизонтальный сплиттер высоты графиков ──
-                # Перетаскивание этой полосы вверх/вниз меняет высоту каждого
-                # графика газодинамических параметров (self._plot_row_h).
-                dpg.add_button(tag="plot_h_split", label="═ высота графиков ═",
-                               width=-1, height=10)
-                with dpg.theme() as ph_theme:
-                    with dpg.theme_component(dpg.mvButton):
-                        dpg.add_theme_color(dpg.mvThemeCol_Button, C_BORDER)
-                        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, C_ACCENT)
-                        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
-                        dpg.add_theme_color(dpg.mvThemeCol_Text, C_MUTED)
-                dpg.bind_item_theme("plot_h_split", ph_theme)
-
             # Вертикальный сплиттер между графиками и панелью стиля
             dpg.add_button(tag="hsplit", label="|", width=8, height=-1)
             with dpg.theme() as hsplit_theme:
@@ -1177,16 +989,12 @@ class MainWindow:
         dpg.add_checkbox(label="Профиль сопла на графиках",
                          tag="chk_show_profile", default_value=False,
                          callback=self._on_toggle_profile_1d)
-        dpg.add_text("Размер каждого графика — сплиттерами:\n"
-                     "• высота: полоса «═» под графиками (вверх/вниз);\n"
-                     "• ширина: вертикальная полоса «|» между колонками\n"
-                     "  (в 2-колоночной раскладке — тяните влево/вправо).",
-                     color=C_MUTED, wrap=0)
+        dpg.add_input_int(label="Высота графика (px)", tag="sp_plot_row_h",
+                          default_value=280, min_value=160, max_value=600,
+                          callback=lambda: self._redraw_plots())
         dpg.add_combo(["Авто", "1 колонка", "2 колонки"],
                       tag="cb_plot_cols", default_value="Авто",
                       callback=lambda: self._redraw_plots())
-        dpg.add_button(label="↺ Сбросить ширину графиков", width=-1,
-                       callback=self._reset_plot_width)
         dpg.add_separator()
         dpg.add_text("Шрифт/стиль:")
         dpg.add_input_float(label="Толщ. линий", tag="sp_lw",
@@ -1564,20 +1372,6 @@ class MainWindow:
         except Exception:
             return None
 
-    def _series_geometry(self):
-        """Геометрия выбранного типа для согласования профиля и параметров.
-
-        Источник оси X и профиля r/R_кр в section_series, чтобы кривые
-        газодинамики и наложенный профиль соответствовали тому же контуру,
-        что и на вкладке «Геометрия». None → обобщённая разбивка.
-        """
-        if self.perf is None:
-            return None
-        try:
-            return self._build_calc_geometry(self.perf)
-        except Exception:
-            return None
-
     # ─── Расчёт ──────────────────────────────────────────────────────────
 
     def on_calculate(self):
@@ -1627,7 +1421,6 @@ class MainWindow:
             "include_condensed": bool(dpg.get_value("chk_condensed")),
             "injection_velocity": float(dpg.get_value("sp_inj_velocity") or 0.0),
             "chamber_pressure_drop_frac": float(dpg.get_value("sp_chamber_dp") or 0.0) / 100.0,
-            "precision": PRECISION_MAP.get(dpg.get_value("cb_precision"), "balanced"),
         }
 
         self._solver = "cea" if dpg.get_value("rb_cea") else "own"
@@ -1639,7 +1432,6 @@ class MainWindow:
         dpg.configure_item("btn_calc", enabled=False)
         dpg.set_value("status_text", f"Расчёт ({self._solver})... подождите.")
         dpg.set_value("progress_text", "⏳ Выполняется расчёт...")
-        dpg.set_value("iter_text", "")
         of_desc = f"of={of_ratio:.3f}" if of_ratio is not None else "optimize"
         ActionLogger.info(
             "Расчёт запущен",
@@ -1661,14 +1453,7 @@ class MainWindow:
             if msg is None:
                 break
             if msg["type"] == "progress":
-                m = msg['msg']
-                if "·" in m:
-                    stage, detail = m.split("·", 1)
-                    dpg.set_value("progress_text", f"⏳ {stage.strip()}")
-                    dpg.set_value("iter_text", detail.strip())
-                else:
-                    dpg.set_value("progress_text", f"⏳ {m}")
-                    dpg.set_value("iter_text", "")
+                dpg.set_value("progress_text", f"⏳ {msg['msg']}")
             elif msg["type"] == "ok":
                 try:
                     self._on_calc_done(msg["perf"])
@@ -1688,7 +1473,6 @@ class MainWindow:
         self.perf = perf
         dpg.configure_item("btn_calc", enabled=True)
         dpg.set_value("progress_text", "")
-        dpg.set_value("iter_text", "")
         st0 = perf.stations[0]
         dpg.set_value("status_text",
                       f"Готово. Tкамеры = {st0.T_K:.1f} К, "
@@ -1721,7 +1505,6 @@ class MainWindow:
     def _on_calc_failed(self, msg: str):
         dpg.configure_item("btn_calc", enabled=True)
         dpg.set_value("progress_text", "")
-        dpg.set_value("iter_text", "")
         dpg.set_value("status_text", "Ошибка расчёта.")
         dpg.set_value("txt_perf", f"Ошибка расчёта:\n{msg[:2000]}")
         ActionLogger.error("Расчёт завершился ошибкой", detail=msg[:500])
@@ -1742,20 +1525,13 @@ class MainWindow:
         # Перестраиваем колонки: параметр + по станциям + ед.изм.
         # (DPG не поддерживает динамическое добавление колонок в существующую
         #  таблицу — пересоздаём таблицу целиком.)
-        # Фиксированная ширина колонок + горизонтальная прокрутка: при
-        # большом числе сечений таблица прокручивается внутри своего
-        # контейнера (stations_scroll), а не растягивает всю вкладку.
         with dpg.table(tag="tbl_stations", header_row=True,
-                       resizable=True, policy=dpg.mvTable_SizingFixedFit,
-                       scrollX=True, scrollY=False,
+                       resizable=True, policy=dpg.mvTable_SizingStretchProp,
                        parent=self._stations_parent()):
-            dpg.add_table_column(label="Параметр",
-                                 init_width_or_weight=160)
+            dpg.add_table_column(label="Параметр")
             for s in stations:
-                dpg.add_table_column(label=s.label,
-                                     init_width_or_weight=110)
-            dpg.add_table_column(label="Ед.изм.",
-                                 init_width_or_weight=110)
+                dpg.add_table_column(label=s.label)
+            dpg.add_table_column(label="Ед.изм.")
             params = [
                 ("Давление", lambda s: f"{s.P_Pa/1e6:.4f}", "МПа"),
                 ("Температура", lambda s: f"{s.T_K:.4f}", "К"),
@@ -1779,8 +1555,8 @@ class MainWindow:
                     dpg.add_text(unit)
 
     def _stations_parent(self) -> str:
-        """Родительский тег для таблицы станций (прокручиваемый контейнер)."""
-        return "stations_scroll" if dpg.does_item_exist("stations_scroll") else "tab_stations"
+        """Родительский тег для таблицы станций (вкладка)."""
+        return "tab_stations"
 
     def _fill_perf_text(self, perf: RocketPerformance):
         ActionLogger.info("Заполнение текста тяговых характеристик")
@@ -1879,25 +1655,13 @@ class MainWindow:
             "dark": bool(dpg.get_value("chk_dark_plot")),
         }
 
-    def _plot_columns(self) -> int:
-        """Число колонок графиков по выбору пользователя (combo cb_plot_cols)."""
-        mode = dpg.get_value("cb_plot_cols") if dpg.does_item_exist("cb_plot_cols") else "Авто"
-        if mode == "1 колонка":
-            return 1
-        if mode == "2 колонки":
-            return 2
-        # «Авто»: 2 колонки, если графиков больше трёх, иначе 1.
-        n = len([k for k in self._plot_keys])
-        return 2 if n > 3 else 1
-
     def _redraw_plots(self):
         ActionLogger.info("Перерисовка графиков")
         if self.perf is None:
             ActionLogger.warning("_redraw_plots: perf is None")
             return
         ser = section_series(self.perf, self._chamber_length_m(),
-                             self._auto_conv_div_lengths(),
-                             geometry=self._series_geometry())
+                             self._auto_conv_div_lengths())
         if not ser:
             return
         # Очищаем контейнер графиков
@@ -1919,177 +1683,69 @@ class MainWindow:
 
         style = self._collect_style()
         lw = max(0.5, style["lw"])
-        row_h = int(self._plot_row_h)
-        ncols = self._plot_columns()
-        show_profile = bool(self._show_profile_1d)
-        r_rel = ser.get("r_rel")
-        # Профиль рисуем (нормированный r/r_кр) только если есть валидные данные.
-        if r_rel is None or not np.any(np.isfinite(np.asarray(r_rel, dtype=float))):
-            show_profile = False
-
-        # Раскладка по колонкам: размещаем графики в строки по ncols штук.
-        # Каждая строка — горизонтальная группа; ширина каждого графика
-        # делится поровну (-1 «на всю оставшуюся ширину» внутри группы).
-        # Ширина каждого графика: если задан сплиттер ширины
-        # (self._plot_col_w > 0) — фиксированные px одинаково для всех;
-        # иначе старое поведение (1 колонка → -1, иначе делить поровну).
-        col_w = int(getattr(self, "_plot_col_w", 0) or 0)
-        if col_w > 0:
-            plot_w = col_w
-        else:
-            plot_w = -1 if ncols <= 1 else 0
-
-        rows = [keys[i:i + ncols] for i in range(0, len(keys), ncols)]
-        for r_i, row_keys in enumerate(rows):
-            row_tag = f"plot_row_{r_i}"
-            with dpg.group(parent=grp, tag=row_tag, horizontal=(ncols > 1)):
-                for c_i, key in enumerate(row_keys):
-                    self._draw_single_plot(key, ser, x, style, lw, row_h,
-                                           plot_w, show_profile, r_rel)
-                    # Вертикальный сплиттер ширины между колонками
-                    # (только при 2+ колонках и не после последнего графика).
-                    if ncols > 1 and c_i < len(row_keys) - 1:
-                        wsplit_tag = f"plot_wsplit_{r_i}_{c_i}"
-                        dpg.add_button(tag=wsplit_tag, label="|",
-                                       width=8, height=row_h)
-                        with dpg.theme() as ws_theme:
-                            with dpg.theme_component(dpg.mvButton):
-                                dpg.add_theme_color(dpg.mvThemeCol_Button,
-                                                    C_BORDER)
-                                dpg.add_theme_color(
-                                    dpg.mvThemeCol_ButtonHovered, C_ACCENT)
-                                dpg.add_theme_color(
-                                    dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
-                                dpg.add_theme_color(dpg.mvThemeCol_Text,
-                                                    C_MUTED)
-                        dpg.bind_item_theme(wsplit_tag, ws_theme)
-
-    def _draw_single_plot(self, key, ser, x, style, lw, row_h, plot_w,
-                          show_profile, r_rel):
-        """Отрисовка одного графика газодинамического параметра.
-
-        ``plot_w`` — ширина графика в px (или -1/0 для авто-доли строки),
-        вычисляется в _redraw_plots с учётом сплиттера ширины.
-        """
-        label, unit, color = next((l, u, c) for k, l, u, c in PLOT_PARAM_DEFS if k == key)
-        y = plot_param_value(key, ser)
-        if y is None:
-            return
-        plot_tag = f"plot_{key}"
-        x_axis = f"plot_{key}_x"
-        y_axis = f"plot_{key}_y"
-        y2_axis = f"plot_{key}_y2"
-        # Флаги сеток: основная/доп. реализуются через no_gridlines у осей и
-        # толщину линий (MajorGridSize / MinorGridSize) в теме плота.
-        no_grid = not (style["grid_major"] or style["grid_minor"])
-        # Плот добавляется в текущий активный контейнер (горизонтальную
-        # группу строки), открытый в _redraw_plots через `with dpg.group(...)`.
-        with dpg.plot(tag=plot_tag,
-                      label=label + (f", {unit}" if unit else ""),
-                      height=row_h, width=plot_w):
-            # Тема плота: управляем толщиной основной/доп. сетки.
-            with dpg.theme() as plot_theme:
-                with dpg.theme_component(dpg.mvPlot):
-                    major = 1.2 if style["grid_major"] else 0.0
-                    minor = 0.7 if style["grid_minor"] else 0.0
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_MajorGridSize,
-                                        major, category=dpg.mvThemeCat_Plots)
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_MinorGridSize,
-                                        minor, category=dpg.mvThemeCat_Plots)
-            dpg.bind_item_theme(plot_tag, plot_theme)
-
-            dpg.add_plot_axis(dpg.mvXAxis, label="x, м", tag=x_axis,
-                              no_gridlines=no_grid)
-            dpg.add_plot_axis(dpg.mvYAxis,
-                              label=(unit if unit else label), tag=y_axis,
-                              no_gridlines=no_grid)
-            dpg.set_axis_limits(y_axis,
-                                ymin=float(np.nanmin(y)),
-                                ymax=float(np.nanmax(y)))
-            # Theme for line series with color and weight
-            line_series_tag = f"ls_{key}"
-            scatter_series_tag = f"ss_{key}"
-            dpg.add_line_series(list(x), list(y),
-                                parent=y_axis, tag=line_series_tag)
-            with dpg.theme() as line_theme:
-                with dpg.theme_component(dpg.mvLineSeries):
-                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
-                                        category=dpg.mvThemeCat_Plots)
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight,
-                                        float(lw),
-                                        category=dpg.mvThemeCat_Plots)
-            dpg.bind_item_theme(line_series_tag, line_theme)
-            if style["markers"]:
-                dpg.add_scatter_series(list(x), list(y),
-                                       parent=y_axis, tag=scatter_series_tag)
-                with dpg.theme() as scatter_theme:
-                    with dpg.theme_component(dpg.mvScatterSeries):
-                        dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color,
-                                            category=dpg.mvThemeCat_Plots)
-                        dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color,
-                                            category=dpg.mvThemeCat_Plots)
-                dpg.bind_item_theme(scatter_series_tag, scatter_theme)
-            if key == "M":
-                hl_tag = f"hl_M_{key}"
-                try:
-                    dpg.add_inf_line_series([1.0], parent=y_axis, tag=hl_tag, horizontal=True)
-                except Exception as e_inf:
-                    ActionLogger.warning("add_inf_line_series (M) failed", detail=str(e_inf))
-                    hl_tag = None
-                if hl_tag:
-                    with dpg.theme() as hl_theme:
-                        with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
-                                                category=dpg.mvThemeCat_Plots)
-                    dpg.bind_item_theme(hl_tag, hl_theme)
-            x_thr = ser.get("x_throat_m")
-            if x_thr is not None:
-                vl_tag = f"vl_throat_{key}"
-                try:
-                    dpg.add_inf_line_series([x_thr], parent=y_axis, tag=vl_tag, horizontal=False)
-                except Exception as e_inf:
-                    ActionLogger.warning("add_inf_line_series (throat) failed", detail=str(e_inf))
-                    vl_tag = None
-                if vl_tag:
-                    with dpg.theme() as vl_theme:
-                        with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED,
-                                                category=dpg.mvThemeCat_Plots)
-                    dpg.bind_item_theme(vl_tag, vl_theme)
-
-            # ── Наложение профиля сопла (r/r_кр) на отдельной правой оси ──
-            if show_profile and r_rel is not None:
-                try:
-                    rr = np.asarray(r_rel, dtype=float)
-                    dpg.add_plot_axis(dpg.mvYAxis2, label="r/rкр",
-                                      tag=y2_axis, no_gridlines=True,
-                                      opposite=True)
-                    rmax = float(np.nanmax(rr[np.isfinite(rr)])) if np.any(np.isfinite(rr)) else 1.0
-                    dpg.set_axis_limits(y2_axis, ymin=0.0, ymax=max(rmax * 1.15, 1e-6))
-                    prof_top = f"prof_top_{key}"
-                    prof_bot = f"prof_bot_{key}"
-                    dpg.add_line_series(list(x), list(rr),
-                                        parent=y2_axis, tag=prof_top)
-                    dpg.add_line_series(list(x), list(-rr),
-                                        parent=y2_axis, tag=prof_bot)
-                    with dpg.theme() as prof_theme:
-                        with dpg.theme_component(dpg.mvLineSeries):
-                            dpg.add_theme_color(dpg.mvPlotCol_Line,
-                                                (130, 130, 128, 160),
-                                                category=dpg.mvThemeCat_Plots)
-                            dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight,
-                                                1.5,
-                                                category=dpg.mvThemeCat_Plots)
-                    dpg.bind_item_theme(prof_top, prof_theme)
-                    dpg.bind_item_theme(prof_bot, prof_theme)
-                except Exception as e_prof:
-                    ActionLogger.warning("Наложение профиля сопла не удалось",
-                                         detail=str(e_prof))
-
-            dpg.fit_axis_data(x_axis)
-            dpg.fit_axis_data(y_axis)
-            if show_profile and dpg.does_item_exist(y2_axis):
-                dpg.fit_axis_data(y2_axis)
+        for key in keys:
+            label, unit, color = next((l, u, c) for k, l, u, c in PLOT_PARAM_DEFS if k == key)
+            y = plot_param_value(key, ser)
+            if y is None:
+                continue
+            plot_tag = f"plot_{key}"
+            x_axis = f"plot_{key}_x"
+            y_axis = f"plot_{key}_y"
+            with dpg.plot(parent=grp, tag=plot_tag,
+                          label=label + (f", {unit}" if unit else ""),
+                          height=int(dpg.get_value("sp_plot_row_h") or 280),
+                          width=-1):
+                dpg.add_plot_axis(dpg.mvXAxis, label="x, м", tag=x_axis)
+                dpg.add_plot_axis(dpg.mvYAxis,
+                                  label=(unit if unit else label), tag=y_axis)
+                dpg.set_axis_limits(y_axis,
+                                    ymin=float(np.nanmin(y)),
+                                    ymax=float(np.nanmax(y)))
+                # Theme for line series with color and weight
+                line_series_tag = f"ls_{key}"
+                scatter_series_tag = f"ss_{key}"
+                dpg.add_line_series(list(x), list(y),
+                                    parent=y_axis, tag=line_series_tag)
+                with dpg.theme() as line_theme:
+                    with dpg.theme_component(dpg.mvLineSeries):
+                        dpg.add_theme_color(dpg.mvPlotCol_Line, color)
+                        dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, int(lw * 100))
+                dpg.bind_item_theme(line_series_tag, line_theme)
+                if style["markers"]:
+                    dpg.add_scatter_series(list(x), list(y),
+                                           parent=y_axis, tag=scatter_series_tag)
+                    with dpg.theme() as scatter_theme:
+                        with dpg.theme_component(dpg.mvScatterSeries):
+                            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color)
+                            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color)
+                    dpg.bind_item_theme(scatter_series_tag, scatter_theme)
+                if key == "M":
+                    hl_tag = f"hl_M_{key}"
+                    try:
+                        dpg.add_inf_line_series([1.0], parent=y_axis, tag=hl_tag, horizontal=True)
+                    except Exception as e_inf:
+                        ActionLogger.warning("add_inf_line_series (M) failed", detail=str(e_inf))
+                        hl_tag = None
+                    if hl_tag:
+                        with dpg.theme() as hl_theme:
+                            with dpg.theme_component(dpg.mvLineSeries):
+                                dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                        dpg.bind_item_theme(hl_tag, hl_theme)
+                x_thr = ser.get("x_throat_m")
+                if x_thr is not None:
+                    vl_tag = f"vl_throat_{key}"
+                    try:
+                        dpg.add_inf_line_series([x_thr], parent=y_axis, tag=vl_tag, horizontal=False)
+                    except Exception as e_inf:
+                        ActionLogger.warning("add_inf_line_series (throat) failed", detail=str(e_inf))
+                        vl_tag = None
+                    if vl_tag:
+                        with dpg.theme() as vl_theme:
+                            with dpg.theme_component(dpg.mvLineSeries):
+                                dpg.add_theme_color(dpg.mvPlotCol_Line, C_MUTED)
+                        dpg.bind_item_theme(vl_tag, vl_theme)
+                dpg.fit_axis_data(x_axis)
+                dpg.fit_axis_data(y_axis)
 
     def _save_figures(self):
         """Сохранение графиков через matplotlib (экспорт в PNG)."""
@@ -2103,8 +1759,7 @@ class MainWindow:
             dpg.set_value("status_text", "matplotlib недоступен для экспорта.")
             return
         ser = section_series(self.perf, self._chamber_length_m(),
-                             self._auto_conv_div_lengths(),
-                             geometry=self._series_geometry())
+                             self._auto_conv_div_lengths())
         if not ser:
             return
         # Простой экспорт: все выбранные графики в один PNG
@@ -2137,7 +1792,17 @@ class MainWindow:
             row, col = i // ncols, i % ncols
             axes[row][col].set_visible(False)
         fig.tight_layout()
-        path = os.path.join(os.path.expanduser("~"), "nozzle_plots.png")
+
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Сохранить рисунки как PNG",
+            "nozzle_plots.png",
+            [("PNG files", "*.png"), ("All files", "*.*")],
+        )
+        if path is None:
+            plt.close(fig)
+            return
+
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         dpg.set_value("status_text", f"Рисунок сохранён: {path}")
@@ -2232,17 +1897,10 @@ class MainWindow:
                                          parent="geom_y", label=label)
             ls_neg = dpg.add_line_series(list(x_arr), list(-np.asarray(r_arr)),
                                          parent="geom_y")
-            # ВАЖНО: цвет линии серии в ImPlot применяется только с
-            # категорией mvThemeCat_Plots. Без неё серия (и маркер в
-            # легенде) берёт цвет из дефолтной палитры ImPlot — отсюда
-            # расхождение легенды и линий. Цвет в легенде = цвет линии той
-            # серии, у которой задан label (положительная ветвь).
             with dpg.theme() as geom_theme:
                 with dpg.theme_component(dpg.mvLineSeries):
-                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
-                                        category=dpg.mvThemeCat_Plots)
-                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 2.0,
-                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color)
+                    dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 200)
             dpg.bind_item_theme(ls_pos, geom_theme)
             dpg.bind_item_theme(ls_neg, geom_theme)
         dpg.fit_axis_data("geom_x")
@@ -2298,16 +1956,25 @@ class MainWindow:
             for gtype, geom in geometries.items():
                 if geom is None:
                     continue
-                fname = f"nozzle_contour_{gtype}.csv"
-                path = os.path.join(os.path.expanduser("~"), fname)
+                # Диалог выбора файла через проводник Windows
+                path = _save_file_dialog(
+                    f"Сохранить контур сопла ({gtype}) как CSV",
+                    f"nozzle_contour_{gtype}.csv",
+                    [("CSV files", "*.csv"), ("All files", "*.*")],
+                )
+                if path is None:
+                    continue
                 with open(path, "w", newline="", encoding="utf-8-sig") as f:
                     wr = csv.writer(f, delimiter=";")
                     wr.writerow(["x_m", "r_m"])
                     for p in geom.points:
                         wr.writerow([f"{p.x_m:.6f}", f"{p.r_m:.6f}"])
-                saved.append(fname)
-            dpg.set_value("status_text",
-                          "Контур(ы) сохранены: " + ", ".join(saved))
+                saved.append(os.path.basename(path))
+            if saved:
+                dpg.set_value("status_text",
+                              "Контур(ы) сохранены: " + ", ".join(saved))
+            else:
+                dpg.set_value("status_text", "Экспорт отменён.")
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка экспорта: {e}")
 
@@ -2434,7 +2101,14 @@ class MainWindow:
         if self.perf is None:
             ActionLogger.warning("Экспорт CSV прерван — нет данных расчёта")
             return
-        path = os.path.join(os.path.expanduser("~"), "nozzle_export.csv")
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Экспорт данных в CSV",
+            "nozzle_export.csv",
+            [("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Экспорт CSV", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
@@ -2463,7 +2137,14 @@ class MainWindow:
         if self.perf is None:
             ActionLogger.warning("Экспорт Amesim прерван — нет данных расчёта")
             return
-        path = os.path.join(os.path.expanduser("~"), "nozzle_amesim.data")
+        # Диалог выбора файла через проводник Windows
+        path = _save_file_dialog(
+            "Экспорт данных в формат Amesim",
+            "nozzle_amesim.data",
+            [("Amesim data files", "*.data"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Экспорт Amesim", path=path)
         stations = self.perf.stations
         x = build_axial_coordinates(
@@ -2496,63 +2177,9 @@ class MainWindow:
 
     # ─── Конфигурация ────────────────────────────────────────────────────
 
-    def on_save_config(self):
-        """Открывает проводник для выбора места сохранения конфигурации."""
-        if self.mixture_widget is None:
-            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
-            dpg.set_value("status_text", "Нет данных для сохранения.")
-            return
-        ActionLogger.info("Открытие диалога сохранения конфигурации")
-        if dpg.does_item_exist("dlg_save_config"):
-            dpg.show_item("dlg_save_config")
-
-    def on_load_config(self):
-        """Открывает проводник для выбора файла конфигурации."""
-        ActionLogger.info("Открытие диалога загрузки конфигурации")
-        if dpg.does_item_exist("dlg_load_config"):
-            dpg.show_item("dlg_load_config")
-
-    @staticmethod
-    def _path_from_dialog(app_data) -> Optional[str]:
-        """Извлекает путь к файлу из app_data диалога файлов DPG."""
-        if not isinstance(app_data, dict):
-            return None
-        # Предпочитаем полный путь, выбранный пользователем.
-        path = app_data.get("file_path_name")
-        if path:
-            return path
-        # Резерв: каталог + первый выбранный файл из selections.
-        sels = app_data.get("selections") or {}
-        if sels:
-            return next(iter(sels.values()))
-        cur = app_data.get("current_path")
-        name = app_data.get("file_name")
-        if cur and name:
-            return os.path.join(cur, name)
-        return None
-
-    def _on_save_config_selected(self, sender, app_data):
-        path = self._path_from_dialog(app_data)
-        if not path:
-            dpg.set_value("status_text", "Сохранение отменено.")
-            return
-        # Гарантируем расширение .json.
-        if not os.path.splitext(path)[1]:
-            path += ".json"
-        self._do_save_config(path)
-
-    def _on_load_config_selected(self, sender, app_data):
-        path = self._path_from_dialog(app_data)
-        if not path or not os.path.exists(path):
-            dpg.set_value("status_text", "Файл конфигурации не выбран.")
-            return
-        self._do_load_config(path)
-
-    def _do_save_config(self, path: str):
-        if self.mixture_widget is None:
-            return
-        ActionLogger.info("Сохранение конфигурации", path=path)
-        cfg = {
+    def _build_config_dict(self) -> dict:
+        """Собирает словарь конфигурации из текущих полей UI."""
+        return {
             "mixture": self.mixture_widget.get_mixture(),
             "mix_mode": self._mix_mode(),
             "mix_value": dpg.get_value("ed_mix_value") or "",
@@ -2565,7 +2192,6 @@ class MainWindow:
             "injection_velocity": float(dpg.get_value("sp_inj_velocity") or 0.0),
             "chamber_pressure_drop": float(dpg.get_value("sp_chamber_dp") or 0.0),
             "solver": self._solver,
-            "precision": dpg.get_value("cb_precision") or "Сбалансировано",
             "L_chamber": float(dpg.get_value("sp_L_chamber") or 0.1),
             "L_star": float(dpg.get_value("sp_L_star") or 1.0),
             "losses": {
@@ -2575,25 +2201,65 @@ class MainWindow:
             "style": {
                 "lw": float(dpg.get_value("sp_lw") or 1.8),
                 "markers": bool(dpg.get_value("chk_markers")),
-                "smooth": bool(dpg.get_value("chk_smooth")),
                 "grid_major": bool(dpg.get_value("chk_grid_major")),
                 "grid_minor": bool(dpg.get_value("chk_grid_minor")),
                 "dark": bool(dpg.get_value("chk_dark_plot")),
-                "show_profile": bool(dpg.get_value("chk_show_profile")),
-                "plot_cols": dpg.get_value("cb_plot_cols") or "Авто",
-                "plot_row_h": int(self._plot_row_h),
-                "plot_col_w": int(self._plot_col_w),
             },
         }
+
+    def _write_config(self, path: str):
+        """Записывает конфигурацию в указанный файл."""
+        cfg = self._build_config_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def on_save_config(self):
+        """Быстрое сохранение конфигурации (без диалога, в текущий файл).
+
+        Если файл ещё не был сохранён/загружен — открывает диалог «Сохранить как».
+        """
+        if self.mixture_widget is None:
+            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
+            return
+        if self._config_path is None:
+            # Нет текущего файла — переходим к «Сохранить как»
+            self.on_save_config_as()
+            return
+        ActionLogger.info("Быстрое сохранение конфигурации", path=self._config_path)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            dpg.set_value("status_text", f"Конфигурация сохранена: {path}")
+            self._write_config(self._config_path)
+            dpg.set_value("status_text", f"Конфигурация сохранена: {self._config_path}")
         except Exception as e:
-            ActionLogger.error("Ошибка сохранения конфигурации", detail=str(e))
             dpg.set_value("status_text", f"Ошибка: {e}")
 
-    def _do_load_config(self, path: str):
+    def on_save_config_as(self):
+        """Сохранение конфигурации с выбором пути через проводник Windows."""
+        if self.mixture_widget is None:
+            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
+            return
+        ActionLogger.info("Сохранение конфигурации как…")
+        path = _save_file_dialog(
+            "Сохранить конфигурацию как",
+            "config.vika",
+            [("VIKA files", "*.vika"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
+        try:
+            self._write_config(path)
+            self._config_path = path  # Запоминаем путь для быстрого сохранения
+            dpg.set_value("status_text", f"Конфигурация сохранена: {path}")
+        except Exception as e:
+            dpg.set_value("status_text", f"Ошибка: {e}")
+
+    def on_load_config(self):
+        ActionLogger.info("Загрузка конфигурации")
+        path = _open_file_dialog(
+            "Загрузить конфигурацию",
+            [("VIKA files", "*.vika"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
         ActionLogger.info("Загрузка конфигурации", path=path)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -2607,7 +2273,6 @@ class MainWindow:
             dpg.set_value("cb_Pc_unit", cfg.get("Pc_unit", "МПа"))
             dpg.set_value("cb_Pe_unit", cfg.get("Pe_unit", "МПа"))
             dpg.set_value("sp_n_inter", int(cfg.get("n_inter", 8)))
-            dpg.set_value("cb_precision", cfg.get("precision", "Сбалансировано"))
             dpg.set_value("chk_condensed", bool(cfg.get("include_condensed", True)))
             dpg.set_value("sp_inj_velocity", float(cfg.get("injection_velocity", 0.0)))
             dpg.set_value("sp_chamber_dp", float(cfg.get("chamber_pressure_drop", 0.0)))
@@ -2619,25 +2284,14 @@ class MainWindow:
             st = cfg.get("style", {})
             dpg.set_value("sp_lw", float(st.get("lw", 1.8)))
             dpg.set_value("chk_markers", bool(st.get("markers", True)))
-            if dpg.does_item_exist("chk_smooth"):
-                dpg.set_value("chk_smooth", bool(st.get("smooth", False)))
             dpg.set_value("chk_grid_major", bool(st.get("grid_major", True)))
             dpg.set_value("chk_grid_minor", bool(st.get("grid_minor", True)))
             dpg.set_value("chk_dark_plot", bool(st.get("dark", True)))
-            if dpg.does_item_exist("chk_show_profile"):
-                self._show_profile_1d = bool(st.get("show_profile", False))
-                dpg.set_value("chk_show_profile", self._show_profile_1d)
-            if dpg.does_item_exist("cb_plot_cols"):
-                dpg.set_value("cb_plot_cols", st.get("plot_cols", "Авто"))
-            self._plot_row_h = int(st.get("plot_row_h", self._plot_row_h))
-            self._plot_col_w = int(st.get("plot_col_w", self._plot_col_w))
             self._update_of_from_mixture()
             self._update_overall_efficiency()
-            if self.perf is not None:
-                self._redraw_plots()
+            self._config_path = path  # Запоминаем путь для быстрого сохранения
             dpg.set_value("status_text", f"Конфигурация загружена: {path}")
         except Exception as e:
-            ActionLogger.error("Ошибка загрузки конфигурации", detail=str(e))
             dpg.set_value("status_text", f"Ошибка: {e}")
 
     def _about(self):

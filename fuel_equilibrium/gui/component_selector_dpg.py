@@ -162,14 +162,17 @@ class ComponentListWidgetDPG:
             self._on_change(self.get_components())
 
     def _add_component(self):
-        """Открыть модальный диалог выбора компонента."""
+        """Открыть диалог выбора компонента."""
         if not self.species_db:
             return
-        dlg = ComponentSelectorDialogDPG(
+        ComponentSelectorDialogDPG(
             self.species_db, mode=self.mode,
             selected=[c["name"] for c in self.components],
+            callback=self._on_component_selected,
         )
-        name = dlg.run()
+
+    def _on_component_selected(self, name: Optional[str]):
+        """Колбэк, вызываемый после закрытия диалога выбора компонента."""
         if name:
             self.components.append({"name": name, "mass": 1.0, "T": 0.0})
             self._refresh_table()
@@ -206,21 +209,14 @@ class ComponentSelectorDialogDPG:
     """Модальное окно выбора компонента с поиском/фильтром, DPG-версия."""
 
     def __init__(self, species_db: Dict[str, Species], mode: str = "oxidizer",
-                 selected: List[str] = None):
+                 selected: List[str] = None, callback=None):
         self.species_db = species_db
         self.mode = mode
         self.selected = selected or []
+        self._callback = callback
         self._result: Optional[str] = None
         self._modal_id: Optional[int] = None
-
-    def run(self) -> Optional[str]:
-        """Показать модальный диалог и вернуть выбранное имя (или None)."""
-        self._result = None
         self._build_modal()
-        # DPG не блокирует; имитируем модальность через флаг.
-        # Возврат результата отложенный — используем polling в главном цикле.
-        # Для простоты синхронного возврата ждём закрытия.
-        return self._result
 
     def _build_modal(self):
         # Создаём всплывающее окно поверх вьюпорта.
@@ -310,12 +306,15 @@ class ComponentSelectorDialogDPG:
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
+        if self._callback:
+            self._callback(self._result)
 
     def _cancel(self):
-        self._result = None
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
+        if self._callback:
+            self._callback(None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
