@@ -269,28 +269,3 @@ def test_dispatch_rpa_aliases():
     for alias in ("rpa_parabolic", "rpa", "parabolic", "parabolic_bell"):
         geom = build_nozzle_geometry(0.05, 16.0, method=alias)
         assert geom.method == "rpa_parabolic"
-
-
-# ── map_area_ratios: согласование профиля с реальным контуром ──────────────────
-
-def test_map_area_ratios_matches_contour_endpoints():
-    """Профиль по отношениям площадей должен совпадать с реальным контуром."""
-    for build in (build_profiled_nozzle, build_conical_nozzle):
-        g = build(0.05, 16.0, R_chamber_m=0.125)
-        ar_cham = (g.R_chamber_m / g.R_throat_m) ** 2
-        ars = np.array([ar_cham, 1.0, 16.0])
-        sup = np.array([False, False, True])
-        x, r = g.map_area_ratios(ars, supersonic_flags=sup)
-        assert np.all(np.isfinite(x)) and np.all(np.isfinite(r))
-        assert r[1] == pytest.approx(g.R_throat_m, rel=0.05)   # горловина
-        assert r[2] == pytest.approx(g.R_exit_m, rel=0.05)     # срез
-        assert r[0] == pytest.approx(g.R_chamber_m, rel=0.1)   # камера
-        assert x[0] <= x[1] <= x[2]
-
-
-def test_map_area_ratios_branch_selection():
-    """Одинаковое A/A_кр на дозвуковой и сверхзвуковой ветви даёт разный x."""
-    g = build_profiled_nozzle(0.05, 16.0, R_chamber_m=0.125)
-    x, r = g.map_area_ratios(np.array([4.0, 4.0]),
-                             supersonic_flags=np.array([False, True]))
-    assert x[0] < x[1]

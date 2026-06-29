@@ -6,7 +6,7 @@
 import math
 import numpy as np
 from scipy.optimize import minimize, LinearConstraint
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 from .nasa9_parser import Species
@@ -443,7 +443,6 @@ def solve_equilibrium_HP(
     tol_H: float = 1e-3,        # отн. невязка по энтальпии
     max_outer: int = 60,
     use_cache: bool = True,
-    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> EquilibriumResult:
     """
     Находит равновесие при заданных H и P.
@@ -516,11 +515,6 @@ def solve_equilibrium_HP(
         if verbose:
             print(f"  HP outer {outer:3d}: T={T:.3f} К, H={H_now:.4e}, "
                   f"target={H_target:.4e}, rel.dH={rel_dH:+.3e}")
-        if progress_cb:
-            progress_cb(
-                f"Камера (HP) · внешний шаг {outer + 1}/{max_outer}: "
-                f"T={T:.1f} К, ΔH/H={rel_dH:+.1e}"
-            )
 
         if abs(rel_dH) < tol_H:
             converged = True
@@ -591,8 +585,6 @@ def solve_equilibrium_SP(
     tol_S: float = 1e-4,
     max_outer: int = 60,
     use_cache: bool = True,
-    n0_warm: Optional[np.ndarray] = None,
-    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> EquilibriumResult:
     """
     Находит равновесие при заданных S и P.
@@ -605,8 +597,7 @@ def solve_equilibrium_SP(
         logger = NullLogger()
 
     # ── кэш равновесного состава для SP-задачи ─────────────────────────
-    # warm-start (n0_warm) отключает кэш: состав кэшируется только для холодного старта.
-    _cache = get_global_cache() if (use_cache and n0_warm is None) else None
+    _cache = get_global_cache() if use_cache else None
     _cache_key = None
     if _cache is not None:
         _cache_key = _cache.make_key(
@@ -624,7 +615,7 @@ def solve_equilibrium_SP(
     T_min, T_max = T_bounds
 
     last_result = None
-    n_warm = n0_warm
+    n_warm = None
     iter_total = 0
     S_prev = None
     T_prev = None
@@ -656,11 +647,6 @@ def solve_equilibrium_SP(
         if verbose:
             print(f"  SP outer {outer:3d}: T={T:.3f} К, S={S_now:.4e}, "
                   f"target={S_target:.4e}, rel.dS={rel_dS:+.3e}")
-        if progress_cb:
-            progress_cb(
-                f"Расширение (SP) · внешний шаг {outer + 1}/{max_outer}: "
-                f"T={T:.1f} К, ΔS/S={rel_dS:+.1e}"
-            )
 
         if abs(rel_dS) < tol_S:
             converged = True
