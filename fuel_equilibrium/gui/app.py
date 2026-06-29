@@ -989,7 +989,9 @@ class MainWindow:
         dpg.set_value("txt_logs_view", text)
 
         if dpg.does_item_exist("lbl_log_file"):
-            dpg.set_value("lbl_log_file", f"Файл: {ActionLogger.log_path()}")
+            init_err = ActionLogger.log_init_error().strip()
+            suffix = f"  (ошибка инициализации: {init_err})" if init_err else ""
+            dpg.set_value("lbl_log_file", f"Файл: {ActionLogger.log_path()}{suffix}")
 
         try:
             if dpg.does_item_exist("logs_output_child"):

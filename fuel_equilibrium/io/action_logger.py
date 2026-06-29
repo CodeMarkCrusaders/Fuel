@@ -16,17 +16,20 @@ import json
 import logging
 import logging.handlers
 import os
+import tempfile
 import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Deque, Dict, List, Optional
 
-_LOG_DIR = os.path.join(os.path.expanduser("~"), ".fuel_equilibrium", "logs")
-_LOG_FILE = os.path.join(_LOG_DIR, "app.log")
 _MAX_BYTES = 2_097_152  # 2 МБ
 _BACKUP_COUNT = 3
 _MEMORY_LIMIT = 5000
+
+_LOGGER: Optional[logging.Logger] = None
+_ACTIVE_LOG_FILE: Optional[str] = None
+_LOGGER_INIT_ERROR: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -88,12 +91,7 @@ class _LogSink:
             return list(self._items)
 
 
-_LOGGER: Optional[logging.Logger] = None
 _SINK = _LogSink(_MEMORY_LIMIT)
-
-
-def _ensure_log_dir() -> None:
-    os.makedirs(_LOG_DIR, exist_ok=True)
 
 
 def _details_to_text(details: Dict[str, object]) -> str:
@@ -103,6 +101,70 @@ def _details_to_text(details: Dict[str, object]) -> str:
         return " | " + json.dumps(details, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
         return " | " + "; ".join(f"{k}={v!r}" for k, v in details.items())
+
+
+def _candidate_log_paths() -> List[str]:
+    """Набор путей для лог-файла (по приоритету, с fallback)."""
+    candidates: List[str] = []
+
+    env_dir = os.environ.get("FUEL_EQUILIBRIUM_LOG_DIR")
+    if env_dir:
+        candidates.append(os.path.join(env_dir, "app.log"))
+
+    # Предпочитаем локальный logs рядом с рабочим каталогом запуска.
+    candidates.append(os.path.join(os.getcwd(), "logs", "app.log"))
+
+    # Путь относительно пакета (удобно для запуска из исходников).
+    project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(project_dir, "logs", "app.log"))
+
+    # Пользовательский профиль.
+    candidates.append(os.path.join(os.path.expanduser("~"), ".fuel_equilibrium", "logs", "app.log"))
+
+    # Последний fallback: временный каталог.
+    candidates.append(os.path.join(tempfile.gettempdir(), "fuel_equilibrium", "logs", "app.log"))
+
+    # Удаляем дубликаты с сохранением порядка.
+    unique: List[str] = []
+    seen = set()
+    for p in candidates:
+        norm = os.path.abspath(os.path.normpath(p))
+        if norm not in seen:
+            seen.add(norm)
+            unique.append(norm)
+    return unique
+
+
+def _try_create_file_handler() -> Optional[logging.Handler]:
+    """Пытается создать файловый хендлер по fallback-путям."""
+    global _ACTIVE_LOG_FILE, _LOGGER_INIT_ERROR
+
+    last_error: Optional[str] = None
+    for path in _candidate_log_paths():
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                path,
+                maxBytes=_MAX_BYTES,
+                backupCount=_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(
+                logging.Formatter(
+                    "[%(asctime)s] %(levelname)-8s %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _ACTIVE_LOG_FILE = path
+            _LOGGER_INIT_ERROR = None
+            return handler
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+
+    _ACTIVE_LOG_FILE = None
+    _LOGGER_INIT_ERROR = last_error or "Не удалось создать RotatingFileHandler"
+    return None
 
 
 def _get_logger() -> logging.Logger:
@@ -122,24 +184,12 @@ def _get_logger() -> logging.Logger:
     memory_handler.setLevel(logging.DEBUG)
     logger.addHandler(memory_handler)
 
-    try:
-        _ensure_log_dir()
-        file_handler = logging.handlers.RotatingFileHandler(
-            _LOG_FILE,
-            maxBytes=_MAX_BYTES,
-            backupCount=_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(
-            logging.Formatter(
-                "[%(asctime)s] %(levelname)-8s %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-        )
+    file_handler = _try_create_file_handler()
+    if file_handler is not None:
         logger.addHandler(file_handler)
-    except (OSError, PermissionError):
+    else:
         logger.addHandler(logging.NullHandler())
+        logger.error("Не удалось инициализировать файловый лог", reason=_LOGGER_INIT_ERROR)
 
     _LOGGER = logger
     return logger
@@ -178,7 +228,15 @@ class ActionLogger:
     @staticmethod
     def log_path() -> str:
         _get_logger()
-        return _LOG_FILE
+        if _ACTIVE_LOG_FILE:
+            return _ACTIVE_LOG_FILE
+        # Если файловый лог не поднялся, показываем первый ожидаемый путь.
+        return _candidate_log_paths()[0]
+
+    @staticmethod
+    def log_init_error() -> str:
+        _get_logger()
+        return _LOGGER_INIT_ERROR or ""
 
     @staticmethod
     def get_entries(limit: int = 300, min_level: str = "INFO", contains: str = "") -> List[LogEntry]:
@@ -227,7 +285,7 @@ class ActionLogger:
         """Принудительно сбросить хендлеры logging."""
         logger = _get_logger()
         if reason:
-            logger.debug("flush() | %s", reason)
+            ActionLogger.debug("flush", reason=reason)
         for h in logger.handlers:
             try:
                 h.flush()

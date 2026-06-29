@@ -239,30 +239,42 @@ class ComponentSelectorDialogDPG:
         self._callback = callback
         self._result: Optional[str] = None
         self._modal_id: Optional[int] = None
+
+        # Уникальные теги на экземпляр диалога (иначе между окнами бывают коллизии).
+        self._tag_prefix = f"__cs_{id(self)}"
+        self._tag_modal = f"{self._tag_prefix}_modal"
+        self._tag_search = f"{self._tag_prefix}_search"
+        self._tag_filter = f"{self._tag_prefix}_filter"
+        self._tag_table = f"{self._tag_prefix}_table"
+        self._tag_details = f"{self._tag_prefix}_details"
+
         self._build_modal()
 
     def _build_modal(self):
         # Создаём всплывающее окно поверх вьюпорта.
         title = (f"Выбор компонента ("
                  f"{'Окислитель' if self.mode == 'oxidizer' else 'Горючее'})")
-        with dpg.window(tag="__comp_selector_modal", label=title,
+        if dpg.does_item_exist(self._tag_modal):
+            dpg.delete_item(self._tag_modal)
+
+        with dpg.window(tag=self._tag_modal, label=title,
                         modal=True, no_close=True, width=620, height=500,
                         pos=[100, 80]) as self._modal_id:
             dpg.add_input_text(label="Поиск",
                                hint="Имя или элемент...",
-                               tag="__cs_search",
+                               tag=self._tag_search,
                                callback=self._filter)
             with dpg.group(horizontal=True):
                 dpg.add_text("Состояние:")
                 dpg.add_radio_button(
                     ["Все", "Газ", "Жидкость", "Твёрдое"],
-                    tag="__cs_filter", horizontal=True,
+                    tag=self._tag_filter, horizontal=True,
                     default_value="Все", callback=self._filter)
             dpg.add_text(
                 f"Показаны вещества для "
                 f"{'окислителя' if self.mode == 'oxidizer' else 'горючего'}.",
                 color=(168, 162, 158))
-            with dpg.table(tag="__cs_table", header_row=True,
+            with dpg.table(tag=self._tag_table, header_row=True,
                            resizable=True, height=300,
                            policy=dpg.mvTable_SizingStretchProp):
                 dpg.add_table_column(label="Компонент", width_fixed=True,
@@ -271,7 +283,7 @@ class ComponentSelectorDialogDPG:
                                      init_width_or_weight=120)
                 dpg.add_table_column(label="М (г/моль)")
                 dpg.add_table_column(label="Сост.")
-            dpg.add_text("", tag="__cs_details", wrap=580)
+            dpg.add_text("", tag=self._tag_details, wrap=580)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="✓ Выбрать",
                                callback=lambda *_: self._accept())
@@ -281,11 +293,11 @@ class ComponentSelectorDialogDPG:
 
     def _populate(self):
         """Заполнить таблицу отфильтрованными компонентами."""
-        table = "__cs_table"
+        table = self._tag_table
         for child in _get_slot_children(table, slot=1):
             dpg.delete_item(child)
-        search = (dpg.get_value("__cs_search") or "").lower().strip()
-        fstate = dpg.get_value("__cs_filter") or "Все"
+        search = (dpg.get_value(self._tag_search) or "").lower().strip()
+        fstate = dpg.get_value(self._tag_filter) or "Все"
         state_map = {"Все": None, "Газ": "gas",
                      "Жидкость": "liquid", "Твёрдое": "solid"}
         state_filter = state_map.get(fstate)
@@ -318,14 +330,22 @@ class ComponentSelectorDialogDPG:
                            f"М: {sp.mol_weight:.4f} г/моль\n"
                            f"Hf298: {sp.hf298:.2f} Дж/моль\n"
                            f"Сост.: {sp.aggregate_state_ru}")
-                    dpg.set_value("__cs_details", txt)
+                    dpg.set_value(self._tag_details, txt)
                 self._result = name
+                ActionLogger.debug("Компонент выделен в диалоге", name=name, mode=self.mode)
         return _cb
 
     def _filter(self, *args):
         self._populate()
 
     def _accept(self, *_):
+        if not self._result:
+            ActionLogger.warning("Компонент не выбран в диалоге", mode=self.mode)
+            if dpg.does_item_exist(self._tag_details):
+                dpg.set_value(self._tag_details, "Сначала выберите компонент в таблице.")
+            return
+
+        ActionLogger.info("Подтверждён выбор компонента", name=self._result, mode=self.mode)
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
@@ -333,6 +353,7 @@ class ComponentSelectorDialogDPG:
             self._callback(self._result)
 
     def _cancel(self, *_):
+        ActionLogger.info("Диалог выбора компонента закрыт без выбора", mode=self.mode)
         if self._modal_id is not None:
             dpg.delete_item(self._modal_id)
             self._modal_id = None
