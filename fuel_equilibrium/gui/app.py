@@ -598,6 +598,8 @@ class MainWindow:
         self._calc_geom_type = "profiled"
         self._calc_use_rpa = False
         self._solver = "own"
+        # Путь к текущему файлу конфигурации (для быстрого сохранения)
+        self._config_path: Optional[str] = None
 
         self._build()
 
@@ -623,8 +625,10 @@ class MainWindow:
                 dpg.add_menu_item(label="Экспорт Amesim (.data)…",
                                   callback=self.on_export_amesim)
                 dpg.add_separator()
-                dpg.add_menu_item(label="Сохранить конфигурацию…",
+                dpg.add_menu_item(label="Сохранить конфигурацию",
                                   callback=self.on_save_config)
+                dpg.add_menu_item(label="Сохранить конфигурацию как…",
+                                  callback=self.on_save_config_as)
                 dpg.add_menu_item(label="Загрузить конфигурацию…",
                                   callback=self.on_load_config)
                 dpg.add_separator()
@@ -2173,20 +2177,9 @@ class MainWindow:
 
     # ─── Конфигурация ────────────────────────────────────────────────────
 
-    def on_save_config(self):
-        if self.mixture_widget is None:
-            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
-            return
-        ActionLogger.info("Сохранение конфигурации")
-        # Диалог выбора файла через проводник Windows
-        path = _save_file_dialog(
-            "Сохранить конфигурацию",
-            "rpa_config.json",
-            [("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if path is None:
-            return
-        cfg = {
+    def _build_config_dict(self) -> dict:
+        """Собирает словарь конфигурации из текущих полей UI."""
+        return {
             "mixture": self.mixture_widget.get_mixture(),
             "mix_mode": self._mix_mode(),
             "mix_value": dpg.get_value("ed_mix_value") or "",
@@ -2213,16 +2206,54 @@ class MainWindow:
                 "dark": bool(dpg.get_value("chk_dark_plot")),
             },
         }
+
+    def _write_config(self, path: str):
+        """Записывает конфигурацию в указанный файл."""
+        cfg = self._build_config_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def on_save_config(self):
+        """Быстрое сохранение конфигурации (без диалога, в текущий файл).
+
+        Если файл ещё не был сохранён/загружен — открывает диалог «Сохранить как».
+        """
+        if self.mixture_widget is None:
+            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
+            return
+        if self._config_path is None:
+            # Нет текущего файла — переходим к «Сохранить как»
+            self.on_save_config_as()
+            return
+        ActionLogger.info("Быстрое сохранение конфигурации", path=self._config_path)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self._write_config(self._config_path)
+            dpg.set_value("status_text", f"Конфигурация сохранена: {self._config_path}")
+        except Exception as e:
+            dpg.set_value("status_text", f"Ошибка: {e}")
+
+    def on_save_config_as(self):
+        """Сохранение конфигурации с выбором пути через проводник Windows."""
+        if self.mixture_widget is None:
+            ActionLogger.warning("Сохранение конфигурации прервано — нет mixture_widget")
+            return
+        ActionLogger.info("Сохранение конфигурации как…")
+        path = _save_file_dialog(
+            "Сохранить конфигурацию как",
+            "rpa_config.json",
+            [("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path is None:
+            return
+        try:
+            self._write_config(path)
+            self._config_path = path  # Запоминаем путь для быстрого сохранения
             dpg.set_value("status_text", f"Конфигурация сохранена: {path}")
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка: {e}")
 
     def on_load_config(self):
         ActionLogger.info("Загрузка конфигурации")
-        # Диалог выбора файла через проводник Windows
         path = _open_file_dialog(
             "Загрузить конфигурацию",
             [("JSON files", "*.json"), ("All files", "*.*")],
@@ -2258,6 +2289,7 @@ class MainWindow:
             dpg.set_value("chk_dark_plot", bool(st.get("dark", True)))
             self._update_of_from_mixture()
             self._update_overall_efficiency()
+            self._config_path = path  # Запоминаем путь для быстрого сохранения
             dpg.set_value("status_text", f"Конфигурация загружена: {path}")
         except Exception as e:
             dpg.set_value("status_text", f"Ошибка: {e}")
