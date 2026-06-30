@@ -619,7 +619,7 @@ def _build_segmented_pressure_grid(
     Возвращает массив давлений (Па), отсортированный по ходу потока
     (от большего к меньшему), без граничных точек Pc/Pt/Pe.
     """
-    n_total = int(max(0, min(1048, n_total)))
+    n_total = int(max(0, n_total))
     if n_total <= 0:
         return np.array([], dtype=float)
 
@@ -849,7 +849,7 @@ def solve_rocket_nozzle(
         oxidizer, fuel  — компоненты топлива (mass_kg в сумме обычно = 1 кг).
         P_chamber, P_exit — давления в камере и на срезе, Па.
         n_intermediate_stations — общее число дополнительных сечений
-                                  (0..1048) для газодинамического расчёта.
+                                  (0..∞) для газодинамического расчёта.
         section_density_*       — относительная плотность сечений по зонам
                                   дозвук/критика/сверхзвук.
         injection_velocity — скорость подачи компонентов на входе (м/с).
@@ -868,7 +868,7 @@ def solve_rocket_nozzle(
     if logger is None:
         logger = NullLogger()
 
-    n_intermediate_stations = int(max(0, min(1048, n_intermediate_stations)))
+    n_intermediate_stations = int(max(0, n_intermediate_stations))
 
     # ── 1) Энтальпия реагентов и элементный баланс ─────────────────────
     components = [oxidizer, fuel]

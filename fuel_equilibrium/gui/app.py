@@ -626,11 +626,6 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     x = x[order]; P = P[order]; T = T[order]; rho = rho[order]
     V = V[order]; a = a[order]; gs = gs[order]; Ae = Ae[order]
     labels = [labels[i] for i in order]
-    _, iu = np.unique(np.round(x, 9), return_index=True)
-    iu = np.sort(iu)
-    x = x[iu]; P = P[iu]; T = T[iu]; rho = rho[iu]
-    V = V[iu]; a = a[iu]; gs = gs[iu]; Ae = Ae[iu]
-    labels = [labels[i] for i in iu]
 
     # Решатель газодинамики (rocket/nozzle_flow.py) теперь выдаёт гладкие
     # профили gamma_s/a/M (производные считаются с жёстким допуском и
@@ -657,11 +652,11 @@ def section_series(perf, chamber_length_m, conv_div_lengths) -> dict:
     S = np.array([float(getattr(s, "S_J_per_kgK", float("nan"))) for s in stations])
     H = np.array([float(getattr(s, "H_J_per_kg", float("nan"))) for s in stations])
     if S.size == order.size:
-        S = S[order][iu]
+        S = S[order]
     else:
         S = np.full_like(x, float("nan"))
     if H.size == order.size:
-        H = H[order][iu]
+        H = H[order]
     else:
         H = np.full_like(x, float("nan"))
 
@@ -754,7 +749,7 @@ class MainWindow:
         self.worker: Optional[NozzleSolverWorker] = None
         self.mixture_widget: Optional[MixturePropellantWidgetDPG] = None
         self._side_width = 280
-        self._left_width = 460
+        self._left_width = 560
         self._plot_keys = list(PLOT_DEFAULT_KEYS)
         self._show_profile_1d = False
         self._last_geometry: Optional[NozzleGeometry] = None
@@ -822,7 +817,7 @@ class MainWindow:
                                  width=self._left_width,
                                  border=True, autosize_x=False,
                                  autosize_y=True,
-                                 horizontal_scrollbar=False)
+                                 horizontal_scrollbar=True)
             self._build_input_panel()
 
             # Сплиттер (перетаскиваемая граница). Кнопка-ручка: пока удерживается
@@ -872,7 +867,7 @@ class MainWindow:
             except Exception:
                 root_x = 0
             new_w = int(mx - root_x)
-            new_w = max(300, min(new_w, 1100))
+            new_w = max(360, min(new_w, 1200))
             if new_w != self._left_width:
                 self._left_width = new_w
                 dpg.set_item_width("left_panel", self._left_width)
@@ -923,13 +918,12 @@ class MainWindow:
                 mix_tag, self.species_db,
                 on_change=lambda m: self._update_of_from_mixture())
 
-            # Соотношение компонентов
             with dpg.group(horizontal=True):
                 dpg.add_text("Соотношение:")
                 dpg.add_combo(
                     ["Km (массовое O/F)", "α (Km/Km0)", "Оптимум (max Isp)"],
                     tag="cb_mix_mode", default_value="Km (массовое O/F)",
-                    width=-40, callback=lambda s, a: self._on_mix_mode_changed())
+                    width=220, callback=lambda s, a: self._on_mix_mode_changed())
             dpg.add_input_text(label="Значение", hint="Km (O/F)",
                                tag="ed_mix_value", width=-1,
                                callback=lambda s: self._update_of_from_mixture())
@@ -938,42 +932,45 @@ class MainWindow:
         with dpg.collapsing_header(parent="left_panel",
                                    label="Параметры расчёта",
                                    default_open=True, closable=False):
-            # Исходные данные
             with dpg.collapsing_header(label="Исходные данные",
-                                        default_open=True, closable=False,
-                                        leaf=True):
-                dpg.add_input_text(label="P камеры", hint="давление",
-                                   tag="ed_Pc", width=-1)
-                dpg.add_combo(["Па", "кПа", "МПа", "бар", "атм"],
-                              tag="cb_Pc_unit", default_value="МПа", width=-1)
-                dpg.add_input_text(label="P среза", hint="давление",
-                                   tag="ed_Pe", width=-1)
-                dpg.add_combo(["Па", "кПа", "МПа", "бар", "атм"],
-                              tag="cb_Pe_unit", default_value="МПа", width=-1)
-                dpg.add_slider_float(label="Скорость подачи (м/с)",
-                                     tag="sp_inj_velocity",
-                                     default_value=0.0, min_value=0.0,
-                                     max_value=500.0, format="%.1f")
-                dpg.add_slider_float(label="Перепад давления (%)",
-                                     tag="sp_chamber_dp",
-                                     default_value=0.0, min_value=0.0,
-                                     max_value=30.0, format="%.2f")
+                                       default_open=True, closable=False,
+                                       leaf=True):
+                dpg.add_text("P камеры", color=C_MUTED)
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(hint="давление", tag="ed_Pc", width=-100)
+                    dpg.add_combo(["Па", "кПа", "МПа", "бар", "атм"],
+                                  tag="cb_Pc_unit", default_value="МПа", width=90)
+
+                dpg.add_text("P среза", color=C_MUTED)
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(hint="давление", tag="ed_Pe", width=-100)
+                    dpg.add_combo(["Па", "кПа", "МПа", "бар", "атм"],
+                                  tag="cb_Pe_unit", default_value="МПа", width=90)
+
+                dpg.add_input_float(label="Скорость подачи (м/с)",
+                                    tag="sp_inj_velocity",
+                                    default_value=0.0, min_value=0.0,
+                                    min_clamped=True, format="%.3f")
+                dpg.add_input_float(label="Перепад давления (%)",
+                                    tag="sp_chamber_dp",
+                                    default_value=0.0, min_value=0.0,
+                                    min_clamped=True, format="%.4f")
                 dpg.add_checkbox(label="Учитывать конденсат",
                                  tag="chk_condensed", default_value=True)
-            # Газодинамика
+
             with dpg.collapsing_header(label="Газодинамика (1D)",
-                                        default_open=False, closable=False,
-                                        leaf=True):
-                dpg.add_slider_int(label="Промежут. сечений",
-                                    tag="sp_n_inter", default_value=8,
-                                    min_value=0, max_value=1048)
+                                       default_open=False, closable=False,
+                                       leaf=True):
+                dpg.add_input_int(label="Промежут. сечений",
+                                  tag="sp_n_inter", default_value=8,
+                                  min_value=0, min_clamped=True)
                 dpg.add_text("Промежуточные сечения распределяются равномерно\n"
                              "по длине сопла (дозвук → горловина → сверхзвук).",
-                             color=C_MUTED, wrap=380)
-            # Геометрия (для оси X)
+                             color=C_MUTED, wrap=520)
+
             with dpg.collapsing_header(label="Геометрия (Size & Geometry)",
-                                        default_open=False, closable=False,
-                                        leaf=True):
+                                       default_open=False, closable=False,
+                                       leaf=True):
                 self._build_geometry_input()
 
         with dpg.collapsing_header(parent="left_panel",
@@ -989,22 +986,27 @@ class MainWindow:
                              callback=self._on_solver_changed)
             dpg.add_text("Собственный решатель использует NASA-9 полиномы и SLSQP.\n"
                          "CEA-решатель (Cantera) даёт идентичные результаты NASA CEA.",
-                         color=C_MUTED, wrap=380)
+                         color=C_MUTED, wrap=520)
 
         with dpg.collapsing_header(parent="left_panel",
                                    label="Потери (реализуемые КПД)",
                                    default_open=False, closable=False):
-            dpg.add_slider_float(label="КПД реакции ηр",
-                                 tag="sp_eff_reaction",
-                                 default_value=1.0, min_value=0.0,
-                                 max_value=1.0, format="%.4f")
-            dpg.add_slider_float(label="КПД сопла ηс",
-                                 tag="sp_eff_nozzle",
-                                 default_value=1.0, min_value=0.0,
-                                 max_value=1.0, format="%.4f",
-                                 callback=self._update_overall_efficiency)
+            dpg.add_input_float(label="КПД реакции ηр",
+                                tag="sp_eff_reaction",
+                                default_value=1.0, min_value=0.0,
+                                max_value=1.0, format="%.4f")
+            dpg.add_input_float(label="КПД сопла ηс",
+                                tag="sp_eff_nozzle",
+                                default_value=1.0, min_value=0.0,
+                                max_value=1.0, format="%.4f",
+                                callback=self._update_overall_efficiency)
             dpg.add_text("Суммарный ηобщ = 1.0000", tag="lbl_eff_overall",
                          color=C_ACCENT)
+
+        with dpg.collapsing_header(parent="left_panel",
+                                   label="Аналитический расчёт (RPA JSON)",
+                                   default_open=False, closable=False):
+            self._build_analytic_tab(embedded=True)
 
         # Кнопка расчёта и статус перенесены в нижнюю панель правой колонки
         # (_build_action_bar). Здесь больше ничего не добавляем.
@@ -1067,11 +1069,16 @@ class MainWindow:
             with dpg.tab(label="Газодинамика"):
                 with dpg.tab_bar():
                     with dpg.tab(label="Параметры по сечениям", tag="tab_stations"):
-                        with dpg.table(tag="tbl_stations", header_row=True,
-                                       resizable=True, policy=dpg.mvTable_SizingStretchProp):
-                            dpg.add_table_column(label="Параметр")
-                            dpg.add_table_column(label="Значение")
-                            dpg.add_table_column(label="Ед.изм.")
+                        with dpg.child_window(tag="stations_table_container",
+                                              border=False,
+                                              autosize_x=True,
+                                              autosize_y=True,
+                                              horizontal_scrollbar=True):
+                            with dpg.table(tag="tbl_stations", header_row=True,
+                                           resizable=True, policy=dpg.mvTable_SizingStretchProp):
+                                dpg.add_table_column(label="Параметр")
+                                dpg.add_table_column(label="Значение")
+                                dpg.add_table_column(label="Ед.изм.")
                     with dpg.tab(label="Графики по длине сопла"):
                         self._build_plots_tab()
                     with dpg.tab(label="Тяговые характеристики"):
@@ -1090,10 +1097,11 @@ class MainWindow:
                                              tag="rb_mass", default_value=False,
                                              callback=lambda: self._on_fraction_mode_changed("rb_mass"))
                             dpg.add_text("Топ:")
-                            dpg.add_slider_int(tag="sp_topN", default_value=15,
-                                               min_value=3, max_value=50,
-                                               width=120,
-                                               callback=lambda: self._refresh_species_view())
+                            dpg.add_input_int(tag="sp_topN", default_value=15,
+                                              min_value=3, max_value=50,
+                                              min_clamped=True, max_clamped=True,
+                                              width=120,
+                                              callback=lambda: self._refresh_species_view())
                         with dpg.table(tag="tbl_species", header_row=True,
                                        resizable=True, policy=dpg.mvTable_SizingStretchProp):
                             dpg.add_table_column(label="Компонент")
@@ -1103,11 +1111,7 @@ class MainWindow:
             with dpg.tab(label="Геометрия"):
                 self._build_geometry_tab()
 
-            # Группа 4: Аналитический расчёт
-            with dpg.tab(label="Аналитический расчёт"):
-                self._build_analytic_tab()
-
-            # Группа 5: Журнал
+            # Группа 4: Журнал
             with dpg.tab(label="Логи"):
                 self._build_logs_tab()
 
@@ -1124,9 +1128,10 @@ class MainWindow:
         with dpg.group(horizontal=True):
             dpg.add_input_text(label="Фильтр", tag="ed_logs_filter", width=320,
                                callback=lambda: self._refresh_log_view(force=True))
-            dpg.add_slider_int(label="Строк", tag="sp_logs_lines", default_value=300,
-                               min_value=50, max_value=5000, width=250,
-                               callback=lambda: self._refresh_log_view(force=True))
+            dpg.add_input_int(label="Строк", tag="sp_logs_lines", default_value=300,
+                              min_value=50, max_value=5000,
+                              min_clamped=True, max_clamped=True, width=250,
+                              callback=lambda: self._refresh_log_view(force=True))
         dpg.add_text("Файл: —", tag="lbl_log_file", color=C_MUTED, wrap=1000)
         with dpg.child_window(tag="logs_output_child", autosize_x=True, autosize_y=True, border=True):
             dpg.add_input_text(tag="txt_logs_view", multiline=True, readonly=True,
@@ -1313,10 +1318,11 @@ class MainWindow:
                                       tag="geom_y")
                 dpg.add_text("", tag="txt_geom_summary", wrap=600)
 
-    def _build_analytic_tab(self):
-        """Вкладка RPA-ввода: чекбоксы (много) + радио-группы (один из)."""
-        with dpg.group(horizontal=True):
-            with dpg.child_window(border=True, width=520, autosize_y=True):
+    def _build_analytic_tab(self, embedded: bool = False):
+        """Форма RPA-ввода: чекбоксы (много) + радио-группы (один из)."""
+        form_width = -1 if embedded else 520
+        with dpg.group(horizontal=(not embedded)):
+            with dpg.child_window(border=True, width=form_width, autosize_y=True):
                 dpg.add_text("Форма входных данных в стиле RPA.",
                              color=C_MUTED, wrap=500)
                 dpg.add_separator()
@@ -2076,8 +2082,8 @@ class MainWindow:
                     dpg.add_text(unit)
 
     def _stations_parent(self) -> str:
-        """Родительский тег для таблицы станций (вкладка)."""
-        return "tab_stations"
+        """Родительский тег для таблицы станций (контейнер с прокруткой)."""
+        return "stations_table_container"
 
     def _fill_perf_text(self, perf: RocketPerformance):
         ActionLogger.info("Заполнение текста тяговых характеристик")
