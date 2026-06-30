@@ -351,33 +351,43 @@ class NozzleSolverWorker:
         fu_components = p["fuel_components"]
         if not ox_components or not fu_components:
             raise ValueError("Не заданы компоненты окислителя и/или горючего.")
+
         of_ratio = max(float(of_ratio), 1e-9)
         fuel_mass_kg = 1.0 / (1.0 + of_ratio)
         oxidizer_mass_kg = of_ratio / (1.0 + of_ratio)
+
         ox_comp = ox_components[0]
         ox_T = ox_comp["T"] if ox_comp["T"] > 0 else None
         ox = Propellant(name=ox_comp["name"], mass_kg=oxidizer_mass_kg, T_K=ox_T)
+
         fu_comp = fu_components[0]
         fu_T = fu_comp["T"] if fu_comp["T"] > 0 else None
         fu = Propellant(name=fu_comp["name"], mass_kg=fuel_mass_kg, T_K=fu_T)
 
-        if self.solver == "cea":
-            perf = solve_rocket_nozzle_cea(
-                oxidizer=ox, fuel=fu,
-                P_chamber=p["P_chamber"], P_exit=p["P_exit"],
-                n_intermediate_stations=p.get("n_inter", 5),
-                include_condensed=p.get("include_condensed", False),
-                injection_velocity=p.get("injection_velocity", 0.0),
-                chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
-                verbose=False,
-                progress_cb=lambda s: self._emit({"type": "progress", "msg": s}),
-            )
-        else:
-            perf = solve_rocket_nozzle(
+        def _solve_once(n_inter: int, densities=(1.0, 1.0, 1.0)):
+            d_sub, d_crit, d_sup = densities
+            if self.solver == "cea":
+                return solve_rocket_nozzle_cea(
+                    oxidizer=ox, fuel=fu,
+                    P_chamber=p["P_chamber"], P_exit=p["P_exit"],
+                    n_intermediate_stations=n_inter,
+                    section_density_subsonic=d_sub,
+                    section_density_critical=d_crit,
+                    section_density_supersonic=d_sup,
+                    include_condensed=p.get("include_condensed", False),
+                    injection_velocity=p.get("injection_velocity", 0.0),
+                    chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
+                    verbose=False,
+                    progress_cb=lambda s: self._emit({"type": "progress", "msg": s}),
+                )
+            return solve_rocket_nozzle(
                 oxidizer=ox, fuel=fu,
                 P_chamber=p["P_chamber"], P_exit=p["P_exit"],
                 species_db=self.species_db,
-                n_intermediate_stations=p.get("n_inter", 5),
+                n_intermediate_stations=n_inter,
+                section_density_subsonic=d_sub,
+                section_density_critical=d_crit,
+                section_density_supersonic=d_sup,
                 include_condensed=p.get("include_condensed", True),
                 injection_velocity=p.get("injection_velocity", 0.0),
                 chamber_pressure_drop_frac=p.get("chamber_pressure_drop_frac", 0.0),
@@ -386,7 +396,73 @@ class NozzleSolverWorker:
                     context=f"solver=own; of={of_ratio:.6f}"
                 ),
             )
-        return perf
+
+        def _geometry_density_weights(perf_main: RocketPerformance):
+            try:
+                st_exit = perf_main.stations[-1]
+                ar = float(getattr(st_exit, "Ae_At", float("nan")))
+                if not (math.isfinite(ar) and ar > 1.0):
+                    return (1.0, 1.0, 1.0)
+
+                R_throat = max(float(p.get("geom_R_throat_m", 0.05)), 1e-6)
+                R_ch_factor = max(float(p.get("geom_R_chamber_factor", 2.5)), 1.05)
+                R_chamber = R_throat * R_ch_factor
+                theta_in = float(p.get("geom_theta_in_deg", 30.0))
+                theta_exit = float(p.get("geom_theta_exit_deg", 15.0))
+                theta_max = float(p.get("geom_theta_max_deg", 30.0))
+                length_ratio = float(p.get("geom_length_ratio", 9.5))
+                auto_angles = bool(p.get("geom_auto_angles", True))
+                method = str(p.get("geom_method", "profiled") or "profiled").lower()
+
+                if method == "conical":
+                    geom = build_conical_nozzle(
+                        R_throat, ar,
+                        R_chamber_m=R_chamber,
+                        theta_exit_deg=theta_exit,
+                        theta_in_deg=theta_in,
+                    )
+                elif method == "rpa":
+                    geom = build_rpa_parabolic_nozzle(
+                        R_throat, ar,
+                        R_chamber_m=R_chamber,
+                        contraction_angle_deg=theta_in,
+                    )
+                else:
+                    geom = build_profiled_nozzle(
+                        R_throat, ar,
+                        R_chamber_m=R_chamber,
+                        theta_exit_deg=(None if auto_angles else theta_exit),
+                        theta_max_deg=(None if auto_angles else theta_max),
+                        length_ratio=(None if auto_angles else length_ratio),
+                        theta_in_deg=theta_in,
+                    )
+
+                l_sub = max(float(getattr(geom, "length_subsonic_m", 0.0)), 1e-6)
+                l_sup = max(float(getattr(geom, "length_supersonic_m", 0.0)), 1e-6)
+                l_crit = max(0.5 * (l_sub + l_sup) / 2.0, 1e-6)
+                return (l_sub, l_crit, l_sup)
+            except Exception:
+                return (1.0, 1.0, 1.0)
+
+        # Этап 1: равновесие/состав и параметры газа в 4 основных сечениях.
+        self._emit({"type": "progress", "msg": "Этап 1/2: равновесие в 4 основных сечениях..."})
+        perf_main = _solve_once(n_inter=0)
+
+        n_inter = int(max(0, p.get("n_inter", 5)))
+        if n_inter <= 0:
+            return perf_main
+
+        # Этап 2: геометрия сопла + промежуточные сечения.
+        densities = _geometry_density_weights(perf_main)
+        self._emit({
+            "type": "progress",
+            "msg": (
+                f"Этап 2/2: геометрия и промежуточные сечения (N={n_inter}, "
+                f"веса {densities[0]:.2f}/{densities[1]:.2f}/{densities[2]:.2f})..."
+            ),
+        })
+        perf_full = _solve_once(n_inter=n_inter, densities=densities)
+        return perf_full
 
     def _find_optimum_of(self):
         """Поиск оптимального Km (массовое O/F), максимизирующего Isp."""
@@ -1594,6 +1670,15 @@ class MainWindow:
             "include_condensed": bool(dpg.get_value("chk_condensed")),
             "injection_velocity": float(dpg.get_value("sp_inj_velocity") or 0.0),
             "chamber_pressure_drop_frac": float(dpg.get_value("sp_chamber_dp") or 0.0) / 100.0,
+            # Параметры геометрии для этапа 2/2 (распределение промежуточных сечений)
+            "geom_method": self._calc_geom_type,
+            "geom_R_throat_m": float(dpg.get_value("sp_calc_Rthroat") or 0.05),
+            "geom_R_chamber_factor": float(dpg.get_value("sp_calc_Rcham") or 2.5),
+            "geom_theta_in_deg": float(dpg.get_value("sp_calc_theta_in") or 30.0),
+            "geom_theta_max_deg": float(dpg.get_value("sp_calc_theta_max") or 30.0),
+            "geom_theta_exit_deg": float(dpg.get_value("sp_calc_theta_exit") or 15.0),
+            "geom_length_ratio": float(dpg.get_value("sp_calc_len_ratio") or 9.5),
+            "geom_auto_angles": bool(dpg.get_value("chk_calc_auto_angles")),
         }
 
         self._solver = "cea" if dpg.get_value("rb_cea") else "own"
