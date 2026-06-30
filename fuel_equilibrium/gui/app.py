@@ -1314,59 +1314,208 @@ class MainWindow:
                 dpg.add_text("", tag="txt_geom_summary", wrap=600)
 
     def _build_analytic_tab(self):
-        """Вкладка аналитического (инженерного) расчёта."""
+        """Вкладка RPA-ввода: чекбоксы (много) + радио-группы (один из)."""
         with dpg.group(horizontal=True):
-            with dpg.child_window(border=True, width=400, autosize_y=True):
-                dpg.add_text("Инженерная методика РПА / Добровольского.",
-                             color=C_MUTED, wrap=380)
+            with dpg.child_window(border=True, width=520, autosize_y=True):
+                dpg.add_text("Форма входных данных в стиле RPA.",
+                             color=C_MUTED, wrap=500)
                 dpg.add_separator()
-                dpg.add_input_float(label="Pн (тяга в пустот.), Н",
-                                    tag="sp_an_thrust",
-                                    default_value=7770000.0, format="%.1f")
-                dpg.add_input_float(label="pк (камера), МПа",
-                                    tag="sp_an_pk", default_value=7.0,
+
+                dpg.add_text("Chamber / thrust requirements", color=C_ACCENT)
+                dpg.add_input_float(label="Chamber pressure, MPa",
+                                    tag="sp_rpa_pc", default_value=13.4,
                                     format="%.4f")
-                dpg.add_input_float(label="pa (срез), МПа",
-                                    tag="sp_an_pa", default_value=0.0486,
-                                    format="%.5f")
-                dpg.add_input_float(label="Km (O/F массовое)",
-                                    tag="sp_an_Km", default_value=2.27,
-                                    format="%.4f")
-                dpg.add_input_float(label="Iуд (пустот.), м/с",
-                                    tag="sp_an_isp",
-                                    default_value=3349.4838, format="%.4f")
-                dpg.add_input_float(label="k (адиабата)", tag="sp_an_k",
-                                    default_value=1.1343, format="%.4f")
-                dpg.add_input_float(label="Rг, Дж/(кг·К)",
-                                    tag="sp_an_Rg", default_value=346.2,
-                                    format="%.3f")
-                dpg.add_input_float(label="Tк (камера), К",
-                                    tag="sp_an_Tk", default_value=3692.99,
-                                    format="%.2f")
-                dpg.add_input_float(label="α (справочно)",
-                                    tag="sp_an_alpha", default_value=0.81,
-                                    format="%.3f")
-                dpg.add_input_float(label="φк (камера)",
-                                    tag="sp_an_phik", default_value=0.99,
-                                    format="%.4f")
-                dpg.add_input_float(label="φс (сопло)",
-                                    tag="sp_an_phic", default_value=0.98,
-                                    format="%.4f")
-                dpg.add_input_float(label="Wср (впрыск), м/с",
-                                    tag="sp_an_winj", default_value=30.0,
-                                    format="%.1f")
-                dpg.add_input_float(label="ρ (скругление)",
-                                    tag="sp_an_rho", default_value=2.0,
-                                    format="%.2f")
+                dpg.add_checkbox(
+                    label="Determine thrust chamber size matching the specified requirements",
+                    tag="chk_rpa_determine_size", default_value=True)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Nominal thrust", tag="rb_rpa_nominal_thrust",
+                                     default_value=True,
+                                     callback=lambda: self._on_rpa_req_mode_changed("rb_rpa_nominal_thrust"))
+                    dpg.add_checkbox(label="Mass flow rate", tag="rb_rpa_mass_flow",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_req_mode_changed("rb_rpa_mass_flow"))
+                    dpg.add_checkbox(label="Throat diameter", tag="rb_rpa_throat_diameter",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_req_mode_changed("rb_rpa_throat_diameter"))
+                dpg.add_input_float(label="Nominal thrust, kN", tag="sp_rpa_nominal_thrust",
+                                    default_value=2846.0, format="%.3f")
+                dpg.add_input_float(label="Mass flow rate, kg/s", tag="sp_rpa_mass_flow",
+                                    default_value=0.0, format="%.4f")
+                dpg.add_input_float(label="Throat diameter, mm", tag="sp_rpa_throat_diameter",
+                                    default_value=0.0, format="%.4f")
+                dpg.add_input_int(label="Number of chambers", tag="sp_rpa_num_chambers",
+                                  default_value=1, min_value=1, min_clamped=True)
+                dpg.add_checkbox(label="Perform chamber thermal analysis",
+                                 tag="chk_rpa_thermal_analysis", default_value=False)
+
                 dpg.add_separator()
-                dpg.add_button(label="Рассчитать", width=-1,
+                dpg.add_text("Nozzle inlet condition", color=C_ACCENT)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Mass flux", tag="rb_rpa_inlet_mass_flux",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_inlet_mode_changed("rb_rpa_inlet_mass_flux"))
+                    dpg.add_checkbox(label="Contraction area ratio", tag="rb_rpa_inlet_contraction",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_inlet_mode_changed("rb_rpa_inlet_contraction"))
+                dpg.add_input_float(label="Mass flux, kg/(m²·s)", tag="sp_rpa_mass_flux",
+                                    default_value=0.0, format="%.4f")
+                dpg.add_input_float(label="Contraction area ratio (Ac/At)",
+                                    tag="sp_rpa_contraction_ratio", default_value=0.0,
+                                    format="%.4f")
+
+                dpg.add_separator()
+                dpg.add_text("Nozzle exit condition", color=C_ACCENT)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Pressure", tag="rb_rpa_exit_pressure",
+                                     default_value=True,
+                                     callback=lambda: self._on_rpa_exit_mode_changed("rb_rpa_exit_pressure"))
+                    dpg.add_checkbox(label="Expansion area ratio", tag="rb_rpa_exit_area_ratio",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_exit_mode_changed("rb_rpa_exit_area_ratio"))
+                    dpg.add_checkbox(label="Expansion pressure ratio", tag="rb_rpa_exit_pressure_ratio",
+                                     default_value=False,
+                                     callback=lambda: self._on_rpa_exit_mode_changed("rb_rpa_exit_pressure_ratio"))
+                dpg.add_input_float(label="Exit pressure, MPa", tag="sp_rpa_exit_pressure",
+                                    default_value=0.0486, format="%.5f")
+                dpg.add_input_float(label="Expansion area ratio (Ae/At)",
+                                    tag="sp_rpa_exit_area_ratio", default_value=0.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Expansion pressure ratio (pc/pe)",
+                                    tag="sp_rpa_exit_pressure_ratio", default_value=0.0,
+                                    format="%.4f")
+
+                dpg.add_separator()
+                dpg.add_checkbox(label="Frozen equilibrium flow",
+                                 tag="chk_rpa_frozen_flow", default_value=False)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Freezing at pressure ratio (pt/pf)",
+                                     tag="rb_rpa_freeze_pressure", default_value=True,
+                                     callback=lambda: self._on_rpa_frozen_mode_changed("rb_rpa_freeze_pressure"))
+                    dpg.add_checkbox(label="Freezing at area ratio (Af/At)",
+                                     tag="rb_rpa_freeze_area", default_value=False,
+                                     callback=lambda: self._on_rpa_frozen_mode_changed("rb_rpa_freeze_area"))
+                dpg.add_input_float(label="Freeze pressure ratio (pt/pf)",
+                                    tag="sp_rpa_freeze_pressure_ratio", default_value=0.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Freeze area ratio (Af/At)",
+                                    tag="sp_rpa_freeze_area_ratio", default_value=0.0,
+                                    format="%.4f")
+
+                dpg.add_separator()
+                dpg.add_text("Reaction efficiency", color=C_ACCENT)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Estimate efficiency from engine parameters",
+                                     tag="rb_rpa_reaction_estimate", default_value=True,
+                                     callback=lambda: self._on_rpa_reaction_eff_mode_changed("rb_rpa_reaction_estimate"))
+                    dpg.add_checkbox(label="Predefined efficiency",
+                                     tag="rb_rpa_reaction_predefined", default_value=False,
+                                     callback=lambda: self._on_rpa_reaction_eff_mode_changed("rb_rpa_reaction_predefined"))
+                dpg.add_input_float(label="Predefined reaction efficiency, %",
+                                    tag="sp_rpa_reaction_eff_pct", default_value=100.0,
+                                    format="%.3f")
+
+                dpg.add_separator()
+                dpg.add_text("Nozzle shape and efficiency", color=C_ACCENT)
+                dpg.add_checkbox(
+                    label="Bell nozzle, estimate efficiency for length=80%",
+                    tag="rb_rpa_nozzle_shape_estimate", default_value=True,
+                    callback=lambda: self._on_rpa_nozzle_shape_mode_changed("rb_rpa_nozzle_shape_estimate"))
+                dpg.add_checkbox(label="Bell nozzle with length, %",
+                                 tag="rb_rpa_nozzle_shape_len", default_value=False,
+                                 callback=lambda: self._on_rpa_nozzle_shape_mode_changed("rb_rpa_nozzle_shape_len"))
+                dpg.add_checkbox(label="Bell nozzle with efficiency, %",
+                                 tag="rb_rpa_nozzle_shape_eff", default_value=False,
+                                 callback=lambda: self._on_rpa_nozzle_shape_mode_changed("rb_rpa_nozzle_shape_eff"))
+                dpg.add_checkbox(label="Conical nozzle with half angle, deg",
+                                 tag="rb_rpa_nozzle_shape_conical", default_value=False,
+                                 callback=lambda: self._on_rpa_nozzle_shape_mode_changed("rb_rpa_nozzle_shape_conical"))
+                dpg.add_input_float(label="Bell nozzle length, %",
+                                    tag="sp_rpa_nozzle_len_pct", default_value=80.0,
+                                    format="%.3f")
+                dpg.add_input_float(label="Bell nozzle efficiency, %",
+                                    tag="sp_rpa_nozzle_eff_pct", default_value=100.0,
+                                    format="%.3f")
+                dpg.add_input_float(label="Conical half-angle, deg",
+                                    tag="sp_rpa_nozzle_half_angle_deg", default_value=15.0,
+                                    format="%.3f")
+
+                dpg.add_separator()
+                dpg.add_text("Nozzle flow effects", color=C_ACCENT)
+                dpg.add_checkbox(label="Consider multiphase flow and phase transitions",
+                                 tag="chk_rpa_multiphase", default_value=True)
+                dpg.add_checkbox(label="Consider species ionization effects",
+                                 tag="chk_rpa_ionization", default_value=True)
+                dpg.add_checkbox(label="Estimate performance loss due to flow separation",
+                                 tag="chk_rpa_flow_sep_loss", default_value=True)
+
+                dpg.add_separator()
+                dpg.add_text("Ambient operating condition", color=C_ACCENT)
+                dpg.add_checkbox(label="Enable ambient operating condition",
+                                 tag="chk_rpa_ambient_enable", default_value=False)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Fixed ambient pressure",
+                                     tag="rb_rpa_ambient_fixed", default_value=True,
+                                     callback=lambda: self._on_rpa_ambient_mode_changed("rb_rpa_ambient_fixed"))
+                    dpg.add_checkbox(label="Ambient pressure range",
+                                     tag="rb_rpa_ambient_range", default_value=False,
+                                     callback=lambda: self._on_rpa_ambient_mode_changed("rb_rpa_ambient_range"))
+                dpg.add_input_float(label="Ambient fixed pressure, atm",
+                                    tag="sp_rpa_ambient_fixed_atm", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Ambient pressure from, atm",
+                                    tag="sp_rpa_ambient_from_atm", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Ambient pressure to, atm",
+                                    tag="sp_rpa_ambient_to_atm", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_checkbox(label="Calculate estimated delivered performance",
+                                 tag="chk_rpa_ambient_delivered", default_value=False)
+
+                dpg.add_separator()
+                dpg.add_text("Throttle settings", color=C_ACCENT)
+                dpg.add_checkbox(label="Enable throttle settings",
+                                 tag="chk_rpa_throttle_enable", default_value=False)
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(label="Fixed throttle value",
+                                     tag="rb_rpa_throttle_fixed", default_value=True,
+                                     callback=lambda: self._on_rpa_throttle_mode_changed("rb_rpa_throttle_fixed"))
+                    dpg.add_checkbox(label="Throttle values range",
+                                     tag="rb_rpa_throttle_range", default_value=False,
+                                     callback=lambda: self._on_rpa_throttle_mode_changed("rb_rpa_throttle_range"))
+                dpg.add_input_float(label="Fixed throttle value (0..1)",
+                                    tag="sp_rpa_throttle_fixed", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Throttle min (0..1)",
+                                    tag="sp_rpa_throttle_min", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_input_float(label="Throttle max (0..1)",
+                                    tag="sp_rpa_throttle_max", default_value=1.0,
+                                    format="%.4f")
+                dpg.add_checkbox(label="Calculate estimated delivered performance",
+                                 tag="chk_rpa_throttle_delivered", default_value=False)
+
+                dpg.add_separator()
+                dpg.add_button(label="Собрать входные данные", width=-1,
                                callback=self._on_analytic_compute)
                 dpg.add_button(label="Из основного расчёта", width=-1,
                                callback=self._on_analytic_pull_from_main)
             with dpg.child_window(border=False, autosize_x=True,
                                   autosize_y=True):
-                dpg.add_text("Задайте исходные данные слева и нажмите «Рассчитать».",
-                             tag="txt_analytic", wrap=700)
+                dpg.add_text("Заполните форму слева и нажмите «Собрать входные данные».",
+                             tag="txt_analytic", wrap=760)
+                dpg.add_text("",
+                             tag="txt_rpa_schema_hint", color=C_MUTED,
+                             wrap=760)
+
+        self._on_rpa_req_mode_changed("rb_rpa_nominal_thrust")
+        self._on_rpa_inlet_mode_changed()
+        self._on_rpa_exit_mode_changed("rb_rpa_exit_pressure")
+        self._on_rpa_frozen_mode_changed("rb_rpa_freeze_pressure")
+        self._on_rpa_reaction_eff_mode_changed("rb_rpa_reaction_estimate")
+        self._on_rpa_nozzle_shape_mode_changed("rb_rpa_nozzle_shape_estimate")
+        self._on_rpa_ambient_mode_changed("rb_rpa_ambient_fixed")
+        self._on_rpa_throttle_mode_changed("rb_rpa_throttle_fixed")
 
     # ─── Обработчики UI ──────────────────────────────────────────────────
 
@@ -1431,6 +1580,82 @@ class MainWindow:
             self._calc_geom_type, self._calc_use_rpa = "rpa", True
         else:
             self._calc_geom_type, self._calc_use_rpa = "profiled", False
+
+    def _set_enabled_many(self, tags, enabled: bool):
+        for tag in tags:
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=enabled)
+
+    def _on_rpa_req_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            ["rb_rpa_nominal_thrust", "rb_rpa_mass_flow", "rb_rpa_throat_diameter"],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_nominal_thrust"], selected == "rb_rpa_nominal_thrust")
+        self._set_enabled_many(["sp_rpa_mass_flow"], selected == "rb_rpa_mass_flow")
+        self._set_enabled_many(["sp_rpa_throat_diameter"], selected == "rb_rpa_throat_diameter")
+
+    def _on_rpa_inlet_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            ["rb_rpa_inlet_mass_flux", "rb_rpa_inlet_contraction"],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_mass_flux"], selected == "rb_rpa_inlet_mass_flux")
+        self._set_enabled_many(["sp_rpa_contraction_ratio"], selected == "rb_rpa_inlet_contraction")
+
+    def _on_rpa_exit_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            ["rb_rpa_exit_pressure", "rb_rpa_exit_area_ratio", "rb_rpa_exit_pressure_ratio"],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_exit_pressure"], selected == "rb_rpa_exit_pressure")
+        self._set_enabled_many(["sp_rpa_exit_area_ratio"], selected == "rb_rpa_exit_area_ratio")
+        self._set_enabled_many(["sp_rpa_exit_pressure_ratio"], selected == "rb_rpa_exit_pressure_ratio")
+
+    def _on_rpa_frozen_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            ["rb_rpa_freeze_pressure", "rb_rpa_freeze_area"],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_freeze_pressure_ratio"], selected == "rb_rpa_freeze_pressure")
+        self._set_enabled_many(["sp_rpa_freeze_area_ratio"], selected == "rb_rpa_freeze_area")
+
+    def _on_rpa_reaction_eff_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            ["rb_rpa_reaction_estimate", "rb_rpa_reaction_predefined"],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_reaction_eff_pct"], selected == "rb_rpa_reaction_predefined")
+
+    def _on_rpa_nozzle_shape_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(
+            [
+                "rb_rpa_nozzle_shape_estimate",
+                "rb_rpa_nozzle_shape_len",
+                "rb_rpa_nozzle_shape_eff",
+                "rb_rpa_nozzle_shape_conical",
+            ],
+            clicked_tag,
+        )
+        self._set_enabled_many(["sp_rpa_nozzle_len_pct"], selected == "rb_rpa_nozzle_shape_len")
+        self._set_enabled_many(["sp_rpa_nozzle_eff_pct"], selected == "rb_rpa_nozzle_shape_eff")
+        self._set_enabled_many(["sp_rpa_nozzle_half_angle_deg"], selected == "rb_rpa_nozzle_shape_conical")
+
+    def _on_rpa_ambient_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(["rb_rpa_ambient_fixed", "rb_rpa_ambient_range"], clicked_tag)
+        self._set_enabled_many(["sp_rpa_ambient_fixed_atm"], selected == "rb_rpa_ambient_fixed")
+        self._set_enabled_many(
+            ["sp_rpa_ambient_from_atm", "sp_rpa_ambient_to_atm"],
+            selected == "rb_rpa_ambient_range",
+        )
+
+    def _on_rpa_throttle_mode_changed(self, clicked_tag=None):
+        selected = self._enforce_radio(["rb_rpa_throttle_fixed", "rb_rpa_throttle_range"], clicked_tag)
+        self._set_enabled_many(["sp_rpa_throttle_fixed"], selected == "rb_rpa_throttle_fixed")
+        self._set_enabled_many(
+            ["sp_rpa_throttle_min", "sp_rpa_throttle_max"],
+            selected == "rb_rpa_throttle_range",
+        )
 
     def _update_overall_efficiency(self):
         try:
@@ -2286,30 +2511,91 @@ class MainWindow:
     # ─── Аналитический расчёт ────────────────────────────────────────────
 
     def _on_analytic_compute(self):
-        ActionLogger.info("Аналитический расчёт запущен")
+        ActionLogger.info("Сбор RPA-входа запущен")
         try:
-            inp = AnalyticSizingInput(
-                thrust_vac_N=float(dpg.get_value("sp_an_thrust") or 7.77e6),
-                p_chamber_Pa=float(dpg.get_value("sp_an_pk") or 7.0) * 1e6,
-                p_exit_Pa=float(dpg.get_value("sp_an_pa") or 0.0486) * 1e6,
-                Km=float(dpg.get_value("sp_an_Km") or 2.27),
-                Isp_vac_m_s=float(dpg.get_value("sp_an_isp") or 3349.48),
-                k_adiabatic=float(dpg.get_value("sp_an_k") or 1.1343),
-                R_gas_J_kgK=float(dpg.get_value("sp_an_Rg") or 346.2),
-                T_chamber_K=float(dpg.get_value("sp_an_Tk") or 3692.99),
-                phi_k=float(dpg.get_value("sp_an_phik") or 0.99),
-                phi_c=float(dpg.get_value("sp_an_phic") or 0.98),
-                alpha=float(dpg.get_value("sp_an_alpha") or 0.81),
-                W_inj_mean_m_s=float(dpg.get_value("sp_an_winj") or 30.0),
-                rho_curvature=float(dpg.get_value("sp_an_rho") or 2.0),
+            req_mode = "nominal_thrust" if dpg.get_value("rb_rpa_nominal_thrust") else (
+                "mass_flow_rate" if dpg.get_value("rb_rpa_mass_flow") else "throat_diameter"
             )
-            res = compute_analytic_sizing(inp)
-            dpg.set_value("txt_analytic",
-                          self._format_analytic_result(inp, res))
-            self._last_analytic_result = res
+            inlet_mode = "mass_flux" if dpg.get_value("rb_rpa_inlet_mass_flux") else "contraction_area_ratio"
+            exit_mode = "pressure" if dpg.get_value("rb_rpa_exit_pressure") else (
+                "expansion_area_ratio" if dpg.get_value("rb_rpa_exit_area_ratio") else "expansion_pressure_ratio"
+            )
+            freeze_mode = "pressure_ratio" if dpg.get_value("rb_rpa_freeze_pressure") else "area_ratio"
+            reaction_eff_mode = "estimate" if dpg.get_value("rb_rpa_reaction_estimate") else "predefined"
+            if dpg.get_value("rb_rpa_nozzle_shape_estimate"):
+                nozzle_shape_mode = "bell_estimate_80_percent"
+            elif dpg.get_value("rb_rpa_nozzle_shape_len"):
+                nozzle_shape_mode = "bell_with_length"
+            elif dpg.get_value("rb_rpa_nozzle_shape_eff"):
+                nozzle_shape_mode = "bell_with_efficiency"
+            else:
+                nozzle_shape_mode = "conical_with_half_angle"
+
+            data = {
+                "chamber_pressure_mpa": float(dpg.get_value("sp_rpa_pc") or 0.0),
+                "determine_thrust_chamber_size": bool(dpg.get_value("chk_rpa_determine_size")),
+                "thrust_requirement": {
+                    "mode": req_mode,
+                    "nominal_thrust_kN": float(dpg.get_value("sp_rpa_nominal_thrust") or 0.0),
+                    "mass_flow_rate_kg_s": float(dpg.get_value("sp_rpa_mass_flow") or 0.0),
+                    "throat_diameter_mm": float(dpg.get_value("sp_rpa_throat_diameter") or 0.0),
+                },
+                "number_of_chambers": int(dpg.get_value("sp_rpa_num_chambers") or 1),
+                "perform_chamber_thermal_analysis": bool(dpg.get_value("chk_rpa_thermal_analysis")),
+                "nozzle_inlet_condition": {
+                    "mode": inlet_mode,
+                    "mass_flux_kg_m2_s": float(dpg.get_value("sp_rpa_mass_flux") or 0.0),
+                    "contraction_area_ratio_Ac_At": float(dpg.get_value("sp_rpa_contraction_ratio") or 0.0),
+                },
+                "nozzle_exit_condition": {
+                    "mode": exit_mode,
+                    "pressure_mpa": float(dpg.get_value("sp_rpa_exit_pressure") or 0.0),
+                    "expansion_area_ratio_Ae_At": float(dpg.get_value("sp_rpa_exit_area_ratio") or 0.0),
+                    "expansion_pressure_ratio_pc_pe": float(dpg.get_value("sp_rpa_exit_pressure_ratio") or 0.0),
+                },
+                "frozen_equilibrium_flow": {
+                    "enabled": bool(dpg.get_value("chk_rpa_frozen_flow")),
+                    "mode": freeze_mode,
+                    "pressure_ratio_pt_pf": float(dpg.get_value("sp_rpa_freeze_pressure_ratio") or 0.0),
+                    "area_ratio_Af_At": float(dpg.get_value("sp_rpa_freeze_area_ratio") or 0.0),
+                },
+                "reaction_efficiency": {
+                    "mode": reaction_eff_mode,
+                    "predefined_efficiency_percent": float(dpg.get_value("sp_rpa_reaction_eff_pct") or 0.0),
+                },
+                "nozzle_shape_and_efficiency": {
+                    "mode": nozzle_shape_mode,
+                    "bell_length_percent": float(dpg.get_value("sp_rpa_nozzle_len_pct") or 0.0),
+                    "bell_efficiency_percent": float(dpg.get_value("sp_rpa_nozzle_eff_pct") or 0.0),
+                    "conical_half_angle_deg": float(dpg.get_value("sp_rpa_nozzle_half_angle_deg") or 0.0),
+                },
+                "nozzle_flow_effects": {
+                    "multiphase_and_phase_transition": bool(dpg.get_value("chk_rpa_multiphase")),
+                    "species_ionization_effects": bool(dpg.get_value("chk_rpa_ionization")),
+                    "flow_separation_loss": bool(dpg.get_value("chk_rpa_flow_sep_loss")),
+                },
+                "ambient_operating_condition": {
+                    "enabled": bool(dpg.get_value("chk_rpa_ambient_enable")),
+                    "mode": "fixed" if dpg.get_value("rb_rpa_ambient_fixed") else "range",
+                    "fixed_pressure_atm": float(dpg.get_value("sp_rpa_ambient_fixed_atm") or 0.0),
+                    "from_atm": float(dpg.get_value("sp_rpa_ambient_from_atm") or 0.0),
+                    "to_atm": float(dpg.get_value("sp_rpa_ambient_to_atm") or 0.0),
+                    "calc_estimated_delivered_performance": bool(dpg.get_value("chk_rpa_ambient_delivered")),
+                },
+                "throttle_settings": {
+                    "enabled": bool(dpg.get_value("chk_rpa_throttle_enable")),
+                    "mode": "fixed" if dpg.get_value("rb_rpa_throttle_fixed") else "range",
+                    "fixed_value": float(dpg.get_value("sp_rpa_throttle_fixed") or 0.0),
+                    "min": float(dpg.get_value("sp_rpa_throttle_min") or 0.0),
+                    "max": float(dpg.get_value("sp_rpa_throttle_max") or 0.0),
+                    "calc_estimated_delivered_performance": bool(dpg.get_value("chk_rpa_throttle_delivered")),
+                },
+            }
+            dpg.set_value("txt_analytic", json.dumps(data, ensure_ascii=False, indent=2))
+            dpg.set_value("txt_rpa_schema_hint", "Данные успешно собраны. Можно использовать этот JSON в консольной версии.")
         except Exception as exc:
             dpg.set_value("txt_analytic",
-                          f"Ошибка расчёта:\n{exc}\n\n{traceback.format_exc()}")
+                          f"Ошибка сбора входных данных:\n{exc}\n\n{traceback.format_exc()}")
 
     @staticmethod
     def _format_analytic_result(inp, r):
@@ -2361,13 +2647,6 @@ class MainWindow:
                           "Сначала выполните основной (термодинамический) расчёт.")
             return
         try:
-            g0 = 9.80665
-            isp_vac_s = getattr(self.perf, "Isp_vac_s", None)
-            if isp_vac_s:
-                dpg.set_value("sp_an_isp", float(isp_vac_s) * g0)
-            of = getattr(self.perf, "O_F", None)
-            if of:
-                dpg.set_value("sp_an_Km", float(of))
             stations = getattr(self.perf, "stations", None) or []
             chamber = None
             for st in stations:
@@ -2378,25 +2657,16 @@ class MainWindow:
             if chamber is None and stations:
                 chamber = stations[0]
             if chamber is not None:
-                k = getattr(chamber, "gamma_eq", None) or getattr(chamber, "gamma_s", None)
-                if k:
-                    dpg.set_value("sp_an_k", float(k))
-                Rg = getattr(chamber, "R_specific_J_per_kgK", None)
-                if Rg:
-                    dpg.set_value("sp_an_Rg", float(Rg))
-                Tk = getattr(chamber, "T_K", None)
-                if Tk:
-                    dpg.set_value("sp_an_Tk", float(Tk))
                 Pc = getattr(chamber, "P_Pa", None)
                 if Pc:
-                    dpg.set_value("sp_an_pk", float(Pc) / 1e6)
+                    dpg.set_value("sp_rpa_pc", float(Pc) / 1e6)
             if stations:
                 Pe = getattr(stations[-1], "P_Pa", None)
                 if Pe:
-                    dpg.set_value("sp_an_pa", float(Pe) / 1e6)
+                    dpg.set_value("sp_rpa_exit_pressure", float(Pe) / 1e6)
             dpg.set_value("txt_analytic",
-                          "Параметры подставлены из последнего расчёта. "
-                          "Проверьте значения перед расчётом.")
+                          "Часть параметров подставлена из последнего основного расчёта. "
+                          "Проверьте значения перед сохранением JSON.")
         except Exception as exc:
             dpg.set_value("txt_analytic", f"Ошибка: {exc}")
 
