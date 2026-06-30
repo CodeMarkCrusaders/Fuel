@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Z.ai interface clone</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #141618;
+      --panel: rgba(20, 22, 24, 0.88);
+      --text: #f4f6f8;
+      --muted: #9ea6b2;
+      --ok: #36c275;
+      --warn: #ffb454;
+      --error: #ff6b6b;
+    }
+
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      overflow: hidden;
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+    }
+
+    iframe {
+      border: 0;
+      width: 100vw;
+      height: 100vh;
+      background: var(--bg);
+    }
+
+    .status {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 9999;
+      max-width: min(520px, 92vw);
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 10px 35px rgba(0, 0, 0, 0.35);
+    }
+
+    .status strong { font-size: 13px; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .error { color: var(--error); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <iframe
+      id="zai-frame"
+      title="Z.ai"
+      src="https://chat.z.ai/space/q11h7547njx0-art"
+      sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+      referrerpolicy="no-referrer"
+    ></iframe>
+  </div>
+
+  <div class="status" id="status">
+    <strong>Проверка интерфейса и конфига…</strong>
+    <div class="muted">См. подробности в DevTools console.</div>
+  </div>
+
+  <script>
+    (function () {
+      const requiredTopLevel = [
+        'mixture', 'mix_mode', 'mix_value', 'Pc_field', 'Pe_field',
+        'Pc_unit', 'Pe_unit', 'n_inter', 'include_condensed',
+        'injection_velocity', 'chamber_pressure_drop', 'solver',
+        'L_chamber', 'L_star', 'losses', 'style'
+      ];
+
+      const requiredMixture = ['ox_components', 'fuel_components'];
+      const requiredLosses = ['reaction_eff', 'nozzle_eff'];
+      const requiredStyle = ['lw', 'markers', 'grid_major', 'grid_minor', 'dark'];
+
+      function missingKeys(obj, keys) {
+        return keys.filter((k) => !(k in obj));
+      }
+
+      function logStep(label, ok, details) {
+        const mark = ok ? '✅' : '❌';
+        const method = ok ? 'log' : 'error';
+        console[method](`${mark} ${label}`, details || '');
+      }
+
+      function updateStatus(text, cls) {
+        const el = document.getElementById('status');
+        el.innerHTML = `<strong class="${cls || ''}">${text}</strong><div class="muted">См. подробности в DevTools console.</div>`;
+      }
+
+      async function validateConfig() {
+        console.log('🚀 Z.ai interface loaded in iframe');
+        console.log('ℹ️ Source: saved HTML replicated via embedded live page');
+
+        const frame = document.getElementById('zai-frame');
+        frame.addEventListener('load', () => {
+          logStep('Iframe загружен', true, frame.src);
+        });
+
+        try {
+          const response = await fetch('./config.vika', { cache: 'no-store' });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const cfg = await response.json();
+
+          logStep('config.vika прочитан', true, cfg);
+
+          const missTop = missingKeys(cfg, requiredTopLevel);
+          logStep('Проверка top-level ключей', missTop.length === 0, missTop);
+
+          const missMix = cfg.mixture ? missingKeys(cfg.mixture, requiredMixture) : requiredMixture;
+          logStep('Проверка mixture', missMix.length === 0, missMix);
+
+          const missLosses = cfg.losses ? missingKeys(cfg.losses, requiredLosses) : requiredLosses;
+          logStep('Проверка losses', missLosses.length === 0, missLosses);
+
+          const missStyle = cfg.style ? missingKeys(cfg.style, requiredStyle) : requiredStyle;
+          logStep('Проверка style', missStyle.length === 0, missStyle);
+
+          const checks = {
+            hasComponents: Array.isArray(cfg.mixture?.ox_components) && Array.isArray(cfg.mixture?.fuel_components),
+            validNInter: Number.isFinite(Number(cfg.n_inter)) && Number(cfg.n_inter) > 0,
+            validUnits: typeof cfg.Pc_unit === 'string' && typeof cfg.Pe_unit === 'string',
+            solverSet: typeof cfg.solver === 'string' && cfg.solver.length > 0,
+          };
+
+          Object.entries(checks).forEach(([name, ok]) => {
+            logStep(`Функциональная проверка: ${name}`, !!ok, cfg[name]);
+          });
+
+          const allGood = (
+            missTop.length === 0 &&
+            missMix.length === 0 &&
+            missLosses.length === 0 &&
+            missStyle.length === 0 &&
+            Object.values(checks).every(Boolean)
+          );
+
+          updateStatus(allGood ? 'Проверка пройдена: интерфейс и конфиг готовы ✅' : 'Есть ошибки проверки, см. консоль ❌', allGood ? 'ok' : 'error');
+        } catch (err) {
+          console.error('❌ Ошибка чтения/проверки config.vika', err);
+          updateStatus('Ошибка чтения config.vika ❌', 'error');
+        }
+      }
+
+      validateConfig();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "mixture": {
+    "ox_components": [
+      {
+        "name": "O2(L)",
+        "mass": 1.0,
+        "T": 0
+      }
+    ],
+    "fuel_components": [
+      {
+        "name": "CH4(L)",
+        "mass": 1.0,
+        "T": 0.0
+      }
+    ]
+  },
+  "mix_mode": "km",
+  "mix_value": "2",
+  "Pc_field": "1",
+  "Pe_field": "13",
+  "Pc_unit": "атм",
+  "Pe_unit": "МПа",
+  "n_inter": 289,
+  "include_condensed": true,
+  "injection_velocity": 0.0,
+  "chamber_pressure_drop": 0.0,
+  "solver": "own",
+  "L_chamber": 0.10000000149011612,
+  "L_star": 1.0,
+  "losses": {
+    "reaction_eff": 1.0,
+    "nozzle_eff": 1.0
+  },
+  "style": {
+    "lw": 1.7999999523162842,
+    "markers": true,
+    "grid_major": true,
+    "grid_minor": true,
+    "dark": true
+  }
+}
