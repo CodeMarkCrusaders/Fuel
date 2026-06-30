@@ -9,7 +9,7 @@ RPA-Style Rocket Nozzle Calculator — GUI на Dear PyGui.
 Возможности:
   • Расчёт параметров по длине сопла (P, T, V, M, ρ, гамма, состав)
   • Два решателя: собственный (Gibbs minimisation) и CEA (Cantera)
-  • Тёмная тема в стиле Claude.ai
+  • Тёмная тема в стиле Z.ai
   • Экспорт точек в CSV (формат, совместимый с Amesim)
   • Графики на нативном DPG plot (без WebEngine/Plotly)
   • Сплиттеры вместо слайдеров для настройки ширины панелей
@@ -163,45 +163,48 @@ class ActionIterationLogger(IterationLogger):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Тема (Claude.ai dark)
+# Тема (Z.ai dark)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Палитра Claude.ai
-C_BG = (38, 38, 36)        # #262624
-C_BG_DARK = (30, 30, 28)   # #1e1e1c
-C_BG_PANEL = (48, 48, 46)  # #30302e
-C_FG = (250, 250, 249)     # #fafaf9
-C_MUTED = (168, 162, 158)  # #a8a29e
-C_ACCENT = (204, 120, 92)  # #cc785c
-C_ACCENT_DARK = (184, 107, 80)
-C_BORDER = (58, 58, 55)    # #3a3a37
+# Палитра Z.ai (dark)
+C_BG = (20, 22, 24)        # #141618
+C_BG_DARK = (17, 20, 24)   # #111418
+C_BG_PANEL = (28, 32, 38)  # #1c2026
+C_FG = (236, 240, 245)     # #ecf0f5
+C_MUTED = (145, 157, 173)  # #919dad
+C_ACCENT = (0, 212, 255)   # #00d4ff
+C_ACCENT_DARK = (0, 170, 210)
+C_BORDER = (44, 53, 66)    # #2c3542
+C_SUCCESS = (66, 200, 154) # #42c89a
 
 
 def apply_dark_theme(theme_id: Optional[int] = None) -> int:
-    """Создаёт и возвращает тёмную тему в стиле Claude.ai."""
+    """Создаёт и возвращает тёмную тему в стиле Z.ai."""
     with dpg.theme() as t:
         with dpg.theme_component(dpg.mvAll):
             dpg.add_theme_color(dpg.mvThemeCol_WindowBg, C_BG)
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, C_BG_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, C_BG_PANEL)
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg, C_BG_PANEL)
             dpg.add_theme_color(dpg.mvThemeCol_Border, C_BORDER)
             dpg.add_theme_color(dpg.mvThemeCol_Text, C_FG)
             dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, C_MUTED)
             dpg.add_theme_color(dpg.mvThemeCol_FrameBg, C_BG_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, C_BORDER)
-            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, C_ACCENT_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_Button, C_BORDER)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (74, 74, 71))
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_Header, C_ACCENT)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, C_ACCENT_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, C_ACCENT_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (36, 44, 54))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, C_BG_PANEL)
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (34, 44, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (42, 54, 70))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 100, 126))
+            dpg.add_theme_color(dpg.mvThemeCol_Header, (34, 44, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (43, 56, 72))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (50, 67, 88))
             dpg.add_theme_color(dpg.mvThemeCol_CheckMark, C_ACCENT)
             dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, C_ACCENT)
+            dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, C_ACCENT_DARK)
             dpg.add_theme_color(dpg.mvThemeCol_Tab, C_BG_PANEL)
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered, C_BORDER)
-            dpg.add_theme_color(dpg.mvThemeCol_TabActive, C_BG)
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (43, 56, 72))
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive, (34, 44, 58))
             dpg.add_theme_color(dpg.mvThemeCol_TabUnfocused, C_BG_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_TabUnfocusedActive, C_BG_PANEL)
             dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, C_ACCENT)
             dpg.add_theme_color(dpg.mvThemeCol_PlotLines, C_ACCENT)
             dpg.add_theme_color(dpg.mvThemeCol_PlotLinesHovered, C_ACCENT_DARK)
@@ -209,25 +212,22 @@ def apply_dark_theme(theme_id: Optional[int] = None) -> int:
             dpg.add_theme_color(dpg.mvThemeCol_TitleBg, C_BG_DARK)
             dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, C_BG_DARK)
             dpg.add_theme_color(dpg.mvThemeCol_TitleBgCollapsed, C_BG_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_MenuBarBg, C_BG_DARK)
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg, C_BG_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, C_MUTED)
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, (64, 82, 104))
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabHovered, C_ACCENT)
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabActive, C_ACCENT_DARK)
 
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 8)
             dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 3)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 5)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 8, 8)
-            dpg.add_theme_style(dpg.mvStyleVar_TabRounding, 3)
-            dpg.add_theme_style(dpg.mvStyleVar_GrabMinSize, 10)
-            dpg.add_theme_style(dpg.mvStyleVar_ScrollbarSize, 14)
-
-        # Специальный компонент для primary-кнопок (акцентный цвет)
-        with dpg.theme_component(dpg.mvButton, parent=t) as tc_btn:
-            pass  # наследует общую тему
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 10)
+            dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 7)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 10, 10)
+            dpg.add_theme_style(dpg.mvStyleVar_TabRounding, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_GrabMinSize, 11)
+            dpg.add_theme_style(dpg.mvStyleVar_ScrollbarSize, 12)
 
     if theme_id is not None:
         dpg.bind_theme(t)
@@ -239,9 +239,11 @@ def make_primary_button_theme() -> int:
     with dpg.theme() as t:
         with dpg.theme_component(dpg.mvButton):
             dpg.add_theme_color(dpg.mvThemeCol_Button, C_ACCENT)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, C_ACCENT_DARK)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (160, 90, 64))
-            dpg.add_theme_color(dpg.mvThemeCol_Text, C_BG_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (89, 224, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, C_ACCENT_DARK)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (8, 19, 26))
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 10)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 10, 8)
     return t
 
 
@@ -564,22 +566,22 @@ class NozzleSolverWorker:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PLOT_PARAM_DEFS = [
-    ("P",     "Давление P",            "МПа",     (204, 120, 92)),
-    ("T",     "Температура T",         "К",       (106, 176, 255)),
-    ("V",     "Скорость потока V",     "м/с",     (130, 210, 122)),
-    ("M",     "Число Маха M",          "",        (230, 184, 0)),
-    ("rho",   "Плотность ρ",           "кг/м³",   (204, 120, 92)),
-    ("gs",    "Изэнтр. показатель γs", "",        (192, 132, 252)),
-    ("a",     "Скорость звука a",      "м/с",     (77, 208, 225)),
-    ("S",     "Энтропия S",            "Дж/(кг·К)", (244, 114, 182)),
-    ("H",     "Энтальпия H",           "МДж/кг",  (251, 146, 60)),
-    ("q_dyn", "Динам. давление q",     "МПа",     (52, 211, 153)),
-    ("tau",   "τ(λ) = T/T₀",           "",        (106, 176, 255)),
-    ("pi",    "π(λ) = P/P₀",           "",        (204, 120, 92)),
-    ("eps",   "ε(λ) = ρ/ρ₀",           "",        (192, 132, 252)),
-    ("lam",   "λ(x) — скор. коэф.",    "",        (230, 184, 0)),
-    ("q_gd",  "q(λ) — прив. расход",   "",        (130, 210, 122)),
-    ("y_gd",  "y(λ) — функ. имп.",     "",        (77, 208, 225)),
+    ("P",     "Давление P",            "МПа",     (0, 212, 255)),
+    ("T",     "Температура T",         "К",       (120, 174, 255)),
+    ("V",     "Скорость потока V",     "м/с",     (66, 200, 154)),
+    ("M",     "Число Маха M",          "",        (255, 198, 87)),
+    ("rho",   "Плотность ρ",           "кг/м³",   (104, 141, 255)),
+    ("gs",    "Изэнтр. показатель γs", "",        (182, 147, 255)),
+    ("a",     "Скорость звука a",      "м/с",     (79, 226, 245)),
+    ("S",     "Энтропия S",            "Дж/(кг·К)", (255, 137, 185)),
+    ("H",     "Энтальпия H",           "МДж/кг",  (255, 150, 99)),
+    ("q_dyn", "Динам. давление q",     "МПа",     (70, 214, 170)),
+    ("tau",   "τ(λ) = T/T₀",           "",        (120, 174, 255)),
+    ("pi",    "π(λ) = P/P₀",           "",        (0, 212, 255)),
+    ("eps",   "ε(λ) = ρ/ρ₀",           "",        (182, 147, 255)),
+    ("lam",   "λ(x) — скор. коэф.",    "",        (255, 198, 87)),
+    ("q_gd",  "q(λ) — прив. расход",   "",        (66, 200, 154)),
+    ("y_gd",  "y(λ) — функ. имп.",     "",        (79, 226, 245)),
 ]
 PLOT_DEFAULT_KEYS = ["P", "T", "V", "M", "rho", "gs"]
 
