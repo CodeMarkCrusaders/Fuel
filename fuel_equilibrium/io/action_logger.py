@@ -1,102 +1,299 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ActionLogger — журнал действий пользователя в GUI.
+ActionLogger — централизованное логирование GUI и приложения.
 
-Пишет в файл временные метки и описания ключевых событий:
-запуск расчёта, экспорт, сохранение/загрузка конфигурации, ошибки.
-
-Файл лога:  ~/rpa_action.log  (ротация при превышении 1 МБ).
-Если файл недоступен — логгирование бесшумно отключается.
+Что делает:
+- пишет лог в ротируемый файл;
+- хранит последние записи в памяти (ring buffer);
+- отдаёт записи для отображения прямо в интерфейсе;
+- поддерживает фильтрацию по уровню и поиску.
 """
 
-import os
+from __future__ import annotations
+
+import json
 import logging
 import logging.handlers
-from typing import Optional
+import os
+import tempfile
+import threading
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Deque, Dict, List, Optional
 
-_LOG_DIR = os.path.expanduser("~")
-_LOG_FILE = os.path.join(_LOG_DIR, "rpa_action.log")
-_MAX_BYTES = 1_048_576  # 1 МБ
-_BACKUP_COUNT = 1
+_MAX_BYTES = 2_097_152  # 2 МБ
+_BACKUP_COUNT = 3
+_MEMORY_LIMIT = 5000
 
 _LOGGER: Optional[logging.Logger] = None
+_ACTIVE_LOG_FILE: Optional[str] = None
+_LOGGER_INIT_ERROR: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    """Структурированная запись журнала."""
+
+    timestamp: datetime
+    level: str
+    action: str
+    details: Dict[str, object]
+    message: str
+
+
+class _InMemoryLogHandler(logging.Handler):
+    """Хендлер Python logging, складывающий записи в память."""
+
+    def __init__(self, sink: "_LogSink"):
+        super().__init__()
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            payload = getattr(record, "action_payload", {}) or {}
+            action = str(payload.get("action") or record.getMessage())
+            details = payload.get("details") or {}
+            if not isinstance(details, dict):
+                details = {"value": str(details)}
+
+            self._sink.append(
+                LogEntry(
+                    timestamp=datetime.fromtimestamp(record.created),
+                    level=record.levelname,
+                    action=action,
+                    details=details,
+                    message=record.getMessage(),
+                )
+            )
+        except Exception:
+            self.handleError(record)
+
+
+class _LogSink:
+    """Потокобезопасный ring buffer для логов."""
+
+    def __init__(self, maxlen: int):
+        self._items: Deque[LogEntry] = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def append(self, entry: LogEntry) -> None:
+        with self._lock:
+            self._items.append(entry)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def get_all(self) -> List[LogEntry]:
+        with self._lock:
+            return list(self._items)
+
+
+_SINK = _LogSink(_MEMORY_LIMIT)
+
+
+def _details_to_text(details: Dict[str, object]) -> str:
+    if not details:
+        return ""
+    try:
+        return " | " + json.dumps(details, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return " | " + "; ".join(f"{k}={v!r}" for k, v in details.items())
+
+
+def _candidate_log_paths() -> List[str]:
+    """Набор путей для лог-файла (по приоритету, с fallback)."""
+    candidates: List[str] = []
+
+    env_dir = os.environ.get("FUEL_EQUILIBRIUM_LOG_DIR")
+    if env_dir:
+        candidates.append(os.path.join(env_dir, "app.log"))
+
+    # Предпочитаем локальный logs рядом с рабочим каталогом запуска.
+    candidates.append(os.path.join(os.getcwd(), "logs", "app.log"))
+
+    # Путь относительно пакета (удобно для запуска из исходников).
+    project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(project_dir, "logs", "app.log"))
+
+    # Пользовательский профиль.
+    candidates.append(os.path.join(os.path.expanduser("~"), ".fuel_equilibrium", "logs", "app.log"))
+
+    # Последний fallback: временный каталог.
+    candidates.append(os.path.join(tempfile.gettempdir(), "fuel_equilibrium", "logs", "app.log"))
+
+    # Удаляем дубликаты с сохранением порядка.
+    unique: List[str] = []
+    seen = set()
+    for p in candidates:
+        norm = os.path.abspath(os.path.normpath(p))
+        if norm not in seen:
+            seen.add(norm)
+            unique.append(norm)
+    return unique
+
+
+def _try_create_file_handler() -> Optional[logging.Handler]:
+    """Пытается создать файловый хендлер по fallback-путям."""
+    global _ACTIVE_LOG_FILE, _LOGGER_INIT_ERROR
+
+    last_error: Optional[str] = None
+    for path in _candidate_log_paths():
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                path,
+                maxBytes=_MAX_BYTES,
+                backupCount=_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(
+                logging.Formatter(
+                    "[%(asctime)s] %(levelname)-8s %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _ACTIVE_LOG_FILE = path
+            _LOGGER_INIT_ERROR = None
+            return handler
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+
+    _ACTIVE_LOG_FILE = None
+    _LOGGER_INIT_ERROR = last_error or "Не удалось создать RotatingFileHandler"
+    return None
 
 
 def _get_logger() -> logging.Logger:
-    """Ленивая инициализация логгера (один раз при первом вызове)."""
     global _LOGGER
     if _LOGGER is not None:
         return _LOGGER
 
-    _LOGGER = logging.getLogger("RocketNozzleGUI")
-    _LOGGER.setLevel(logging.INFO)
+    logger = logging.getLogger("RocketNozzleGUI")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
-    # Предотвращаем дублирование хендлеров при пересоздании
-    if _LOGGER.handlers:
-        return _LOGGER
+    # На случай повторной инициализации очищаем старые хендлеры.
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
 
-    try:
-        handler = logging.handlers.RotatingFileHandler(
-            _LOG_FILE,
-            maxBytes=_MAX_BYTES,
-            backupCount=_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-    except (OSError, PermissionError):
-        # Если не удалось создать файл — заглушка
-        handler = logging.NullHandler()
+    memory_handler = _InMemoryLogHandler(_SINK)
+    memory_handler.setLevel(logging.DEBUG)
+    logger.addHandler(memory_handler)
 
-    formatter = logging.Formatter(
-        "[%(asctime)s]  %(levelname)-8s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-    _LOGGER.addHandler(handler)
-    return _LOGGER
+    file_handler = _try_create_file_handler()
+    if file_handler is not None:
+        logger.addHandler(file_handler)
+    else:
+        logger.addHandler(logging.NullHandler())
+        logger.error("Не удалось инициализировать файловый лог", reason=_LOGGER_INIT_ERROR)
+
+    _LOGGER = logger
+    return logger
 
 
 class ActionLogger:
-    """Статический интерфейс для логирования действий пользователя.
-
-    Пример использования::
-
-        from ..io.action_logger import ActionLogger
-
-        ActionLogger.info("Расчёт запущен", solver="CEA")
-        ActionLogger.warning("База NASA-9 не загружена")
-        ActionLogger.error("Ошибка экспорта", path="...", detail=str(e))
-    """
+    """Статический API для логирования действий GUI и чтения журнала."""
 
     @staticmethod
     def _log(level: int, action: str, **details) -> None:
-        """Записать сообщение в лог с дополнительными полями."""
         logger = _get_logger()
-        if details:
-            parts = [f"{k}={v!r}" for k, v in details.items()]
-            msg = f"{action}  ({'; '.join(parts)})"
-        else:
-            msg = action
-        logger.log(level, msg)
+        details_text = _details_to_text(details)
+        message = f"{action}{details_text}"
+        logger.log(level, message, extra={"action_payload": {"action": action, "details": details}})
 
-    # ── публичные методы ──────────────────────────────────────────────────
+    @staticmethod
+    def debug(action: str, **details) -> None:
+        ActionLogger._log(logging.DEBUG, action, **details)
 
     @staticmethod
     def info(action: str, **details) -> None:
-        """Информационное сообщение."""
         ActionLogger._log(logging.INFO, action, **details)
 
     @staticmethod
     def warning(action: str, **details) -> None:
-        """Предупреждение (например, нехватка данных)."""
         ActionLogger._log(logging.WARNING, action, **details)
 
     @staticmethod
     def error(action: str, **details) -> None:
-        """Ошибка (исключение, сбой расчёта)."""
+        ActionLogger._log(logging.ERROR, action, **details)
+
+    @staticmethod
+    def exception(action: str, **details) -> None:
         ActionLogger._log(logging.ERROR, action, **details)
 
     @staticmethod
     def log_path() -> str:
-        """Вернуть путь к текущему файлу лога."""
-        return _LOG_FILE
+        _get_logger()
+        if _ACTIVE_LOG_FILE:
+            return _ACTIVE_LOG_FILE
+        # Если файловый лог не поднялся, показываем первый ожидаемый путь.
+        return _candidate_log_paths()[0]
+
+    @staticmethod
+    def log_init_error() -> str:
+        _get_logger()
+        return _LOGGER_INIT_ERROR or ""
+
+    @staticmethod
+    def get_entries(limit: int = 300, min_level: str = "DEBUG", contains: str = "") -> List[LogEntry]:
+        """Вернуть записи журнала из памяти (фильтр по уровню и подстроке)."""
+        _get_logger()
+        level_no = logging._nameToLevel.get((min_level or "DEBUG").upper(), logging.DEBUG)
+        needle = (contains or "").strip().lower()
+
+        data = _SINK.get_all()
+        filtered: List[LogEntry] = []
+        for entry in data:
+            entry_level_no = logging._nameToLevel.get(entry.level, logging.INFO)
+            if entry_level_no < level_no:
+                continue
+            if needle:
+                text = f"{entry.action} {entry.message} {entry.details}".lower()
+                if needle not in text:
+                    continue
+            filtered.append(entry)
+
+        if limit > 0:
+            filtered = filtered[-limit:]
+        return filtered
+
+    @staticmethod
+    def render_entries(limit: int = 300, min_level: str = "DEBUG", contains: str = "") -> str:
+        """Вернуть записи журнала одной строкой для текстового виджета."""
+        entries = ActionLogger.get_entries(limit=limit, min_level=min_level, contains=contains)
+        if not entries:
+            return "Логи пока пусты."
+
+        lines: List[str] = []
+        for e in entries:
+            details_text = _details_to_text(e.details)
+            lines.append(
+                f"[{e.timestamp.strftime('%Y-%m-%d %H:%M:%S')}] {e.level:<7} {e.action}{details_text}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def clear_memory() -> None:
+        _SINK.clear()
+
+    @staticmethod
+    def flush(reason: str = "") -> None:
+        """Принудительно сбросить хендлеры logging."""
+        logger = _get_logger()
+        if reason:
+            ActionLogger.debug("flush", reason=reason)
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+
+    @staticmethod
+    def shutdown(reason: str = "") -> None:
+        """Сбросить хендлеры и завершить подсистему logging."""
+        ActionLogger.flush(reason=reason)
+        logging.shutdown()

@@ -33,9 +33,12 @@ fuel_equilibrium.rocket.analytic_sizing
 
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,3 +330,255 @@ def _inlet_volume(F_throat: float, F_chamber: float, L_inlet: float) -> float:
     if L_inlet <= 0:
         return 0.0
     return L_inlet / 3.0 * (F_throat + F_chamber + math.sqrt(max(F_throat * F_chamber, 0.0)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Консольная форма RPA-подобного ввода (GUI-эквивалент)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _ask_bool(prompt: str, default: bool = False) -> bool:
+    mark = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} [{mark}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes", "д", "да", "1"}:
+            return True
+        if raw in {"n", "no", "н", "нет", "0"}:
+            return False
+        print("  Введите y/n.")
+
+
+def _ask_float(prompt: str, default: float = 0.0) -> float:
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip().replace(",", ".")
+        if not raw:
+            return float(default)
+        try:
+            return float(raw)
+        except ValueError:
+            print("  Введите число.")
+
+
+def _ask_int(prompt: str, default: int = 1, min_value: int = 1) -> int:
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return max(default, min_value)
+        try:
+            value = int(raw)
+        except ValueError:
+            print("  Введите целое число.")
+            continue
+        if value < min_value:
+            print(f"  Значение должно быть >= {min_value}.")
+            continue
+        return value
+
+
+def _ask_choice(prompt: str, choices: Dict[str, str], default_key: str) -> str:
+    keys = list(choices.keys())
+    while True:
+        print(prompt)
+        for i, key in enumerate(keys, start=1):
+            print(f"  [{i}] {choices[key]}")
+        raw = input(f"Выбор [{keys.index(default_key) + 1}]: ").strip().lower()
+        if not raw:
+            return default_key
+        if raw in choices:
+            return raw
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(keys):
+                return keys[idx - 1]
+        print("  Некорректный выбор.")
+
+
+def collect_rpa_input_interactive() -> Dict[str, Any]:
+    """Интерактивный сбор входных данных (по форме из GUI)."""
+    print("=" * 72)
+    print("RPA-style input form (console)")
+    print("Квадраты = можно включать несколько; круг = выбор одного из.")
+    print("=" * 72)
+
+    req_mode = _ask_choice(
+        "Требование по размеру/тяге:",
+        {
+            "nominal_thrust": "Nominal thrust",
+            "mass_flow_rate": "Mass flow rate",
+            "throat_diameter": "Throat diameter",
+        },
+        default_key="nominal_thrust",
+    )
+
+    inlet_mode = _ask_choice(
+        "Nozzle inlet condition:",
+        {
+            "mass_flux": "Mass flux",
+            "contraction_area_ratio": "Contraction area ratio (Ac/At)",
+        },
+        default_key="mass_flux",
+    )
+
+    exit_mode = _ask_choice(
+        "Nozzle exit condition:",
+        {
+            "pressure": "Pressure",
+            "expansion_area_ratio": "Expansion area ratio (Ae/At)",
+            "expansion_pressure_ratio": "Expansion pressure ratio (pc/pe)",
+        },
+        default_key="pressure",
+    )
+
+    freeze_mode = _ask_choice(
+        "Frozen equilibrium freeze mode:",
+        {
+            "pressure_ratio": "Freezing at pressure ratio (pt/pf)",
+            "area_ratio": "Freezing at area ratio (Af/At)",
+        },
+        default_key="pressure_ratio",
+    )
+
+    reaction_mode = _ask_choice(
+        "Reaction efficiency mode:",
+        {
+            "estimate": "Estimate from defined engine parameters",
+            "predefined": "Predefined efficiency",
+        },
+        default_key="estimate",
+    )
+
+    nozzle_mode = _ask_choice(
+        "Nozzle shape and efficiency mode:",
+        {
+            "bell_estimate_80_percent": "Bell nozzle, estimate for length 80%",
+            "bell_with_length": "Bell nozzle with length",
+            "bell_with_efficiency": "Bell nozzle with efficiency",
+            "conical_with_half_angle": "Conical nozzle with half angle",
+        },
+        default_key="bell_estimate_80_percent",
+    )
+
+    ambient_mode = _ask_choice(
+        "Ambient operating condition mode:",
+        {
+            "fixed": "Fixed ambient pressure",
+            "range": "Ambient pressure range",
+        },
+        default_key="fixed",
+    )
+
+    throttle_mode = _ask_choice(
+        "Throttle mode:",
+        {
+            "fixed": "Fixed throttle value",
+            "range": "Throttle values range",
+        },
+        default_key="fixed",
+    )
+
+    return {
+        "chamber_pressure_mpa": _ask_float("Chamber pressure, MPa", 13.4),
+        "determine_thrust_chamber_size": _ask_bool(
+            "Determine thrust chamber size matching specified requirements", True
+        ),
+        "thrust_requirement": {
+            "mode": req_mode,
+            "nominal_thrust_kN": _ask_float("Nominal thrust, kN", 2846.0),
+            "mass_flow_rate_kg_s": _ask_float("Mass flow rate, kg/s", 0.0),
+            "throat_diameter_mm": _ask_float("Throat diameter, mm", 0.0),
+        },
+        "number_of_chambers": _ask_int("Number of chambers", 1, min_value=1),
+        "perform_chamber_thermal_analysis": _ask_bool("Perform chamber thermal analysis", False),
+        "nozzle_inlet_condition": {
+            "mode": inlet_mode,
+            "mass_flux_kg_m2_s": _ask_float("Mass flux, kg/(m^2·s)", 0.0),
+            "contraction_area_ratio_Ac_At": _ask_float("Contraction area ratio (Ac/At)", 0.0),
+        },
+        "nozzle_exit_condition": {
+            "mode": exit_mode,
+            "pressure_mpa": _ask_float("Exit pressure, MPa", 0.0486),
+            "expansion_area_ratio_Ae_At": _ask_float("Expansion area ratio (Ae/At)", 0.0),
+            "expansion_pressure_ratio_pc_pe": _ask_float("Expansion pressure ratio (pc/pe)", 0.0),
+        },
+        "frozen_equilibrium_flow": {
+            "enabled": _ask_bool("Frozen equilibrium flow", False),
+            "mode": freeze_mode,
+            "pressure_ratio_pt_pf": _ask_float("Freeze pressure ratio (pt/pf)", 0.0),
+            "area_ratio_Af_At": _ask_float("Freeze area ratio (Af/At)", 0.0),
+        },
+        "reaction_efficiency": {
+            "mode": reaction_mode,
+            "predefined_efficiency_percent": _ask_float("Predefined efficiency, %", 100.0),
+        },
+        "nozzle_shape_and_efficiency": {
+            "mode": nozzle_mode,
+            "bell_length_percent": _ask_float("Bell nozzle length, %", 80.0),
+            "bell_efficiency_percent": _ask_float("Bell nozzle efficiency, %", 100.0),
+            "conical_half_angle_deg": _ask_float("Conical half-angle, deg", 15.0),
+        },
+        "nozzle_flow_effects": {
+            "multiphase_and_phase_transition": _ask_bool("Consider multiphase/phase transition", True),
+            "species_ionization_effects": _ask_bool("Consider species ionization", True),
+            "flow_separation_loss": _ask_bool("Estimate flow separation loss", True),
+        },
+        "ambient_operating_condition": {
+            "enabled": _ask_bool("Enable ambient operating condition", False),
+            "mode": ambient_mode,
+            "fixed_pressure_atm": _ask_float("Ambient fixed pressure, atm", 1.0),
+            "from_atm": _ask_float("Ambient pressure from, atm", 1.0),
+            "to_atm": _ask_float("Ambient pressure to, atm", 1.0),
+            "calc_estimated_delivered_performance": _ask_bool(
+                "Calculate estimated delivered performance (ambient)", False
+            ),
+        },
+        "throttle_settings": {
+            "enabled": _ask_bool("Enable throttle settings", False),
+            "mode": throttle_mode,
+            "fixed_value": _ask_float("Fixed throttle value", 1.0),
+            "min": _ask_float("Throttle min", 1.0),
+            "max": _ask_float("Throttle max", 1.0),
+            "calc_estimated_delivered_performance": _ask_bool(
+                "Calculate estimated delivered performance (throttle)", False
+            ),
+        },
+    }
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI для сбора RPA-входа (interactive или из JSON-файла)."""
+    parser = argparse.ArgumentParser(
+        description="RPA-style input collector (console).",
+    )
+    parser.add_argument(
+        "--input-json",
+        default=None,
+        help="Путь к JSON с уже подготовленными входными данными.",
+    )
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Куда сохранить итоговый JSON (если не задано — только stdout).",
+    )
+    args = parser.parse_args(argv)
+
+    if args.input_json:
+        with open(args.input_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = collect_rpa_input_interactive()
+
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    print(payload)
+
+    if args.output_json:
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            f.write(payload + "\n")
+        print(f"\nJSON сохранён: {args.output_json}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

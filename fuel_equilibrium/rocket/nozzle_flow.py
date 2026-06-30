@@ -1,17 +1,17 @@
-# Газодинамика по соплу: равновесное течение, NASA CEA-подобный расчёт.
+# Газодинамика по соплу: 4 равновесных сечения + замороженные промежуточные.
 #
 # Что считается:
-#   1) Параметры в камере сгорания (Injector):
-#      решается HP-задача — энтальпия равна сумме энтальпий реагентов
-#      при их собственных температурах; давление = P_chamber; скорость ≈ 0.
-#   2) Изэнтропическое расширение по сечениям сопла:
-#      для каждого давления P решается SP-задача (S = S_chamber),
-#      получаются T, состав, H, далее: V = sqrt(2*(H_ch - H)/m_total),
-#      M = V / a, ρ из PV = nRT, Ae/At из сохранения массового расхода.
-#   3) Поиск горловины (M=1) одномерной оптимизацией по P.
+#   1) Равновесие только в 4 ключевых сечениях:
+#      Injector (HP), Nozzle inlet (SP/совпадает с камерой при Δp=0),
+#      Nozzle throat (SP, поиск M=1), Nozzle exit (SP).
+#   2) Во всех остальных сечениях состав заморожен, а параметры считаются
+#      по квазиизэнтропической модели идеального газа при T0=const,
+#      gamma=const и известной геометрии A/A*.
+#   3) Площади промежуточных сечений интерполируются между входом,
+#      горловиной и срезом; для каждого A/A* решается M, затем T, P, rho, V.
 #
-# Модель: «равновесное» (Equilibrium) течение — состав пересчитывается в
-# каждой точке. Это эталон CEA для idealized rocket performance.
+# Таким образом, состав не «пересобирается» в промежуточных точках, но
+# газодинамика по сечениям остаётся согласованной с геометрией сопла.
 #
 # Замечание о массе:
 #   в расчёте равновесия число молей не сохраняется (диссоциация/рекомбинация),
@@ -400,8 +400,13 @@ def _make_station(
     total_mass_g: float,
     H_chamber_per_kg: float,
     Cstar: Optional[float] = None,
+    equilibrium_derivatives: bool = True,
 ) -> StationResult:
-    """Из решения TP/SP-задачи собирает полный набор параметров сечения."""
+    """Из решения TP/SP-задачи собирает полный набор параметров сечения.
+
+    Если ``equilibrium_derivatives=False``, термодинамические производные
+    считаются в замороженном приближении (без пересчёта равновесного состава).
+    """
     T = result_eq.T
     moles = result_eq.moles
     sp_list = species_list
@@ -433,15 +438,22 @@ def _make_station(
     cv_f_per_kg = cv_f / mass_kg
 
     # «равновесное» Cp, Cv и gamma_s (численные производные)
-    try:
-        cp_eq, cv_eq, gamma_s, a_eq, _ = equilibrium_cp_and_sound_speed(
-            sp_list, element_abundances, T, P, moles
-        )
-        cp_eq_per_kg = cp_eq / mass_kg
-        cv_eq_per_kg = cv_eq / mass_kg
-        # NASA RP-1311: Gamma = Cp_eq / Cv_eq (отличается от gamma_s = isentropic exp.)
-        gamma_eq = cp_eq / cv_eq if cv_eq > 1e-30 else gamma_f
-    except Exception:
+    if equilibrium_derivatives:
+        try:
+            cp_eq, cv_eq, gamma_s, a_eq, _ = equilibrium_cp_and_sound_speed(
+                sp_list, element_abundances, T, P, moles
+            )
+            cp_eq_per_kg = cp_eq / mass_kg
+            cv_eq_per_kg = cv_eq / mass_kg
+            # NASA RP-1311: Gamma = Cp_eq / Cv_eq (отличается от gamma_s = isentropic exp.)
+            gamma_eq = cp_eq / cv_eq if cv_eq > 1e-30 else gamma_f
+        except Exception:
+            cp_eq_per_kg = cp_f_per_kg
+            cv_eq_per_kg = cv_f_per_kg
+            gamma_s = gamma_f
+            gamma_eq = gamma_f
+            a_eq = math.sqrt(gamma_f * R_spec * T)
+    else:
         cp_eq_per_kg = cp_f_per_kg
         cv_eq_per_kg = cv_f_per_kg
         gamma_s = gamma_f
@@ -498,6 +510,90 @@ def _make_station(
         species_names=[sp.name for sp in sp_list],
     )
     return station
+
+
+def _solve_frozen_temperature(
+    species_list: List[Species],
+    moles_frozen: np.ndarray,
+    S_target_total: float,
+    P: float,
+    T_init: float,
+    T_bounds: Tuple[float, float] = (200.0, 6000.0),
+) -> float:
+    """Температура на изоэнтропе при фиксированном (замороженном) составе."""
+    T_lo, T_hi = float(T_bounds[0]), float(T_bounds[1])
+    T_lo = max(10.0, T_lo)
+    T_hi = max(T_hi, T_lo + 1.0)
+    T_init = _clamp(float(T_init), T_lo, T_hi)
+
+    def _resid(T: float) -> float:
+        return mixture_entropy(species_list, moles_frozen, T, P) - S_target_total
+
+    f_lo = _resid(T_lo)
+    f_hi = _resid(T_hi)
+
+    if f_lo * f_hi <= 0.0:
+        return float(brentq(_resid, T_lo, T_hi, xtol=1e-6, rtol=1e-8, maxiter=120))
+
+    # Если брекет не найден (редко), берём ближайшую по энтропии границу.
+    # Энтропия при фиксированном составе монотонна по T, поэтому это стабильный fallback.
+    if abs(f_lo) <= abs(f_hi):
+        return T_lo
+    return T_hi
+
+
+def _make_frozen_station(
+    label: str,
+    species_list: List[Species],
+    element_abundances: Dict[str, float],
+    moles_frozen: np.ndarray,
+    S_target_total: float,
+    P: float,
+    T_init: float,
+    total_mass_g: float,
+    H_chamber_per_kg: float,
+) -> StationResult:
+    """Строит сечение для замороженного состава (без пересчёта равновесия)."""
+    T = _solve_frozen_temperature(
+        species_list=species_list,
+        moles_frozen=moles_frozen,
+        S_target_total=S_target_total,
+        P=P,
+        T_init=T_init,
+    )
+    moles = np.asarray(moles_frozen, dtype=float).copy()
+    enthalpy = mixture_enthalpy(species_list, moles, T)
+    entropy = mixture_entropy(species_list, moles, T, P)
+    total_moles = float(moles.sum())
+
+    result_frozen = EquilibriumResult(
+        converged=True,
+        iterations=0,
+        T=T,
+        P=P,
+        species_names=[sp.name for sp in species_list],
+        mole_fractions=(moles / max(total_moles, 1e-30)),
+        moles=moles,
+        total_moles=total_moles,
+        elements=dict(element_abundances),
+        phase=[0 if sp.is_gas else 1 for sp in species_list],
+        g_over_rt=np.array([g_over_RT(sp, T) for sp in species_list], dtype=float),
+        residual=0.0,
+        enthalpy=enthalpy,
+        entropy=entropy,
+        problem_type='SP_frozen',
+    )
+
+    return _make_station(
+        label=label,
+        species_list=species_list,
+        element_abundances=element_abundances,
+        result_eq=result_frozen,
+        P=P,
+        total_mass_g=total_mass_g,
+        H_chamber_per_kg=H_chamber_per_kg,
+        equilibrium_derivatives=False,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -622,6 +718,110 @@ def _resolve_worker_count(n_tasks: int) -> int:
     return max(1, min(n_tasks, cpu, 8))
 
 
+def _area_ratio_from_mach(M: float, gamma: float) -> float:
+    """Изоэнтропическое отношение площадей A/A* для идеального газа."""
+    gm1 = gamma - 1.0
+    gp1 = gamma + 1.0
+    term = (2.0 / gp1) * (1.0 + 0.5 * gm1 * M * M)
+    expo = gp1 / (2.0 * gm1)
+    return (term ** expo) / max(M, 1e-12)
+
+
+def _solve_mach_from_area_ratio(area_ratio: float, gamma: float, supersonic: bool) -> float:
+    """Решает A/A*(M)=const в дозвуковой или сверхзвуковой ветви."""
+    ar = max(float(area_ratio), 1.0 + 1e-9)
+    if abs(ar - 1.0) < 1e-8:
+        return 1.0
+
+    def _residual(M: float) -> float:
+        return _area_ratio_from_mach(M, gamma) - ar
+
+    if supersonic:
+        return brentq(_residual, 1.0 + 1e-8, 50.0, xtol=1e-10, rtol=1e-8, maxiter=100)
+    return brentq(_residual, 1e-8, 1.0 - 1e-8, xtol=1e-10, rtol=1e-8, maxiter=100)
+
+
+def _stagnation_from_static(T: float, P: float, M: float, gamma: float) -> Tuple[float, float]:
+    """Полные параметры T0, P0 из статических T, P, M при заданной gamma."""
+    fac = 1.0 + 0.5 * (gamma - 1.0) * M * M
+    T0 = T * fac
+    P0 = P * (fac ** (gamma / (gamma - 1.0)))
+    return T0, P0
+
+
+def _make_frozen_gasdynamics_station(
+    label: str,
+    species_list: List[Species],
+    moles_frozen: np.ndarray,
+    P: float,
+    T: float,
+    M: float,
+    gamma: float,
+    R_spec: float,
+    area_ratio: float,
+) -> StationResult:
+    """Станция для «замороженного» состава по модели идеального газа (T0=const, gamma=const)."""
+    moles = np.asarray(moles_frozen, dtype=float).copy()
+    mass_g = sum(moles[i] * species_list[i].mol_weight for i in range(len(species_list)))
+    mass_kg = max(mass_g / 1000.0, 1e-30)
+
+    rho = P / max(R_spec * T, 1e-30)
+    a = math.sqrt(max(gamma * R_spec * T, 0.0))
+    V = M * a
+
+    cp = gamma * R_spec / max(gamma - 1.0, 1e-30)
+    cv = cp - R_spec
+
+    H_total = mixture_enthalpy(species_list, moles, T)
+    S_total = mixture_entropy(species_list, moles, T, P)
+    H_per_kg = H_total / mass_kg
+    S_per_kg = S_total / mass_kg
+    U_per_kg = H_per_kg - P / max(rho, 1e-30)
+
+    n_total = float(moles.sum())
+    n_gas = sum(moles[i] for i, sp in enumerate(species_list) if sp.is_gas)
+    mw_g_per_mol = mass_g / max(n_total, 1e-30)
+
+    xi = np.zeros(len(species_list))
+    if n_gas > 0:
+        for i, sp in enumerate(species_list):
+            if sp.is_gas:
+                xi[i] = moles[i] / n_gas
+
+    mf = np.zeros(len(species_list))
+    for i, sp in enumerate(species_list):
+        mf[i] = moles[i] * species_list[i].mol_weight / max(mass_g, 1e-30)
+
+    return StationResult(
+        label=label,
+        P_Pa=float(P),
+        T_K=float(T),
+        H_J_per_kg=H_per_kg,
+        S_J_per_kgK=S_per_kg,
+        U_J_per_kg=U_per_kg,
+        cp_frozen_J_per_kgK=cp,
+        cv_frozen_J_per_kgK=cv,
+        gamma_frozen=gamma,
+        cp_eq_J_per_kgK=cp,
+        cv_eq_J_per_kgK=cv,
+        gamma_eq=gamma,
+        gamma_s=gamma,
+        a_m_per_s=a,
+        V_m_per_s=V,
+        M=float(M),
+        rho_kg_per_m3=rho,
+        n_moles=n_total / mass_kg,
+        mw_g_per_mol=mw_g_per_mol,
+        R_specific_J_per_kgK=R_spec,
+        Ae_At=float(area_ratio),
+        mass_flux_kg_per_m2_s=rho * V,
+        moles=moles,
+        mole_fractions=xi,
+        mass_fractions=mf,
+        species_names=[sp.name for sp in species_list],
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Основная функция: расчёт сопла «от Pc до Pe» с произвольным числом сечений
 # ─────────────────────────────────────────────────────────────────────────────
@@ -643,7 +843,7 @@ def solve_rocket_nozzle(
     logger: Optional[IterationLogger] = None,
     max_gas_species: int = 60,
 ) -> RocketPerformance:
-    """Полный расчёт ракетного сопла в равновесном приближении.
+    """Полный расчёт ракетного сопла (4 равновесных сечения + заморозка между ними).
 
     Параметры:
         oxidizer, fuel  — компоненты топлива (mass_kg в сумме обычно = 1 кг).
@@ -776,7 +976,7 @@ def solve_rocket_nozzle(
             T_init=T_chamber * 0.9,
             include_condensed=include_condensed,
             verbose=False,
-            logger=NullLogger(),  # внутрь не пишем — иначе захламит лог
+            logger=logger,
             tol_S=1e-6,
         )
         st = _make_station('throat?', species_list, elements, r, P_try,
@@ -853,7 +1053,7 @@ def solve_rocket_nozzle(
             T_init=T_chamber * 0.98,
             include_condensed=include_condensed,
             verbose=False,
-            logger=NullLogger(),
+            logger=logger,
             tol_S=1e-6,
         )
         station_inlet = _make_station(
@@ -884,56 +1084,103 @@ def solve_rocket_nozzle(
         P_pre = sorted([float(p) for p in P_grid if p > P_throat + eps], reverse=True)
         P_post = sorted([float(p) for p in P_grid if p < P_throat - eps], reverse=True)
 
-        flow_pressures = [*P_pre, *P_post]
+        # Промежуточные сечения считаем по геометрии (A/A*), при постоянной
+        # полной температуре и фиксированном gamma (как просил пользователь).
+        gamma_fixed = max(1.02, float(station_throat.gamma_s))
+        R_pre = max(station_inlet.R_specific_J_per_kgK, 1e-12)
+        R_post = max(station_throat.R_specific_J_per_kgK, 1e-12)
+
+        M_inlet_eff = min(max(float(station_inlet.M), 0.02), 0.98)
+        A_inlet_over_At = _area_ratio_from_mach(M_inlet_eff, gamma_fixed)
+        if not (math.isfinite(A_inlet_over_At) and A_inlet_over_At > 1.0):
+            A_inlet_over_At = 2.5
+
+        flux_throat_local = max(station_throat.mass_flux_kg_per_m2_s, 1e-30)
+        A_exit_over_At = flux_throat_local / max(station_exit.mass_flux_kg_per_m2_s, 1e-30)
+        if not (math.isfinite(A_exit_over_At) and A_exit_over_At > 1.0):
+            A_exit_over_At = _area_ratio_from_mach(max(float(station_exit.M), 1.2), gamma_fixed)
+        A_exit_over_At = max(A_exit_over_At, 1.0001)
+
+        T0_stag, P0_stag = _stagnation_from_static(
+            station_throat.T_K,
+            station_throat.P_Pa,
+            1.0,
+            gamma_fixed,
+        )
+
+        moles_frozen_pre = station_inlet.moles.copy()
+        moles_frozen_post = station_throat.moles.copy()
+
+        pre_area_ratios: List[float] = []
+        if len(P_pre) > 0:
+            ln_a0 = math.log(max(A_inlet_over_At, 1.0001))
+            for i in range(1, len(P_pre) + 1):
+                s = i / (len(P_pre) + 1)
+                pre_area_ratios.append(float(math.exp((1.0 - s) * ln_a0)))
+
+        post_area_ratios: List[float] = []
+        if len(P_post) > 0:
+            ln_ae = math.log(max(A_exit_over_At, 1.0001))
+            for i in range(1, len(P_post) + 1):
+                s = i / (len(P_post) + 1)
+                post_area_ratios.append(float(math.exp(s * ln_ae)))
+
+        tasks = []
+        idx = 1
+        for ar in pre_area_ratios:
+            tasks.append((idx, ar, False))
+            idx += 1
+        for ar in post_area_ratios:
+            tasks.append((idx, ar, True))
+            idx += 1
 
         def _compute_section(args):
-            """Считает одно сечение (SP-задача + сборка параметров).
+            k, area_ratio_k, is_supersonic = args
+            M_k = _solve_mach_from_area_ratio(area_ratio_k, gamma_fixed, is_supersonic)
 
-            Полностью независимо от других сечений — пригодно для
-            параллельного выполнения в пуле потоков.
-            """
-            k, P_k = args
-            r_k = solve_equilibrium_SP(
+            if is_supersonic:
+                R_k, moles_k = R_post, moles_frozen_post
+            else:
+                R_k, moles_k = R_pre, moles_frozen_pre
+
+            fac = 1.0 + 0.5 * (gamma_fixed - 1.0) * M_k * M_k
+            T_k = T0_stag / fac
+            P_k = P0_stag / (fac ** (gamma_fixed / (gamma_fixed - 1.0)))
+
+            st = _make_frozen_gasdynamics_station(
+                label=f'Section {k}',
                 species_list=species_list,
-                element_abundances=elements,
-                S_target=S_chamber_total, P=float(P_k),
-                T_init=station_throat.T_K * 0.8,
-                include_condensed=include_condensed,
-                verbose=False,
-                logger=NullLogger(),
-                tol_S=1e-6,
+                moles_frozen=moles_k,
+                P=P_k,
+                T=T_k,
+                M=M_k,
+                gamma=gamma_fixed,
+                R_spec=R_k,
+                area_ratio=area_ratio_k,
             )
-            st = _make_station(
-                f'Section {k}', species_list, elements, r_k, float(P_k),
-                mass_total_g, H_chamber_per_kg,
-            )
-            return k, P_k, st
+            return is_supersonic, st
 
-        tasks = list(enumerate(flow_pressures, start=1))
         n_workers = _resolve_worker_count(len(tasks))
-
         if n_workers > 1:
-            # параллельный расчёт сечений в пуле потоков (GIL освобождается
-            # внутри SLSQP/NumPy/Numba, поэтому потоки идут параллельно)
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 results = list(pool.map(_compute_section, tasks))
         else:
             results = [_compute_section(t) for t in tasks]
 
-        # порядок сечений восстанавливаем по давлению (как и раньше),
-        # независимо от порядка завершения потоков
-        for k, P_k, st in results:
-            if P_k > P_throat:
-                intermediate_pre_throat.append(st)
-            else:
+        for is_supersonic, st in results:
+            if is_supersonic:
                 intermediate_post_throat.append(st)
+            else:
+                intermediate_pre_throat.append(st)
 
-        intermediate_pre_throat.sort(key=lambda s: s.P_Pa, reverse=True)
-        intermediate_post_throat.sort(key=lambda s: s.P_Pa, reverse=True)
+        intermediate_pre_throat.sort(key=lambda s: s.Ae_At, reverse=True)
+        intermediate_post_throat.sort(key=lambda s: s.Ae_At)
 
         if logger.enabled:
-            logger.log(f'Газодинамика по сечениям: {len(tasks)} сечений, '
-                       f'{n_workers} поток(ов)')
+            logger.log(
+                f'Газодинамика по сечениям (frozen geometry/T0/gamma): '
+                f'{len(tasks)} сечений, {n_workers} поток(ов), gamma={gamma_fixed:.4f}'
+            )
 
     # ── 8) Ae/At — из сохранения массового расхода ────────────────────
     # m_dot = rho * V * A = const => A/At = (rho_t * V_t) / (rho * V)
@@ -947,6 +1194,8 @@ def solve_rocket_nozzle(
         station_exit,
     ]
     for st in all_stations_for_area:
+        if math.isfinite(st.Ae_At) and st.Ae_At > 0.0:
+            continue
         if st.mass_flux_kg_per_m2_s > 1e-30:
             st.Ae_At = flux_throat / st.mass_flux_kg_per_m2_s
         else:
